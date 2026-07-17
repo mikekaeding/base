@@ -301,16 +301,15 @@ where
             }
             ReconciliationStrategy::Continue => {
                 debug!(
-                    message = "canonical block behind latest pending block, continuing with existing pending state",
+                    message = "canonical block matched pending prefix, rebuilding only future flashblocks",
                     latest_pending_block = pending_blocks.latest_block_number(),
                     earliest_pending_block = pending_blocks.earliest_block_number(),
                     canonical_block = block.number,
                     pending_txns_for_block = ?tracked_txn_hashes.len(),
                     canonical_txns_for_block = ?block_txn_hashes.len(),
                 );
-                // If no reorg, we can continue building on top of the existing pending state
-                // NOTE: We do not retain specific flashblocks here to avoid losing track of our "earliest" pending block number
-                self.build_pending_state(prev_pending_blocks, &flashblocks)
+                flashblocks.retain(|flashblock| flashblock.metadata.block_number > block.number);
+                self.build_pending_state(None, &flashblocks)
             }
             ReconciliationStrategy::NoPendingState => {
                 // This case is already handled above, but included for completeness

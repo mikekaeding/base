@@ -326,6 +326,48 @@ async fn test_only_current_pending_state_cleared_upon_canonical_block_reorg() {
 }
 
 #[tokio::test]
+async fn test_matching_canonical_block_prunes_pending_prefix() {
+    let mut test = FlashblocksBuilderTestHarness::new().await;
+    let block_one_transaction =
+        test.build_transaction_to_send_eth_with_nonce(Account::Alice, Account::Bob, 100_000, 0);
+    test.send_flashblock(FlashblockBuilder::new_base(&test).build()).await;
+    test.send_flashblock(
+        FlashblockBuilder::new(&test, 1)
+            .with_transactions(vec![block_one_transaction.clone()])
+            .build(),
+    )
+    .await;
+    test.send_flashblock(FlashblockBuilder::new_base(&test).with_canonical_block_number(1).build())
+        .await;
+    test.send_flashblock(
+        FlashblockBuilder::new(&test, 1)
+            .with_canonical_block_number(1)
+            .with_transactions(vec![test.build_transaction_to_send_eth_with_nonce(
+                Account::Alice,
+                Account::Charlie,
+                200_000,
+                1,
+            )])
+            .build(),
+    )
+    .await;
+
+    test.new_canonical_block(vec![block_one_transaction]).await;
+
+    let pending = test.flashblocks.get_pending_blocks();
+    let pending = pending.as_ref().expect("future pending block should remain");
+    assert_eq!(pending.earliest_block_number(), 2);
+    assert_eq!(pending.latest_block_number(), 2);
+    assert!(
+        pending
+            .get_flashblocks()
+            .iter()
+            .all(|flashblock| { flashblock.metadata.block_number == 2 })
+    );
+    assert_eq!(test.account_state(Account::Alice).nonce, 2);
+}
+
+#[tokio::test]
 async fn test_nonce_uses_pending_canon_block_instead_of_latest() {
     // Test for race condition when a canon block comes in but user
     // requests their nonce prior to the StateProcessor processing the canon block
