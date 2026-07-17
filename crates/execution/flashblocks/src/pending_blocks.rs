@@ -142,6 +142,108 @@ impl PendingBlocksBuilder {
         }
     }
 
+    /// Retains only pending data after a matching canonical block without replaying transactions.
+    pub fn from_previous_after_canonical(
+        pending_blocks: &PendingBlocks,
+        canonical_block: BlockNumber,
+        earliest_header: Sealed<Header>,
+    ) -> Self {
+        let flashblocks = pending_blocks
+            .flashblocks
+            .iter()
+            .filter(|flashblock| flashblock.metadata.block_number > canonical_block)
+            .cloned()
+            .collect::<Vector<_>>();
+        let transactions = pending_blocks
+            .transactions
+            .iter()
+            .filter(|transaction| transaction.block_number.unwrap_or_default() > canonical_block)
+            .cloned()
+            .collect::<Vector<_>>();
+        let retained_hashes = transactions
+            .iter()
+            .map(|transaction| (transaction.tx_hash(), ()))
+            .collect::<StdHashMap<_, _>>();
+        let retain_hash = |hash: &B256| retained_hashes.contains_key(hash);
+        let latest_flashblock_transaction_count = flashblocks
+            .last()
+            .map(|flashblock| flashblock.diff.transactions.len())
+            .unwrap_or_default();
+
+        Self {
+            flashblocks,
+            headers: vec![earliest_header, pending_blocks.latest_header.clone()],
+            latest_flashblock_tx_start: Some(
+                transactions.len().saturating_sub(latest_flashblock_transaction_count),
+            ),
+            latest_block_base: Some(pending_blocks.latest_block_base.clone()),
+            latest_block_l1_block_info: Some(pending_blocks.latest_block_l1_block_info.clone()),
+            latest_block_transaction_count: Some(pending_blocks.latest_block_transaction_count),
+            latest_block_cumulative_gas_used: Some(pending_blocks.latest_block_cumulative_gas_used),
+            latest_block_next_log_index: Some(pending_blocks.latest_block_next_log_index),
+            transactions,
+            account_balances: pending_blocks.account_balances.clone(),
+            transaction_count: pending_blocks.transaction_count.clone(),
+            transaction_receipts: pending_blocks
+                .transaction_receipts
+                .iter()
+                .filter(|(hash, _)| retain_hash(hash))
+                .map(|(hash, receipt)| (*hash, receipt.clone()))
+                .collect(),
+            transactions_by_hash: pending_blocks
+                .transactions_by_hash
+                .iter()
+                .filter(|(hash, _)| retain_hash(hash))
+                .map(|(hash, transaction)| (*hash, transaction.clone()))
+                .collect(),
+            transaction_position: pending_blocks
+                .transaction_position
+                .iter()
+                .filter(|(hash, _)| retain_hash(hash))
+                .map(|(hash, position)| (*hash, *position))
+                .collect(),
+            next_position_per_block: pending_blocks
+                .next_position_per_block
+                .iter()
+                .filter(|(block, _)| **block > canonical_block)
+                .map(|(block, position)| (*block, *position))
+                .collect(),
+            transaction_state: pending_blocks
+                .transaction_state
+                .iter()
+                .filter(|(hash, _)| retain_hash(hash))
+                .map(|(hash, state)| (*hash, state.clone()))
+                .collect(),
+            transaction_senders: pending_blocks
+                .transaction_senders
+                .iter()
+                .filter(|(hash, _)| retain_hash(hash))
+                .map(|(hash, sender)| (*hash, *sender))
+                .collect(),
+            state_overrides: pending_blocks.state_overrides.clone(),
+            transaction_results: pending_blocks
+                .transaction_results
+                .iter()
+                .filter(|(hash, _)| retain_hash(hash))
+                .map(|(hash, result)| (*hash, result.clone()))
+                .collect(),
+            execution_times: pending_blocks
+                .execution_times
+                .iter()
+                .filter(|(hash, _)| retain_hash(hash))
+                .map(|(hash, time)| (*hash, *time))
+                .collect(),
+            state_root_times: pending_blocks
+                .state_root_times
+                .iter()
+                .filter(|(hash, _)| retain_hash(hash))
+                .map(|(hash, time)| (*hash, *time))
+                .collect(),
+            bundle_state: Some(Arc::clone(&pending_blocks.bundle_state)),
+            deferred_error: None,
+        }
+    }
+
     /// Adds flashblocks to the builder.
     #[inline]
     pub fn with_flashblocks(&mut self, flashblocks: impl IntoIterator<Item = Flashblock>) -> &Self {

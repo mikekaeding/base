@@ -365,6 +365,21 @@ async fn test_matching_canonical_block_prunes_pending_prefix() {
             .all(|flashblock| { flashblock.metadata.block_number == 2 })
     );
     assert_eq!(test.account_state(Account::Alice).nonce, 2);
+
+    test.send_flashblock(
+        FlashblockBuilder::new(&test, 2)
+            .with_canonical_block_number(1)
+            .with_transactions(vec![test.build_transaction_to_send_eth_with_nonce(
+                Account::Alice,
+                Account::Bob,
+                300_000,
+                2,
+            )])
+            .build(),
+    )
+    .await;
+
+    assert_eq!(test.account_state(Account::Alice).nonce, 3);
 }
 
 #[tokio::test]
