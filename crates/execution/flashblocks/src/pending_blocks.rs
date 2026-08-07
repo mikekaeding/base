@@ -553,6 +553,17 @@ impl PendingBlocks {
         self.flashblocks.iter().next().map(|fb| fb.payload_id).unwrap_or_default()
     }
 
+    /// Returns the payload ID for the latest pending block without cloning its Flashblocks.
+    #[inline]
+    pub fn latest_payload_id(&self) -> Option<PayloadId> {
+        let latest_block = self.latest_block_number();
+        self.flashblocks
+            .iter()
+            .rev()
+            .find(|flashblock| flashblock.metadata.block_number == latest_block)
+            .map(|flashblock| flashblock.payload_id)
+    }
+
     /// Returns the index of the latest flashblock.
     #[inline]
     pub const fn latest_flashblock_index(&self) -> u64 {
@@ -1381,6 +1392,30 @@ mod tests {
         assert_eq!(pending_blocks.latest_block_transaction_count(), 1);
         assert_eq!(pending_blocks.latest_block_cumulative_gas_used(), 42_000);
         assert_eq!(pending_blocks.latest_block_next_log_index(), 1);
+    }
+
+    #[test]
+    fn latest_payload_id_uses_latest_pending_block() {
+        let mut first = test_flashblock_for_block(1);
+        first.payload_id = PayloadId::new([1; 8]);
+        let mut second = test_flashblock_for_block(2);
+        second.payload_id = PayloadId::new([2; 8]);
+        let mut builder = PendingBlocksBuilder::default();
+        builder.with_flashblocks([first, second]);
+        builder.with_header(Sealed::new_unchecked(
+            Header { number: 1, ..Default::default() },
+            B256::ZERO,
+        ));
+        builder.with_header(Sealed::new_unchecked(
+            Header { number: 2, ..Default::default() },
+            B256::ZERO,
+        ));
+
+        let pending_blocks = builder.build().expect("two-block pending state should build");
+
+        assert_eq!(pending_blocks.payload_id(), PayloadId::new([1; 8]));
+        assert_eq!(pending_blocks.latest_payload_id(), Some(PayloadId::new([2; 8])));
+
     }
 
     #[test]
