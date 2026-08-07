@@ -186,42 +186,26 @@ where
                 self.pending_blocks.swap(new_pending_blocks);
                 Metrics::block_processing_duration().record(start_time.elapsed());
             }
+            Err(
+                e @ StateProcessorError::Provider(ProviderError::MissingCanonicalHeader { .. }),
+            ) => {
+                if self.cache.lock().await.insert(flashblock) {
+                    debug!(message = "cached flashblock pending canonical block", error = %e);
+                }
+            }
+            Err(StateProcessorError::MissingFirstFlashblock) => {
+                let mut cache = self.cache.lock().await;
+                // this error should only occur for non-zero index flashblocks, but check here for index safety
+                if flashblock.index > 0
+                    && cache.has_flashblock(flashblock.metadata.block_number, flashblock.index - 1)
+                {
+                    cache.insert(flashblock);
+                }
+                // we should ignore this error since it doesn't necessarily indicate a problem
+            }
             Err(e) => {
-                match e {
-                    StateProcessorError::Provider(ProviderError::MissingCanonicalHeader {
-                        ..
-                    }) => {
-                        if self.cache.lock().await.insert(flashblock) {
-                            debug!(message = "cached flashblock pending canonical block", error = %e);
-                            return;
-                        }
-                    }
-                    StateProcessorError::MissingFirstFlashblock => {
-                        let mut cache = self.cache.lock().await;
-                        // this error should only occur for non-zero index flashblocks, but check here for index safety
-                        if flashblock.index > 0
-                            && cache.has_flashblock(
-                                flashblock.metadata.block_number,
-                                flashblock.index - 1,
-                            )
-                            && cache.insert(flashblock)
-                        {
-                            return;
-                        }
-                        // we should ignore this error since it doesn't necessarily indicate a problem
-                        return;
-                    }
-                    _ => {}
-                }
-
-                // skip logging expected caching case
-                if !matches!(
-                    e,
-                    StateProcessorError::Provider(ProviderError::MissingCanonicalHeader { .. })
-                ) {
-                    error!(message = "could not process Flashblock", error = %e);
-                    Metrics::block_processing_error().increment(1);
-                }
+                error!(message = "could not process Flashblock", error = %e);
+                Metrics::block_processing_error().increment(1);
             }
         }
     }
@@ -301,7 +285,7 @@ where
             }
             ReconciliationStrategy::Continue => {
                 debug!(
-                    message = "canonical block matched pending prefix, rebasing future state without replay",
+                    message = "canonical block matched pending prefix, replaying future state from fresh canonical storage",
                     latest_pending_block = pending_blocks.latest_block_number(),
                     earliest_pending_block = pending_blocks.earliest_block_number(),
                     canonical_block = block.number,
@@ -309,7 +293,7 @@ where
                     canonical_txns_for_block = ?block_txn_hashes.len(),
                 );
                 flashblocks.retain(|flashblock| flashblock.metadata.block_number > block.number);
-                self.rebase_pending_state(pending_blocks, block.number, &flashblocks)
+                self.build_pending_state(None, &flashblocks)
             }
             ReconciliationStrategy::NoPendingState => {
                 // This case is already handled above, but included for completeness
@@ -318,51 +302,6 @@ where
                 Ok(None)
             }
         }
-    }
-
-    fn rebase_pending_state(
-        &self,
-        pending_blocks: &Arc<PendingBlocks>,
-        canonical_block: BlockNumber,
-        flashblocks: &[Flashblock],
-    ) -> Result<Option<Arc<PendingBlocks>>> {
-        let Some(earliest_block) =
-            flashblocks.iter().map(|flashblock| flashblock.metadata.block_number).min()
-        else {
-            self.clear_live_state();
-            return Ok(None);
-        };
-        let earliest_flashblocks = flashblocks
-            .iter()
-            .filter(|flashblock| flashblock.metadata.block_number == earliest_block)
-            .cloned()
-            .collect::<Vec<_>>();
-        let earliest_header = BlockAssembler::assemble(&earliest_flashblocks)?.header;
-        let mut pending_blocks_builder = PendingBlocksBuilder::from_previous_after_canonical(
-            pending_blocks,
-            canonical_block,
-            earliest_header,
-        );
-
-        let mut live_state = self.lock_live_state();
-        let Some(LivePendingState { mut db, state_overrides }) = live_state.take() else {
-            drop(live_state);
-            warn!(
-                canonical_block,
-                "live pending state unavailable while rebasing; replaying future Flashblocks"
-            );
-            return self.build_pending_state(None, flashblocks);
-        };
-        drop(live_state);
-
-        db.merge_transitions(BundleRetention::PlainState);
-        db.bundle_state.reverts = Default::default();
-        db.bundle_state.reverts_size = 0;
-        pending_blocks_builder.with_bundle_state(db.bundle_state.clone());
-        pending_blocks_builder.with_state_overrides(state_overrides.clone());
-        let pending_blocks = Arc::new(pending_blocks_builder.build()?);
-        self.set_live_state(db, state_overrides);
-        Ok(Some(pending_blocks))
     }
 
     #[instrument(

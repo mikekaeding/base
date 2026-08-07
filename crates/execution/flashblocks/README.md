@@ -15,6 +15,10 @@ Flashblocks state management for Base nodes. Subscribes to flashblocks and combi
 - **`CanonicalBlockReconciler`**: Reconciles flashblock state with canonical chain updates.
 - **`ReorgDetector`**: Detects chain reorganizations affecting pending state.
 
+Canonical reconciliation rebuilds any still-pending future flashblocks from a fresh canonical state
+provider. Pending state must not carry a database read transaction across canonical blocks because
+long-lived snapshots can expire and interrupt flashblock processing.
+
 ## RPC Extensions
 
 This crate provides pending-state-aware Ethereum RPC implementations used by
