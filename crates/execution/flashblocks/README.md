@@ -27,8 +27,9 @@ Cached payloads retain their original receive time and recovery republishes them
 downstream state machines see the missing index zero. The trader adapter uses that timestamp to mark
 payloads older than the 200 ms freshness budget as synchronization-only rather than trade signals.
 An in-line sequence or execution divergence still quarantines that lineage. Canonical
-updates have queue priority, and directly queued snapshots delayed by at least one 200 ms Flashblock
-interval update internal state without being published as fresh trading signals.
+updates have queue priority. Directly queued snapshots delayed by at least one 200 ms Flashblock
+interval are still published in sequence for downstream state continuity, while the trader adapter
+marks them synchronization-only and suppresses decisions.
 
 ## RPC Extensions
 

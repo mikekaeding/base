@@ -24,9 +24,7 @@ base_metrics::define_metrics! {
     pending_state_quarantines: counter,
     #[describe("Number of next-block Flashblocks held until canonical parent finalization")]
     pending_parent_finalization_waits: counter,
-    #[describe("Number of stale Flashblock snapshots withheld from subscribers")]
-    stale_flashblock_publications_suppressed: counter,
-    #[describe("Number of stale cached Flashblock snapshots published for downstream state recovery")]
+    #[describe("Number of stale Flashblock snapshots published for downstream state recovery")]
     stale_flashblock_recovery_publications: counter,
     #[describe("Pending snapshot flashblock index (current)")]
     pending_snapshot_fb_index: gauge,

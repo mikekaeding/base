@@ -21,7 +21,7 @@ use crate::{
     processor::{StateProcessor, StateUpdate},
 };
 
-// Buffer 4s of live Flashblocks; recovery never republishes its backlog into this channel.
+// Buffer 4s so continuity-only packets can reach every live subscriber in sequence.
 const BUFFER_SIZE: usize = 20;
 const RESET_BUFFER_SIZE: usize = 16;
 

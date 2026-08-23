@@ -191,7 +191,7 @@ where
                                 for (flashblock, received_at) in cached {
                                     let fb_prev = self.pending_blocks.load_full();
                                     if !self
-                                        .apply_flashblock(fb_prev, flashblock, received_at, true)
+                                        .apply_flashblock(fb_prev, flashblock, received_at)
                                         .await
                                     {
                                         break;
@@ -214,7 +214,6 @@ where
                         prev_pending_blocks,
                         flashblock,
                         Some(received_at),
-                        false,
                     )
                     .await;
                 }
@@ -227,21 +226,18 @@ where
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         flashblock: Flashblock,
         received_at: Option<Instant>,
-        recovery: bool,
     ) -> bool {
         let start_time = Instant::now();
         match self.process_flashblock(prev_pending_blocks.clone(), &flashblock) {
             Ok(new_pending_blocks) => {
-                let fresh = received_at
-                    .is_some_and(|received_at| received_at.elapsed() <= MAX_TRADABLE_QUEUE_AGE);
-                let publish = received_at.is_some() && (fresh || recovery);
-                if publish && let Some(ref pb) = new_pending_blocks {
+                if let (Some(recovery_only), Some(pb)) = (
+                    publication_is_recovery_only(received_at),
+                    new_pending_blocks.as_ref(),
+                ) {
                     _ = self.sender.send(Arc::clone(pb));
-                    if recovery && !fresh {
+                    if recovery_only {
                         Metrics::stale_flashblock_recovery_publications().increment(1);
                     }
-                } else if received_at.is_some() && !fresh {
-                    Metrics::stale_flashblock_publications_suppressed().increment(1);
                 }
                 self.pending_blocks.swap(new_pending_blocks);
                 Metrics::block_processing_duration().record(start_time.elapsed());
@@ -960,9 +956,23 @@ where
     }
 }
 
+fn publication_is_recovery_only(received_at: Option<Instant>) -> Option<bool> {
+    received_at.map(|received_at| received_at.elapsed() > MAX_TRADABLE_QUEUE_AGE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_direct_flashblock_is_published_for_recovery() {
+        assert_eq!(publication_is_recovery_only(Some(Instant::now())), Some(false));
+        assert_eq!(
+            publication_is_recovery_only(Some(Instant::now() - Duration::from_millis(250))),
+            Some(true)
+        );
+        assert_eq!(publication_is_recovery_only(None), None);
+    }
 
     #[test]
     fn matching_next_base_fee_preserves_fast_path() {
