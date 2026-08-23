@@ -1,6 +1,6 @@
 //! Cache for flashblocks that arrive before their canonical block.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use alloy_primitives::BlockNumber;
 use base_common_flashblocks::Flashblock;
@@ -18,11 +18,17 @@ pub struct FlashblockCache {
     /// Flashblocks keyed by block number, then by flashblock index. Using a
     /// nested map deduplicates by index — a later flashblock with the same
     /// index silently replaces the earlier one.
-    entries: HashMap<BlockNumber, HashMap<u64, Flashblock>>,
+    entries: HashMap<BlockNumber, HashMap<u64, CachedFlashblock>>,
 
     /// The latest canonical block number we have observed, used to decide
     /// whether a flashblock is close enough to cache.
     latest_canonical: Option<BlockNumber>,
+}
+
+#[derive(Debug)]
+struct CachedFlashblock {
+    flashblock: Flashblock,
+    received_at: Option<Instant>,
 }
 
 impl FlashblockCache {
@@ -51,24 +57,45 @@ impl FlashblockCache {
     /// Returns `true` if the flashblock was cached, `false` if it was rejected
     /// because its block number exceeds the cache-ahead limit.
     pub fn insert(&mut self, flashblock: Flashblock) -> bool {
+        self.insert_inner(flashblock, None)
+    }
+
+    /// Inserts a Flashblock that may still be fresh enough to publish after canonical recovery.
+    pub(crate) fn insert_tradable(&mut self, flashblock: Flashblock, received_at: Instant) -> bool {
+        self.insert_inner(flashblock, Some(received_at))
+    }
+
+    fn insert_inner(&mut self, flashblock: Flashblock, received_at: Option<Instant>) -> bool {
         let block_number = flashblock.metadata.block_number;
         if !self.is_cacheable(block_number) {
             return false;
         }
         let min_block_number_to_retain = block_number.saturating_sub(MAX_CACHE_AHEAD_BLOCKS);
         self.entries.retain(|&bn, _| bn > min_block_number_to_retain);
-        self.entries.entry(block_number).or_default().insert(flashblock.index, flashblock);
+        self.entries
+            .entry(block_number)
+            .or_default()
+            .insert(flashblock.index, CachedFlashblock { flashblock, received_at });
         true
     }
 
     /// Drains all cached flashblocks for the given block number, returning them
     /// sorted by index. Returns an empty `Vec` when nothing is cached.
     pub fn drain(&mut self, block_number: BlockNumber) -> Vec<Flashblock> {
+        self.drain_cached(block_number).into_iter().map(|(flashblock, _)| flashblock).collect()
+    }
+
+    /// Drains ordered cached Flashblocks with their optional original receive timestamps.
+    pub(crate) fn drain_cached(
+        &mut self,
+        block_number: BlockNumber,
+    ) -> Vec<(Flashblock, Option<Instant>)> {
         let Some(by_index) = self.entries.remove(&block_number) else {
             return Vec::new();
         };
-        let mut flashblocks: Vec<Flashblock> = by_index.into_values().collect();
-        flashblocks.sort_by_key(|fb| fb.index);
+        let mut flashblocks: Vec<_> =
+            by_index.into_values().map(|cached| (cached.flashblock, cached.received_at)).collect();
+        flashblocks.sort_by_key(|(flashblock, _)| flashblock.index);
         flashblocks
     }
 

@@ -179,7 +179,7 @@ where
 
                             let mut cache = self.cache.lock().await;
                             cache.update_canonical(block.number);
-                            let cached = cache.drain(block.number + 1);
+                            let cached = cache.drain_cached(block.number + 1);
                             drop(cache);
 
                             if !cached.is_empty() {
@@ -188,9 +188,12 @@ where
                                     canonical_block = block.number,
                                     cached_count = cached.len(),
                                 );
-                                for flashblock in cached {
+                                for (flashblock, received_at) in cached {
                                     let fb_prev = self.pending_blocks.load_full();
-                                    if !self.apply_flashblock(fb_prev, flashblock, false).await {
+                                    if !self
+                                        .apply_flashblock(fb_prev, flashblock, received_at)
+                                        .await
+                                    {
                                         break;
                                     }
                                 }
@@ -207,11 +210,7 @@ where
                         block_number = flashblock.metadata.block_number,
                         flashblock_index = flashblock.index
                     );
-                    let publish = received_at.elapsed() <= MAX_TRADABLE_QUEUE_AGE;
-                    if !publish {
-                        Metrics::stale_flashblock_publications_suppressed().increment(1);
-                    }
-                    self.apply_flashblock(prev_pending_blocks, flashblock, publish).await;
+                    self.apply_flashblock(prev_pending_blocks, flashblock, Some(received_at)).await;
                 }
             }
         }
@@ -221,13 +220,17 @@ where
         &self,
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         flashblock: Flashblock,
-        publish: bool,
+        received_at: Option<Instant>,
     ) -> bool {
         let start_time = Instant::now();
         match self.process_flashblock(prev_pending_blocks.clone(), &flashblock) {
             Ok(new_pending_blocks) => {
+                let publish = received_at
+                    .is_some_and(|received_at| received_at.elapsed() <= MAX_TRADABLE_QUEUE_AGE);
                 if publish && let Some(ref pb) = new_pending_blocks {
                     _ = self.sender.send(Arc::clone(pb));
+                } else if received_at.is_some() {
+                    Metrics::stale_flashblock_publications_suppressed().increment(1);
                 }
                 self.pending_blocks.swap(new_pending_blocks);
                 Metrics::block_processing_duration().record(start_time.elapsed());
@@ -236,7 +239,12 @@ where
             Err(
                 e @ StateProcessorError::Provider(ProviderError::MissingCanonicalHeader { .. }),
             ) => {
-                if self.cache.lock().await.insert(flashblock) {
+                let mut cache = self.cache.lock().await;
+                let cached = match received_at {
+                    Some(received_at) => cache.insert_tradable(flashblock, received_at),
+                    None => cache.insert(flashblock),
+                };
+                if cached {
                     debug!(message = "cached flashblock pending canonical block", error = %e);
                 }
                 false
@@ -247,7 +255,10 @@ where
                 if flashblock.index > 0
                     && cache.has_flashblock(flashblock.metadata.block_number, flashblock.index - 1)
                 {
-                    cache.insert(flashblock);
+                    match received_at {
+                        Some(received_at) => cache.insert_tradable(flashblock, received_at),
+                        None => cache.insert(flashblock),
+                    };
                 }
                 // we should ignore this error since it doesn't necessarily indicate a problem
                 false
@@ -263,7 +274,11 @@ where
                     reason = %e,
                 );
                 Metrics::pending_parent_finalization_waits().increment(1);
-                self.cache.lock().await.insert(flashblock);
+                let mut cache = self.cache.lock().await;
+                match received_at {
+                    Some(received_at) => cache.insert_tradable(flashblock, received_at),
+                    None => cache.insert(flashblock),
+                };
                 self.pending_blocks.swap(None);
                 self.clear_live_state();
                 false

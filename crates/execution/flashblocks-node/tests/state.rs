@@ -726,6 +726,28 @@ async fn test_flashblock_cached_and_applied_after_canonical_block() {
 }
 
 #[tokio::test]
+async fn test_stale_cached_flashblock_recovers_without_publication() {
+    let mut test = FlashblocksBuilderTestHarness::new().await;
+    let mut pending = test.flashblocks.subscribe_to_flashblocks();
+
+    test.send_flashblock(FlashblockBuilder::new_base(&test).with_canonical_block_number(1).build())
+        .await;
+    sleep(Duration::from_millis(250)).await;
+    test.new_canonical_block(vec![]).await;
+
+    assert!(
+        timeout(Duration::from_millis(50), pending.recv()).await.is_err(),
+        "stale recovery must not become a trade signal"
+    );
+    let recovered = test
+        .flashblocks
+        .get_pending_blocks()
+        .get_block(true)
+        .expect("stale cached state should still recover internally");
+    assert_eq!(recovered.header.number, 2);
+}
+
+#[tokio::test]
 async fn test_cached_flashblock_with_transactions_applied_after_canonical() {
     let mut test = FlashblocksBuilderTestHarness::new().await;
 
@@ -803,6 +825,7 @@ async fn test_hidden_canonical_tail_recovers_complete_next_block_lineage() {
 
     test.send_flashblock(parent_base).await;
     test.send_flashblock(parent_visible).await;
+    let mut pending = test.flashblocks.subscribe_to_flashblocks();
 
     let mut next_base = FlashblockBuilder::new_base(&test).with_canonical_block_number(1).build();
     next_base.base.as_mut().expect("base Flashblock").parent_hash = canonical_parent.hash();
@@ -845,6 +868,13 @@ async fn test_hidden_canonical_tail_recovers_complete_next_block_lineage() {
 
     test.flashblocks.on_canonical_block_received(canonical_parent);
     sleep(Duration::from_millis(10)).await;
+
+    let recovered = timeout(Duration::from_millis(100), pending.recv())
+        .await
+        .expect("fresh recovered state should be published promptly")
+        .expect("the pending-state channel should remain open");
+    assert_eq!(recovered.latest_block_number(), 2);
+    assert_eq!(recovered.latest_flashblock_index(), 0);
 
     let pending = test
         .flashblocks

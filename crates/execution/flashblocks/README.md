@@ -23,6 +23,9 @@ The normal Flashblock path never waits for canonical state. At block boundaries 
 next block's parent hash and base fee against the speculative parent in constant time. A
 block-boundary mismatch means the producer sealed a hidden tail after the last public prefix, so the
 next index-zero payload is held briefly and rebuilt from canonical state without resetting consumers.
+Cached payloads retain their original receive time: recovery republishes them in index order only
+while they remain within the 200 ms freshness budget, allowing downstream state machines to see the
+missing index zero without turning an old catch-up backlog into a trade signal.
 An in-line sequence or execution divergence still quarantines that lineage. Canonical
 updates have queue priority, and snapshots delayed by at least one 200 ms Flashblock interval update
 internal state without being published as fresh trading signals.
