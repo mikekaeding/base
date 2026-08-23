@@ -810,14 +810,12 @@ async fn test_hidden_canonical_tail_recovers_complete_next_block_lineage() {
 
     assert!(
         test.flashblocks.get_pending_blocks().is_none(),
-        "the parent hash mismatch must quarantine the speculative next-block lineage"
+        "the parent hash mismatch must wait for the sealed canonical parent"
     );
-    let reset = timeout(Duration::from_millis(100), resets.recv())
-        .await
-        .expect("the state processor should emit an invalidation promptly")
-        .expect("the reset channel should remain open");
-    assert_eq!(reset.block_number, 2);
-    assert_eq!(reset.flashblock_index, 0);
+    assert!(
+        timeout(Duration::from_millis(20), resets.recv()).await.is_err(),
+        "an expected block-boundary finalization wait must not reset downstream consumers"
+    );
 
     test.send_flashblock(
         FlashblockBuilder::new(&test, 1)

@@ -22,6 +22,8 @@ base_metrics::define_metrics! {
     pending_clear_reorg: counter,
     #[describe("Number of speculative Flashblock lineages quarantined after state divergence")]
     pending_state_quarantines: counter,
+    #[describe("Number of next-block Flashblocks held until canonical parent finalization")]
+    pending_parent_finalization_waits: counter,
     #[describe("Number of stale Flashblock snapshots withheld from subscribers")]
     stale_flashblock_publications_suppressed: counter,
     #[describe("Pending snapshot flashblock index (current)")]

@@ -20,8 +20,10 @@ provider. Pending state must not carry a database read transaction across canoni
 long-lived snapshots can expire and interrupt flashblock processing.
 
 The normal Flashblock path never waits for canonical state. At block boundaries it validates the
-the next block's parent hash and base fee against the speculative parent in constant time. A mismatch
-or execution divergence quarantines that lineage until canonical state can rebuild it. Canonical
+next block's parent hash and base fee against the speculative parent in constant time. A
+block-boundary mismatch means the producer sealed a hidden tail after the last public prefix, so the
+next index-zero payload is held briefly and rebuilt from canonical state without resetting consumers.
+An in-line sequence or execution divergence still quarantines that lineage. Canonical
 updates have queue priority, and snapshots delayed by at least one 200 ms Flashblock interval update
 internal state without being published as fresh trading signals.
 

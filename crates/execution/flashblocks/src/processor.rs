@@ -252,6 +252,22 @@ where
                 // we should ignore this error since it doesn't necessarily indicate a problem
                 false
             }
+            Err(
+                e @ (StateProcessorError::ParentHashMismatch { .. }
+                | StateProcessorError::ParentStateIncomplete { .. }),
+            ) => {
+                debug!(
+                    message = "holding next-block Flashblock for canonical parent finalization",
+                    block_number = flashblock.metadata.block_number,
+                    flashblock_index = flashblock.index,
+                    reason = %e,
+                );
+                Metrics::pending_parent_finalization_waits().increment(1);
+                self.cache.lock().await.insert(flashblock);
+                self.pending_blocks.swap(None);
+                self.clear_live_state();
+                false
+            }
             Err(e) => {
                 error!(
                     message = "quarantining divergent Flashblock lineage",

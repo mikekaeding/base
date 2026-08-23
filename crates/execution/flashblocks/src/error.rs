@@ -151,12 +151,12 @@ pub enum StateProcessorError {
     #[error("missing first flashblock: cannot build pending blocks without first flashblock")]
     MissingFirstFlashblock,
 
-    /// The next block does not extend the pending parent's declared hash.
+    /// The next block extends a sealed parent that differs from the last public prefix.
     #[error(
         "pending parent block {parent_block} hash mismatch: calculated {calculated_parent_hash}, declared {declared_parent_hash}"
     )]
     ParentHashMismatch {
-        /// Parent block whose speculative state is incomplete.
+        /// Parent block whose public Flashblock prefix is incomplete.
         parent_block: u64,
         /// Hash declared by the latest speculative parent Flashblock.
         calculated_parent_hash: B256,
@@ -164,7 +164,7 @@ pub enum StateProcessorError {
         declared_parent_hash: B256,
     },
 
-    /// The pending parent cannot produce the base fee declared by the next block.
+    /// The public pending parent cannot produce the base fee declared by the next block.
     #[error(
         "pending parent block {parent_block} is incomplete: calculated next base fee {calculated_next_base_fee}, declared {declared_next_base_fee}"
     )]
