@@ -537,13 +537,11 @@ async fn test_blockhash_dependent_transaction_receipt_pending() -> Result<()> {
     // Created by builder_setup, but inserted into client_setup
     let block_two_fb_base = FlashblockBuilder::new_base(&builder_setup).build();
     let block_two_fb_one = FlashblockBuilder::new(&builder_setup, 1).build();
-    let block_two_fb_two = FlashblockBuilder::new(&builder_setup, 2).build();
-    client_setup.send_flashblock(block_two_fb_base.clone()).await;
-    client_setup.send_flashblock(block_two_fb_one).await;
-    client_setup.send_flashblock(block_two_fb_two).await;
+    let mut block_two_fb_two = FlashblockBuilder::new(&builder_setup, 2).build();
+    let declared_block_two_gas_used = block_two_fb_two.diff.gas_used;
     builder_setup
         .node
-        .build_block_from_transactions(block_two_fb_base.diff.transactions)
+        .build_block_from_transactions(block_two_fb_base.diff.transactions.clone())
         .await
         .expect("able to build canon block 2");
     let canon_block_two = builder_setup
@@ -553,6 +551,11 @@ async fn test_blockhash_dependent_transaction_receipt_pending() -> Result<()> {
         .expect("block 2 should be available")
         .try_into_recovered()
         .expect("able to recover block 2");
+    assert_eq!(canon_block_two.gas_used, declared_block_two_gas_used);
+    block_two_fb_two.diff.block_hash = canon_block_two.hash();
+    client_setup.send_flashblock(block_two_fb_base).await;
+    client_setup.send_flashblock(block_two_fb_one).await;
+    client_setup.send_flashblock(block_two_fb_two).await;
 
     // Step 3. Builder builds flashblocks for block 3
     // that contain a call to the contract

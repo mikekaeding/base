@@ -1,6 +1,6 @@
 //! Flashblocks state management.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use alloy_consensus::Header;
 use arc_swap::{ArcSwapOption, Guard};
@@ -21,16 +21,41 @@ use crate::{
     processor::{StateProcessor, StateUpdate},
 };
 
-// Buffer 4s of flashblocks for flashblock_sender
+// Buffer 4s of live Flashblocks; recovery never republishes its backlog into this channel.
 const BUFFER_SIZE: usize = 20;
+const RESET_BUFFER_SIZE: usize = 16;
+
+/// Identifies a speculative Flashblock lineage that was invalidated locally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlashblocksReset {
+    /// Block whose speculative execution diverged.
+    pub block_number: u64,
+    /// Flashblock index whose execution exposed the divergence.
+    pub flashblock_index: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct TimedStateUpdate {
+    pub(crate) received_at: Instant,
+    pub(crate) update: StateUpdate,
+}
+
+impl TimedStateUpdate {
+    fn new(update: StateUpdate) -> Self {
+        Self { received_at: Instant::now(), update }
+    }
+}
 
 /// Manages the pending flashblock state and processes incoming updates.
 #[derive(Debug)]
 pub struct FlashblocksState {
     pending_blocks: Arc<ArcSwapOption<PendingBlocks>>,
-    queue: mpsc::UnboundedSender<StateUpdate>,
-    rx: Arc<Mutex<mpsc::UnboundedReceiver<StateUpdate>>>,
+    canonical_queue: mpsc::UnboundedSender<TimedStateUpdate>,
+    canonical_rx: Arc<Mutex<mpsc::UnboundedReceiver<TimedStateUpdate>>>,
+    flashblock_queue: mpsc::UnboundedSender<TimedStateUpdate>,
+    flashblock_rx: Arc<Mutex<mpsc::UnboundedReceiver<TimedStateUpdate>>>,
     flashblock_sender: Sender<Arc<PendingBlocks>>,
+    reset_sender: Sender<FlashblocksReset>,
     max_pending_blocks_depth: u64,
 }
 
@@ -40,15 +65,20 @@ impl FlashblocksState {
     /// The state is created without a client. Call [`start`](Self::start) with a client
     /// to spawn the state processor after the node is launched.
     pub fn new(max_pending_blocks_depth: u64) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel::<StateUpdate>();
+        let (canonical_queue, canonical_rx) = mpsc::unbounded_channel::<TimedStateUpdate>();
+        let (flashblock_queue, flashblock_rx) = mpsc::unbounded_channel::<TimedStateUpdate>();
         let pending_blocks: Arc<ArcSwapOption<PendingBlocks>> = Arc::new(ArcSwapOption::new(None));
         let (flashblock_sender, _) = broadcast::channel(BUFFER_SIZE);
+        let (reset_sender, _) = broadcast::channel(RESET_BUFFER_SIZE);
 
         Self {
             pending_blocks,
-            queue: tx,
-            rx: Arc::new(Mutex::new(rx)),
+            canonical_queue,
+            canonical_rx: Arc::new(Mutex::new(canonical_rx)),
+            flashblock_queue,
+            flashblock_rx: Arc::new(Mutex::new(flashblock_rx)),
             flashblock_sender,
+            reset_sender,
             max_pending_blocks_depth,
         }
     }
@@ -69,8 +99,10 @@ impl FlashblocksState {
             client,
             Arc::clone(&self.pending_blocks),
             self.max_pending_blocks_depth,
-            Arc::clone(&self.rx),
+            Arc::clone(&self.canonical_rx),
+            Arc::clone(&self.flashblock_rx),
             self.flashblock_sender.clone(),
+            self.reset_sender.clone(),
         );
 
         tokio::spawn(async move {
@@ -81,7 +113,7 @@ impl FlashblocksState {
     /// Handles a canonical block being received.
     pub fn on_canonical_block_received(&self, block: RecoveredBlock<BaseBlock>) {
         let block_number = block.number;
-        match self.queue.send(StateUpdate::Canonical(block)) {
+        match self.canonical_queue.send(TimedStateUpdate::new(StateUpdate::Canonical(block))) {
             Ok(_) => {
                 info!(message = "added canonical block to processing queue", block_number)
             }
@@ -90,13 +122,19 @@ impl FlashblocksState {
             }
         }
     }
+
+    /// Subscribes to pending-state invalidations that require consumers to fail closed.
+    pub fn subscribe_to_resets(&self) -> broadcast::Receiver<FlashblocksReset> {
+        self.reset_sender.subscribe()
+    }
 }
 
 impl FlashblocksReceiver for FlashblocksState {
     fn on_flashblock_received(&self, flashblock: Flashblock) {
         let flashblock_index = flashblock.index;
         let block_number = flashblock.metadata.block_number;
-        match self.queue.send(StateUpdate::Flashblock(flashblock)) {
+        match self.flashblock_queue.send(TimedStateUpdate::new(StateUpdate::Flashblock(flashblock)))
+        {
             Ok(_) => {
                 debug!(
                     message = "added flashblock to processing queue",

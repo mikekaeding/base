@@ -564,6 +564,18 @@ impl PendingBlocks {
             .map(|flashblock| flashblock.payload_id)
     }
 
+    /// Returns the block hash declared by the latest Flashblock without cloning its payload.
+    #[inline]
+    pub fn latest_declared_block_hash(&self) -> B256 {
+        let latest_block = self.latest_block_number();
+        self.flashblocks
+            .iter()
+            .rev()
+            .find(|flashblock| flashblock.metadata.block_number == latest_block)
+            .map(|flashblock| flashblock.diff.block_hash)
+            .unwrap_or_default()
+    }
+
     /// Returns the index of the latest flashblock.
     #[inline]
     pub const fn latest_flashblock_index(&self) -> u64 {
@@ -1415,7 +1427,6 @@ mod tests {
 
         assert_eq!(pending_blocks.payload_id(), PayloadId::new([1; 8]));
         assert_eq!(pending_blocks.latest_payload_id(), Some(PayloadId::new([2; 8])));
-
     }
 
     #[test]

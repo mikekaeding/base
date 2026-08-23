@@ -4797,6 +4797,7 @@ dependencies = [
  "alloy-signer 2.0.5",
  "alloy-sol-macro",
  "alloy-sol-types",
+ "base-common-chains",
  "base-common-consensus",
  "base-common-flashblocks",
  "base-common-network",

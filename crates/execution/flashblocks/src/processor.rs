@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use alloy_consensus::{
@@ -25,12 +25,15 @@ use reth_evm::ConfigureEvm;
 use reth_primitives_traits::RecoveredBlock;
 use reth_provider::{BlockReaderIdExt, StateProviderBox, StateProviderFactory};
 use reth_revm::{State, database::StateProviderDatabase};
+use revm::context::Block as _;
 use revm_database::states::bundle_state::BundleRetention;
 use tokio::sync::{Mutex, broadcast::Sender, mpsc::UnboundedReceiver};
 
+use crate::state::TimedStateUpdate;
 use crate::{
-    AssembledBlock, BlockAssembler, ExecutionError, FlashblockCache, PendingBlocks,
-    PendingBlocksBuilder, PendingStateBuilder, ProviderError, Result, StateProcessorError,
+    AssembledBlock, BlockAssembler, ExecutionError, FlashblockCache, FlashblocksReset,
+    PendingBlocks, PendingBlocksBuilder, PendingStateBuilder, ProviderError, Result,
+    StateProcessorError,
     metrics::Metrics,
     validation::{
         CanonicalBlockReconciler, FlashblockSequenceValidator, ReconciliationStrategy,
@@ -39,6 +42,24 @@ use crate::{
 };
 
 type PendingExecutionDb = State<StateProviderDatabase<StateProviderBox>>;
+
+// Once a newer 200 ms Flashblock should exist, a queued snapshot is catch-up state, not a trade cue.
+const MAX_TRADABLE_QUEUE_AGE: Duration = Duration::from_millis(200);
+
+const fn validate_next_base_fee(
+    parent_block: u64,
+    calculated_next_base_fee: u64,
+    declared_next_base_fee: u64,
+) -> Result<()> {
+    if calculated_next_base_fee != declared_next_base_fee {
+        return Err(StateProcessorError::ParentStateIncomplete {
+            parent_block,
+            calculated_next_base_fee,
+            declared_next_base_fee,
+        });
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 struct LivePendingState {
@@ -59,11 +80,13 @@ pub enum StateUpdate {
 /// Processes flashblocks and canonical blocks to keep pending state updated.
 #[derive(Debug)]
 pub struct StateProcessor<Client> {
-    rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
+    canonical_rx: Arc<Mutex<UnboundedReceiver<TimedStateUpdate>>>,
+    flashblock_rx: Arc<Mutex<UnboundedReceiver<TimedStateUpdate>>>,
     pending_blocks: Arc<ArcSwapOption<PendingBlocks>>,
     max_depth: u64,
     client: Client,
     sender: Sender<Arc<PendingBlocks>>,
+    reset_sender: Sender<FlashblocksReset>,
     cache: Arc<Mutex<FlashblockCache>>,
     live_state: StdMutex<Option<LivePendingState>>,
 }
@@ -105,12 +128,14 @@ where
     }
 
     /// Creates a new state processor wired to the provided channels and state.
-    pub fn new(
+    pub(crate) fn new(
         client: Client,
         pending_blocks: Arc<ArcSwapOption<PendingBlocks>>,
         max_depth: u64,
-        rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
+        canonical_rx: Arc<Mutex<UnboundedReceiver<TimedStateUpdate>>>,
+        flashblock_rx: Arc<Mutex<UnboundedReceiver<TimedStateUpdate>>>,
         sender: Sender<Arc<PendingBlocks>>,
+        reset_sender: Sender<FlashblocksReset>,
     ) -> Self {
         let cache = client
             .best_block_number()
@@ -120,8 +145,10 @@ where
             pending_blocks,
             client,
             max_depth,
-            rx,
+            canonical_rx,
+            flashblock_rx,
             sender,
+            reset_sender,
             cache: Arc::new(Mutex::new(cache)),
             live_state: StdMutex::new(None),
         }
@@ -129,7 +156,19 @@ where
 
     /// Processes updates from the queue until the channel closes.
     pub async fn start(&self) {
-        while let Some(update) = self.rx.lock().await.recv().await {
+        loop {
+            let timed_update = {
+                let mut canonical_rx = self.canonical_rx.lock().await;
+                let mut flashblock_rx = self.flashblock_rx.lock().await;
+                tokio::select! {
+                    biased;
+                    update = canonical_rx.recv() => update,
+                    update = flashblock_rx.recv() => update,
+                }
+            };
+            let Some(TimedStateUpdate { received_at, update }) = timed_update else {
+                return;
+            };
             let prev_pending_blocks = self.pending_blocks.load_full();
             match update {
                 StateUpdate::Canonical(block) => {
@@ -151,7 +190,9 @@ where
                                 );
                                 for flashblock in cached {
                                     let fb_prev = self.pending_blocks.load_full();
-                                    self.apply_flashblock(fb_prev, flashblock).await;
+                                    if !self.apply_flashblock(fb_prev, flashblock, false).await {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -166,7 +207,11 @@ where
                         block_number = flashblock.metadata.block_number,
                         flashblock_index = flashblock.index
                     );
-                    self.apply_flashblock(prev_pending_blocks, flashblock).await;
+                    let publish = received_at.elapsed() <= MAX_TRADABLE_QUEUE_AGE;
+                    if !publish {
+                        Metrics::stale_flashblock_publications_suppressed().increment(1);
+                    }
+                    self.apply_flashblock(prev_pending_blocks, flashblock, publish).await;
                 }
             }
         }
@@ -176,15 +221,17 @@ where
         &self,
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         flashblock: Flashblock,
-    ) {
+        publish: bool,
+    ) -> bool {
         let start_time = Instant::now();
-        match self.process_flashblock(prev_pending_blocks, &flashblock) {
+        match self.process_flashblock(prev_pending_blocks.clone(), &flashblock) {
             Ok(new_pending_blocks) => {
-                if let Some(ref pb) = new_pending_blocks {
+                if publish && let Some(ref pb) = new_pending_blocks {
                     _ = self.sender.send(Arc::clone(pb));
                 }
                 self.pending_blocks.swap(new_pending_blocks);
                 Metrics::block_processing_duration().record(start_time.elapsed());
+                true
             }
             Err(
                 e @ StateProcessorError::Provider(ProviderError::MissingCanonicalHeader { .. }),
@@ -192,6 +239,7 @@ where
                 if self.cache.lock().await.insert(flashblock) {
                     debug!(message = "cached flashblock pending canonical block", error = %e);
                 }
+                false
             }
             Err(StateProcessorError::MissingFirstFlashblock) => {
                 let mut cache = self.cache.lock().await;
@@ -202,10 +250,37 @@ where
                     cache.insert(flashblock);
                 }
                 // we should ignore this error since it doesn't necessarily indicate a problem
+                false
             }
             Err(e) => {
-                error!(message = "could not process Flashblock", error = %e);
+                error!(
+                    message = "quarantining divergent Flashblock lineage",
+                    block_number = flashblock.metadata.block_number,
+                    flashblock_index = flashblock.index,
+                    error = %e,
+                );
                 Metrics::block_processing_error().increment(1);
+                Metrics::pending_state_quarantines().increment(1);
+
+                let block_number = flashblock.metadata.block_number;
+                let flashblock_index = flashblock.index;
+                let mut cache = self.cache.lock().await;
+                if let Some(pending_blocks) = prev_pending_blocks {
+                    for accepted in pending_blocks
+                        .get_flashblocks()
+                        .into_iter()
+                        .filter(|accepted| accepted.metadata.block_number == block_number)
+                    {
+                        cache.insert(accepted);
+                    }
+                }
+                cache.insert(flashblock);
+                drop(cache);
+
+                self.pending_blocks.swap(None);
+                self.clear_live_state();
+                _ = self.reset_sender.send(FlashblocksReset { block_number, flashblock_index });
+                false
             }
         }
     }
@@ -357,12 +432,11 @@ where
                 // We have received a non-zero flashblock for a new block
                 Metrics::unexpected_block_order().increment(1);
                 error!(
-                    message = "Received non-zero index Flashblock for new block, zeroing Flashblocks until we receive a base Flashblock",
+                    message = "received non-zero index Flashblock for new block",
                     curr_block = %pending_blocks.latest_block_number(),
                     new_block = %block_number,
                 );
-                self.clear_live_state();
-                Ok(None)
+                Err(crate::ProtocolError::InvalidSequence.into())
             }
             SequenceValidationResult::NonSequentialGap { expected, actual } => {
                 Metrics::unexpected_block_order().increment(1);
@@ -372,8 +446,7 @@ where
                     actual_flashblock_index = %actual,
                     "received non-sequential flashblock index for current block"
                 );
-                self.clear_live_state();
-                Ok(None)
+                Err(crate::ProtocolError::InvalidSequence.into())
             }
             SequenceValidationResult::NonSequentialPredecessor { expected, actual } => {
                 Metrics::unexpected_block_order().increment(1);
@@ -388,8 +461,7 @@ where
                     actual_prev_index = %actual.index,
                     "received flashblock with non-sequential predecessor link"
                 );
-                self.clear_live_state();
-                Ok(None)
+                Err(crate::ProtocolError::InvalidSequence.into())
             }
         }
     }
@@ -566,6 +638,14 @@ where
         drop(live_state);
 
         let previous_header = prev_pending_blocks.latest_header();
+        let calculated_parent_hash = prev_pending_blocks.latest_declared_block_hash();
+        if !calculated_parent_hash.is_zero() && calculated_parent_hash != base.parent_hash {
+            return Err(StateProcessorError::ParentHashMismatch {
+                parent_block: previous_header.number,
+                calculated_parent_hash,
+                declared_parent_hash: base.parent_hash,
+            });
+        }
         let current_block = BlockAssembler::assemble(std::slice::from_ref(flashblock))?;
         let l1_block_info = current_block.l1_block_info()?;
         let AssembledBlock { block: assembled_block, header: assembled_header, .. } = current_block;
@@ -595,6 +675,11 @@ where
         let evm_env = evm_config
             .next_evm_env(&previous_header, &block_env_attributes)
             .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
+        validate_next_base_fee(
+            previous_header.number,
+            evm_env.block_env.basefee(),
+            base.base_fee_per_gas.saturating_to(),
+        )?;
         let evm = evm_config.evm_with_env(db, evm_env);
 
         let recovery_start = Instant::now();
@@ -737,6 +822,11 @@ where
             let evm_env = evm_config
                 .next_evm_env(&last_block_header, &block_env_attributes)
                 .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
+            validate_next_base_fee(
+                last_block_header.number,
+                evm_env.block_env.basefee(),
+                assembled.base.base_fee_per_gas.saturating_to(),
+            )?;
             let evm = evm_config.evm_with_env(db, evm_env);
 
             // Parallel sender recovery - batch all ECDSA operations upfront
@@ -825,5 +915,27 @@ where
         }
 
         self.publish_pending_blocks(pending_blocks_builder, db, state_overrides)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matching_next_base_fee_preserves_fast_path() {
+        assert!(validate_next_base_fee(50_353_410, 7_220_739, 7_220_739).is_ok());
+    }
+
+    #[test]
+    fn mismatched_next_base_fee_identifies_incomplete_parent() {
+        assert_eq!(
+            validate_next_base_fee(50_353_410, 7_202_165, 7_220_739),
+            Err(StateProcessorError::ParentStateIncomplete {
+                parent_block: 50_353_410,
+                calculated_next_base_fee: 7_202_165,
+                declared_next_base_fee: 7_220_739,
+            })
+        );
     }
 }

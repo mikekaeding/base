@@ -19,6 +19,12 @@ Canonical reconciliation rebuilds any still-pending future flashblocks from a fr
 provider. Pending state must not carry a database read transaction across canonical blocks because
 long-lived snapshots can expire and interrupt flashblock processing.
 
+The normal Flashblock path never waits for canonical state. At block boundaries it validates the
+the next block's parent hash and base fee against the speculative parent in constant time. A mismatch
+or execution divergence quarantines that lineage until canonical state can rebuild it. Canonical
+updates have queue priority, and snapshots delayed by at least one 200 ms Flashblock interval update
+internal state without being published as fresh trading signals.
+
 ## RPC Extensions
 
 This crate provides pending-state-aware Ethereum RPC implementations used by

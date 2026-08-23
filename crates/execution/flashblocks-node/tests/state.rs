@@ -1,11 +1,14 @@
 //! Integration tests that stress Flashblocks state handling.
 
+use std::time::Duration;
+
 use alloy_network::BlockResponse;
-use alloy_primitives::U256;
+use alloy_primitives::{B256, U256};
 use base_flashblocks::{FlashblocksAPI, PendingBlocksAPI};
 use base_flashblocks_node::test_harness::{FlashblockBuilder, FlashblocksBuilderTestHarness};
 use base_test_utils::Account;
 use reth_provider::{AccountReader, StateProviderFactory};
+use tokio::time::{sleep, timeout};
 
 #[tokio::test]
 async fn test_state_overrides_persisted_across_flashblocks() {
@@ -263,6 +266,7 @@ async fn test_only_current_pending_state_cleared_upon_canonical_block_reorg() {
 
     test.send_flashblock(FlashblockBuilder::new_base(&test).with_canonical_block_number(1).build())
         .await;
+
     test.send_flashblock(
         FlashblockBuilder::new(&test, 1)
             .with_canonical_block_number(1)
@@ -771,6 +775,87 @@ async fn test_cached_flashblock_with_transactions_applied_after_canonical() {
             .expect("balance should be overridden"),
         test.expected_pending_balance(Account::Bob, transfer_amount)
     );
+}
+
+#[tokio::test]
+async fn test_hidden_canonical_tail_recovers_complete_next_block_lineage() {
+    let mut test = FlashblocksBuilderTestHarness::new().await;
+    let mut resets = test.flashblocks.subscribe_to_resets();
+
+    let visible_parent_transaction =
+        test.build_transaction_to_send_eth_with_nonce(Account::Alice, Account::Bob, 100_000, 0);
+    let hidden_parent_transaction =
+        test.build_transaction_to_send_eth_with_nonce(Account::Alice, Account::Charlie, 200_000, 1);
+
+    let parent_base = FlashblockBuilder::new_base(&test).build();
+    let mut parent_visible = FlashblockBuilder::new(&test, 1)
+        .with_transactions(vec![visible_parent_transaction.clone()])
+        .build();
+    parent_visible.diff.block_hash = B256::with_last_byte(1);
+
+    let canonical_parent = test
+        .new_canonical_block_without_processing(vec![
+            visible_parent_transaction,
+            hidden_parent_transaction,
+        ])
+        .await;
+    parent_visible.diff.gas_used = canonical_parent.gas_used;
+
+    test.send_flashblock(parent_base).await;
+    test.send_flashblock(parent_visible).await;
+
+    let mut next_base = FlashblockBuilder::new_base(&test).with_canonical_block_number(1).build();
+    next_base.base.as_mut().expect("base Flashblock").parent_hash = canonical_parent.hash();
+    test.send_flashblock(next_base).await;
+
+    assert!(
+        test.flashblocks.get_pending_blocks().is_none(),
+        "the parent hash mismatch must quarantine the speculative next-block lineage"
+    );
+    let reset = timeout(Duration::from_millis(100), resets.recv())
+        .await
+        .expect("the state processor should emit an invalidation promptly")
+        .expect("the reset channel should remain open");
+    assert_eq!(reset.block_number, 2);
+    assert_eq!(reset.flashblock_index, 0);
+
+    test.send_flashblock(
+        FlashblockBuilder::new(&test, 1)
+            .with_canonical_block_number(1)
+            .with_transactions(vec![test.build_transaction_to_send_eth_with_nonce(
+                Account::Alice,
+                Account::Bob,
+                300_000,
+                2,
+            )])
+            .build(),
+    )
+    .await;
+
+    test.send_flashblock(
+        FlashblockBuilder::new(&test, 2)
+            .with_canonical_block_number(1)
+            .with_transactions(vec![test.build_transaction_to_send_eth_with_nonce(
+                Account::Alice,
+                Account::Charlie,
+                400_000,
+                3,
+            )])
+            .build(),
+    )
+    .await;
+
+    test.flashblocks.on_canonical_block_received(canonical_parent);
+    sleep(Duration::from_millis(10)).await;
+
+    let pending = test
+        .flashblocks
+        .get_pending_blocks()
+        .get_block(true)
+        .expect("the complete cached lineage should replay from the canonical parent");
+    assert_eq!(pending.header.number, 2);
+    assert_eq!(pending.transactions.len(), 3);
+    assert_eq!(test.account_state(Account::Alice).nonce, 4);
 }
 
 #[tokio::test]

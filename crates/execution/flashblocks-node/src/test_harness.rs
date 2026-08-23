@@ -14,11 +14,14 @@ use std::{
     time::Duration,
 };
 
-use alloy_consensus::{BlockHeader, Receipt, Transaction};
+use alloy_consensus::{BlockHeader, Header, Receipt, Transaction};
 use alloy_eips::{BlockHashOrNumber, Decodable2718, Encodable2718};
-use alloy_primitives::{Address, B256, BlockNumber, Bytes, U256, hex::FromHex, map::HashMap};
+use alloy_primitives::{Address, B64, B256, BlockNumber, Bytes, U256, hex::FromHex, map::HashMap};
 use alloy_rpc_types_engine::PayloadId;
-use base_common_consensus::{BaseBlock, BaseReceipt, BaseTransactionSigned, TxDeposit};
+use base_common_chains::Upgrades;
+use base_common_consensus::{
+    BaseBlock, BaseReceipt, BaseTransactionSigned, HoloceneExtraData, JovianExtraData, TxDeposit,
+};
 use base_common_flashblocks::{
     ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, Metadata,
 };
@@ -51,6 +54,36 @@ use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 // The amount of time to wait (in milliseconds) after sending a new flashblock or canonical block
 // so it can be processed by the state processor
 const SLEEP_TIME: u64 = 10;
+// The deposit receipt uses 24,770 gas; the test engine's system processing contributes another 240
+// to the block header's cumulative gas usage.
+const BASE_FLASHBLOCK_GAS_USED: u64 = 25_010;
+const TEST_INITIAL_BASE_FEE: u64 = 1_000_000_000;
+
+/// Encodes the EIP-1559 parameters a test Flashblock builder would put in its next header.
+pub fn next_flashblock_extra_data(
+    chain_spec: &BaseChainSpec,
+    parent: &Header,
+    timestamp: u64,
+) -> Bytes {
+    let base_fee_params = chain_spec.base_fee_params_at_timestamp(timestamp);
+    let eip_1559_params = ((base_fee_params.max_change_denominator as u64) << 32)
+        | (base_fee_params.elasticity_multiplier as u64);
+    let eip_1559_params = B64::from(eip_1559_params);
+
+    if chain_spec.is_jovian_active_at_timestamp(timestamp) {
+        JovianExtraData::encode(
+            eip_1559_params,
+            base_fee_params,
+            parent.base_fee_per_gas.unwrap_or_default(),
+        )
+        .expect("test chain EIP-1559 parameters should encode")
+    } else if chain_spec.is_holocene_active_at_timestamp(timestamp) {
+        HoloceneExtraData::encode(eip_1559_params, base_fee_params)
+            .expect("test chain EIP-1559 parameters should encode")
+    } else {
+        Bytes::new()
+    }
+}
 
 /// Components that allow tests to interact with the Flashblocks worker tasks.
 #[derive(Clone)]
@@ -584,20 +617,41 @@ impl<'a> FlashblockBuilder<'a> {
         let current_block = self.harness.node.latest_block();
         let canonical_block_num =
             self.canonical_block_number.unwrap_or_else(|| current_block.number) + 1;
+        let timestamp = current_block.timestamp + 2;
+        let chain_spec = self.harness.provider.chain_spec();
+        let pending_parent = {
+            let pending = self.harness.flashblocks.get_pending_blocks();
+            pending
+                .as_ref()
+                .filter(|pending| pending.latest_block_number() + 1 == canonical_block_num)
+                .map(|pending| pending.latest_header())
+        };
+        let parent_header = pending_parent.as_deref().unwrap_or_else(|| current_block.header());
+        let parent_hash =
+            pending_parent.as_ref().map_or_else(|| current_block.hash(), |parent| parent.hash());
+        let base_fee_per_gas =
+            chain_spec.next_block_base_fee(parent_header, timestamp).unwrap_or_else(|| {
+                if canonical_block_num > current_block.number + 1 {
+                    TEST_INITIAL_BASE_FEE
+                } else {
+                    0
+                }
+            });
+        let extra_data = next_flashblock_extra_data(chain_spec.as_ref(), parent_header, timestamp);
 
         let base = if self.index == 0 {
             Some(ExecutionPayloadBaseV1 {
                 parent_beacon_block_root: current_block
                     .parent_beacon_block_root()
                     .unwrap_or_default(),
-                parent_hash: current_block.hash(),
+                parent_hash,
                 fee_recipient: Address::random(),
                 prev_randao: B256::random(),
                 block_number: canonical_block_num,
                 gas_limit: current_block.gas_limit,
-                timestamp: current_block.timestamp + 2,
-                extra_data: Bytes::new(),
-                base_fee_per_gas: U256::from(100),
+                timestamp,
+                extra_data,
+                base_fee_per_gas: U256::from(base_fee_per_gas),
             })
         } else {
             None
@@ -616,7 +670,9 @@ impl<'a> FlashblockBuilder<'a> {
                 state_root: B256::default(),
                 receipts_root: B256::default(),
                 block_hash: B256::default(),
-                gas_used: 0,
+                // `gas_used` is cumulative across Flashblocks, so later empty deltas retain the
+                // gas consumed by the base Flashblock's L1 attributes deposit.
+                gas_used: BASE_FLASHBLOCK_GAS_USED,
                 withdrawals: Vec::new(),
                 logs_bloom: Default::default(),
                 withdrawals_root: Default::default(),

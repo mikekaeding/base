@@ -20,6 +20,10 @@ base_metrics::define_metrics! {
     pending_clear_catchup: counter,
     #[describe("Number of times pending snapshot was cleared because of reorg")]
     pending_clear_reorg: counter,
+    #[describe("Number of speculative Flashblock lineages quarantined after state divergence")]
+    pending_state_quarantines: counter,
+    #[describe("Number of stale Flashblock snapshots withheld from subscribers")]
+    stale_flashblock_publications_suppressed: counter,
     #[describe("Pending snapshot flashblock index (current)")]
     pending_snapshot_fb_index: gauge,
     #[describe("Pending snapshot block number (current)")]

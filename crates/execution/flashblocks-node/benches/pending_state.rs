@@ -13,6 +13,7 @@ use base_common_flashblocks::{
     ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, Metadata,
 };
 use base_flashblocks::{FlashblocksAPI, FlashblocksReceiver, FlashblocksState};
+use base_flashblocks_node::test_harness::next_flashblock_extra_data;
 use base_node_runner::test_utils::{LocalNodeProvider, TestHarness};
 use base_test_utils::Account;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
@@ -74,7 +75,18 @@ impl BenchSetup {
         {
             for &count in tx_counts {
                 let txs = sample_transactions(&provider, count, scenario);
-                let blocks = build_flashblocks(&canonical_block, &txs);
+                let timestamp = canonical_block.timestamp + 2;
+                let base_fee_per_gas = provider
+                    .chain_spec()
+                    .next_block_base_fee(canonical_block.header(), timestamp)
+                    .unwrap_or_default();
+                let extra_data = next_flashblock_extra_data(
+                    provider.chain_spec().as_ref(),
+                    canonical_block.header(),
+                    timestamp,
+                );
+                let blocks =
+                    build_flashblocks(&canonical_block, &txs, base_fee_per_gas, extra_data);
                 flashblocks
                     .push((format!("pending_state_{}_{}_txs", scenario.label(), count), blocks));
             }
@@ -191,11 +203,13 @@ async fn wait_for_pending_state(
 fn build_flashblocks(
     canonical_block: &RecoveredBlock<BaseBlock>,
     transactions: &[BaseTransactionSigned],
+    base_fee_per_gas: u64,
+    extra_data: Bytes,
 ) -> Vec<Flashblock> {
     let mut flashblocks = Vec::new();
     let block_number = canonical_block.number + 1;
 
-    flashblocks.push(base_flashblock(canonical_block, block_number));
+    flashblocks.push(base_flashblock(canonical_block, block_number, base_fee_per_gas, extra_data));
 
     let chunk_size = CHUNK_SIZE.max(1);
     let mut gas_used = DEPOSIT_GAS_USED;
@@ -214,6 +228,8 @@ fn build_flashblocks(
 fn base_flashblock(
     canonical_block: &RecoveredBlock<BaseBlock>,
     block_number: BlockNumber,
+    base_fee_per_gas: u64,
+    extra_data: Bytes,
 ) -> Flashblock {
     Flashblock {
         payload_id: PayloadId::default(),
@@ -226,8 +242,8 @@ fn base_flashblock(
             block_number,
             gas_limit: canonical_block.gas_limit,
             timestamp: canonical_block.timestamp + 2,
-            extra_data: Bytes::new(),
-            base_fee_per_gas: U256::from(100),
+            extra_data,
+            base_fee_per_gas: U256::from(base_fee_per_gas),
         }),
         diff: ExecutionPayloadFlashblockDeltaV1 {
             state_root: B256::ZERO,
