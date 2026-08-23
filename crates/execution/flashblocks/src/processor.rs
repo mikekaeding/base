@@ -191,7 +191,7 @@ where
                                 for (flashblock, received_at) in cached {
                                     let fb_prev = self.pending_blocks.load_full();
                                     if !self
-                                        .apply_flashblock(fb_prev, flashblock, received_at)
+                                        .apply_flashblock(fb_prev, flashblock, received_at, true)
                                         .await
                                     {
                                         break;
@@ -210,7 +210,13 @@ where
                         block_number = flashblock.metadata.block_number,
                         flashblock_index = flashblock.index
                     );
-                    self.apply_flashblock(prev_pending_blocks, flashblock, Some(received_at)).await;
+                    self.apply_flashblock(
+                        prev_pending_blocks,
+                        flashblock,
+                        Some(received_at),
+                        false,
+                    )
+                    .await;
                 }
             }
         }
@@ -221,15 +227,20 @@ where
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         flashblock: Flashblock,
         received_at: Option<Instant>,
+        recovery: bool,
     ) -> bool {
         let start_time = Instant::now();
         match self.process_flashblock(prev_pending_blocks.clone(), &flashblock) {
             Ok(new_pending_blocks) => {
-                let publish = received_at
+                let fresh = received_at
                     .is_some_and(|received_at| received_at.elapsed() <= MAX_TRADABLE_QUEUE_AGE);
+                let publish = received_at.is_some() && (fresh || recovery);
                 if publish && let Some(ref pb) = new_pending_blocks {
                     _ = self.sender.send(Arc::clone(pb));
-                } else if received_at.is_some() {
+                    if recovery && !fresh {
+                        Metrics::stale_flashblock_recovery_publications().increment(1);
+                    }
+                } else if received_at.is_some() && !fresh {
                     Metrics::stale_flashblock_publications_suppressed().increment(1);
                 }
                 self.pending_blocks.swap(new_pending_blocks);

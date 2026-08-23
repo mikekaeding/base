@@ -726,7 +726,7 @@ async fn test_flashblock_cached_and_applied_after_canonical_block() {
 }
 
 #[tokio::test]
-async fn test_stale_cached_flashblock_recovers_without_publication() {
+async fn test_stale_cached_flashblock_republishes_for_state_recovery() {
     let mut test = FlashblocksBuilderTestHarness::new().await;
     let mut pending = test.flashblocks.subscribe_to_flashblocks();
 
@@ -735,15 +735,17 @@ async fn test_stale_cached_flashblock_recovers_without_publication() {
     sleep(Duration::from_millis(250)).await;
     test.new_canonical_block(vec![]).await;
 
-    assert!(
-        timeout(Duration::from_millis(50), pending.recv()).await.is_err(),
-        "stale recovery must not become a trade signal"
-    );
+    let published = timeout(Duration::from_millis(100), pending.recv())
+        .await
+        .expect("stale recovery should be published for downstream synchronization")
+        .expect("the pending-state channel should remain open");
+    assert_eq!(published.latest_block_number(), 2);
+    assert_eq!(published.latest_flashblock_index(), 0);
     let recovered = test
         .flashblocks
         .get_pending_blocks()
         .get_block(true)
-        .expect("stale cached state should still recover internally");
+        .expect("stale cached state should recover internally");
     assert_eq!(recovered.header.number, 2);
 }
 
