@@ -2,6 +2,7 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use alloy_eips::BlockNumberOrTag;
 use base_common_rpc_types_engine::BaseExecutionPayloadEnvelope;
+use tokio::sync::watch;
 use tokio::{sync::mpsc, time};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -10,7 +11,8 @@ use crate::follow::{error::FollowError, source::RemoteClient};
 
 /// Number of source L2 payloads to keep prefetched ahead of the insert loop.
 pub(super) const PREFETCH_WINDOW: usize = 50;
-const SOURCE_HEAD_BACKOFF: Duration = Duration::from_secs(1);
+const SOURCE_HEAD_BACKOFF: Duration = Duration::from_millis(200);
+const SOURCE_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
 const PREFETCH_FAILURE_WARN_INTERVAL: u64 = 5;
 
 /// A fetched source payload.
@@ -39,7 +41,11 @@ where
 
     /// Starts fetching from the local node head and pushes payloads through a
     /// bounded channel.
-    pub(super) async fn run(self, start_from_local_head: u64) -> Result<(), FollowError> {
+    pub(super) async fn run(
+        self,
+        start_from_local_head: u64,
+        mut head_notifications: Option<watch::Receiver<()>>,
+    ) -> Result<(), FollowError> {
         let mut next_fetch = start_from_local_head.saturating_add(1);
         let mut source_latest = start_from_local_head;
         let mut consecutive_payload_failures = 0;
@@ -50,18 +56,28 @@ where
             }
 
             if next_fetch > source_latest {
-                source_latest = self.refresh_source_latest(source_latest).await;
+                source_latest = tokio::select! {
+                    _ = self.cancellation.cancelled() => return Ok(()),
+                    latest = self.refresh_source_latest(source_latest) => latest,
+                };
                 if next_fetch > source_latest {
-                    self.backoff_at_source_head().await;
+                    self.wait_at_source_head(&mut head_notifications).await;
                     continue;
                 }
             }
 
-            let payload = self.source.get_payload_by_number(next_fetch).await;
+            let payload = tokio::select! {
+                _ = self.cancellation.cancelled() => return Ok(()),
+                payload = self.source.get_payload_by_number(next_fetch) => payload,
+            };
 
             match payload {
                 Ok(payload) => {
-                    if self.blocks_to_insert_tx.send(payload).await.is_err() {
+                    let sent = tokio::select! {
+                        _ = self.cancellation.cancelled() => return Ok(()),
+                        sent = self.blocks_to_insert_tx.send(payload) => sent,
+                    };
+                    if sent.is_err() {
                         return Ok(());
                     }
                     consecutive_payload_failures = 0;
@@ -86,7 +102,10 @@ where
                             "Failed to prefetch source payload"
                         );
                     }
-                    self.backoff_at_source_head().await;
+                    tokio::select! {
+                        _ = self.cancellation.cancelled() => return Ok(()),
+                        _ = time::sleep(SOURCE_FAILURE_BACKOFF) => {}
+                    }
                 }
             }
         }
@@ -102,7 +121,81 @@ where
         }
     }
 
-    async fn backoff_at_source_head(&self) {
-        time::sleep(SOURCE_HEAD_BACKOFF).await;
+    async fn wait_at_source_head(&self, notifications: &mut Option<watch::Receiver<()>>) {
+        // Watch retains a wake arriving between the latest-head query and this wait.
+        // The fallback covers HTTP sources, lost notifications and subscription reconnects.
+        tokio::select! {
+            _ = self.cancellation.cancelled() => {}
+            _ = time::sleep(SOURCE_HEAD_BACKOFF) => {}
+            changed = async {
+                match notifications.as_mut() {
+                    Some(receiver) => receiver.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() {
+                    *notifications = None;
+                    // A closed notification channel must not become a busy-poll loop.
+                    tokio::select! {
+                        _ = self.cancellation.cancelled() => {}
+                        _ = time::sleep(SOURCE_HEAD_BACKOFF) => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::follow::source::MockRemoteClient;
+
+    fn prefetcher() -> PayloadPrefetcher<MockRemoteClient> {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        PayloadPrefetcher::new(Arc::new(MockRemoteClient::new()), CancellationToken::new(), sender)
+    }
+
+    #[tokio::test]
+    async fn notification_received_before_wait_is_not_lost() {
+        let prefetcher = prefetcher();
+        let (sender, receiver) = watch::channel(());
+        sender.send(()).expect("test receiver is alive");
+        let mut receiver = Some(receiver);
+        time::timeout(Duration::from_millis(100), prefetcher.wait_at_source_head(&mut receiver))
+            .await
+            .expect("queued head wakes without waiting for poll interval");
+    }
+
+    #[tokio::test]
+    async fn closed_notifications_fall_back_without_busy_loop() {
+        let prefetcher = prefetcher();
+        let (sender, receiver) = watch::channel(());
+        drop(sender);
+        let mut receiver = Some(receiver);
+        assert!(
+            time::timeout(Duration::from_millis(20), prefetcher.wait_at_source_head(&mut receiver))
+                .await
+                .is_err()
+        );
+        assert!(receiver.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_head_wait() {
+        let prefetcher = prefetcher();
+        prefetcher.cancellation.cancel();
+        time::timeout(Duration::from_millis(100), prefetcher.wait_at_source_head(&mut None))
+            .await
+            .expect("cancellation does not wait for poll interval");
+    }
+
+    #[tokio::test]
+    async fn polling_still_advances_without_notifications() {
+        let prefetcher = prefetcher();
+        time::timeout(Duration::from_secs(1), prefetcher.wait_at_source_head(&mut None))
+            .await
+            .expect("HTTP and disconnected sources retain bounded polling");
     }
 }

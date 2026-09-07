@@ -357,10 +357,7 @@ mod tests {
         let parent = L2BlockInfo::default();
         let batch = SingleBatch::default();
         let result = attributes_queue.create_next_attributes(batch, parent).await.unwrap_err();
-        assert_eq!(
-            result,
-            PipelineError::AttributesBuilder(BuilderError::AttributesUnavailable).crit()
-        );
+        assert_eq!(result, PipelineError::from(BuilderError::AttributesUnavailable).crit());
     }
 
     #[tokio::test]

@@ -173,9 +173,7 @@ where
             &l1_header,
             next_l2_time,
         )
-        .map_err(|e| {
-            PipelineError::AttributesBuilder(BuilderError::Custom(e.to_string())).crit()
-        })?;
+        .map_err(|e| PipelineError::from(BuilderError::Custom(e.to_string())).crit())?;
         let mut encoded_l1_info_tx = Vec::with_capacity(l1_info_tx_envelope.length());
         l1_info_tx_envelope.encode_2718(&mut encoded_l1_info_tx);
 
@@ -418,7 +416,7 @@ mod tests {
         // Here the default header is used whose hash will not equal the custom `l2_hash` above.
         let expected = BuilderError::BlockMismatch(epoch, l2_parent.l1_origin);
         let err = builder.prepare_payload_attributes(l2_parent, epoch).await.unwrap_err();
-        assert_eq!(err, PipelineErrorKind::Reset(ResetError::AttributesBuilder(expected)));
+        assert_eq!(err, PipelineErrorKind::Reset(ResetError::from(expected)));
     }
 
     #[tokio::test]
@@ -450,7 +448,7 @@ mod tests {
             timestamp,
         );
         let err = builder.prepare_payload_attributes(l2_parent, epoch).await.unwrap_err();
-        assert_eq!(err, PipelineErrorKind::Reset(ResetError::AttributesBuilder(expected)));
+        assert_eq!(err, PipelineErrorKind::Reset(ResetError::from(expected)));
     }
 
     #[tokio::test]

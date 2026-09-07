@@ -1,5 +1,6 @@
 //! This module contains derivation errors thrown within the pipeline.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 
 use alloy_eips::BlockId;
@@ -244,7 +245,7 @@ pub enum PipelineError {
     /// construction of block attributes from batch data. It indicates issues
     /// with attribute validation, formatting, or consistency checks.
     #[error("Attributes builder error: {0}")]
-    AttributesBuilder(#[from] BuilderError),
+    AttributesBuilder(#[source] Box<BuilderError>),
     /// Data encoding or decoding operation failed.
     ///
     /// This error wraps [`PipelineEncodingError`] variants that occur during
@@ -332,7 +333,7 @@ pub enum ResetError {
     ReorgDetected(B256, B256),
     /// Attributes builder error variant, with [`BuilderError`].
     #[error("Attributes builder error: {0}")]
-    AttributesBuilder(#[from] BuilderError),
+    AttributesBuilder(#[source] Box<BuilderError>),
     /// A Holocene activation temporary error.
     #[error("Holocene activation reset")]
     HoloceneActivation,
@@ -382,6 +383,19 @@ pub enum PipelineEncodingError {
     SpanBatchError(#[from] SpanBatchError),
 }
 
+// Large, rare attribute diagnostics should not enlarge every successful pipeline stack frame.
+impl From<BuilderError> for PipelineError {
+    fn from(error: BuilderError) -> Self {
+        Self::AttributesBuilder(Box::new(error))
+    }
+}
+
+impl From<BuilderError> for ResetError {
+    fn from(error: BuilderError) -> Self {
+        Self::AttributesBuilder(Box::new(error))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::error::Error;
@@ -405,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_error_source() {
-        let err = PipelineError::AttributesBuilder(BuilderError::BlockMismatch(
+        let err = PipelineError::from(BuilderError::BlockMismatch(
             Default::default(),
             Default::default(),
         ));
@@ -440,10 +454,7 @@ mod tests {
             ResetError::BadTimestamp(0, 0),
             ResetError::L1OriginMismatch(0, 0),
             ResetError::ReorgDetected(Default::default(), Default::default()),
-            ResetError::AttributesBuilder(BuilderError::BlockMismatch(
-                Default::default(),
-                Default::default(),
-            )),
+            ResetError::from(BuilderError::BlockMismatch(Default::default(), Default::default())),
             ResetError::HoloceneActivation,
             ResetError::BlobsUnavailable(0),
             ResetError::BlockNotFound(B256::default().into()),

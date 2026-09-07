@@ -193,7 +193,10 @@ where
     Remote: RemoteClient + 'static,
     Gate: ProofGate + 'static,
 {
-    pub(super) async fn start(mut self) -> Result<(), FollowError> {
+    pub(super) async fn start(
+        mut self,
+        head_notifications: Option<tokio::sync::watch::Receiver<()>>,
+    ) -> Result<(), FollowError> {
         let next_insert = self.follow_from_block.block_info.number.saturating_add(1);
         let (blocks_to_insert_tx, blocks_to_insert_rx) = mpsc::channel(PREFETCH_WINDOW);
         let prefetcher = PayloadPrefetcher::new(
@@ -201,7 +204,8 @@ where
             self.cancellation.clone(),
             blocks_to_insert_tx,
         );
-        let fetch_loop = prefetcher.run(self.follow_from_block.block_info.number);
+        let fetch_loop =
+            prefetcher.run(self.follow_from_block.block_info.number, head_notifications);
         let insert_loop = Self::run_ordered_insert_loop(
             Arc::clone(&self.engine),
             self.cancellation.clone(),
@@ -484,7 +488,7 @@ mod tests {
         let (blocks_to_insert_tx, blocks_to_insert_rx) = mpsc::channel(PREFETCH_WINDOW);
         let prefetcher =
             PayloadPrefetcher::new(Arc::new(source), cancellation.clone(), blocks_to_insert_tx);
-        let handle = tokio::spawn(async move { prefetcher.run(0).await });
+        let handle = tokio::spawn(async move { prefetcher.run(0, None).await });
 
         let deadline = Instant::now() + Duration::from_secs(1);
         while blocks_to_insert_rx.len() < PREFETCH_WINDOW && Instant::now() < deadline {
@@ -545,7 +549,7 @@ mod tests {
             proof_gate,
             Duration::ZERO,
         );
-        let handle = tokio::spawn(async move { runtime.start().await });
+        let handle = tokio::spawn(async move { runtime.start(None).await });
 
         time::sleep(Duration::from_millis(500)).await;
         assert_eq!(engine.inserted.lock().await.len(), DEFAULT_PROOFS_MAX_BLOCKS_AHEAD as usize);
@@ -661,7 +665,7 @@ mod tests {
             Duration::ZERO,
         );
         let started = Instant::now();
-        let handle = tokio::spawn(async move { runtime.start().await });
+        let handle = tokio::spawn(async move { runtime.start(None).await });
 
         loop {
             if engine.inserted.lock().await.len() >= 20 {

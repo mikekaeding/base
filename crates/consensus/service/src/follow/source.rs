@@ -8,12 +8,20 @@ use base_common_consensus::BaseTxEnvelope;
 use base_common_network::Base;
 use base_common_rpc_types_engine::{BaseExecutionPayload, BaseExecutionPayloadEnvelope};
 use base_protocol::BlockInfo;
+use futures::StreamExt;
+use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use url::Url;
 
 /// Error type for [`RemoteL2Client`] operations.
 #[derive(Debug, Error)]
 pub enum RemoteL2ClientError {
+    /// Connecting the configured HTTP or WebSocket source failed.
+    #[error("failed to connect source L2 RPC: {0}")]
+    Connect(alloy_transport::TransportError),
     /// Failed to fetch block from L2 EL.
     #[error("failed to fetch block at {tag}: {source}")]
     FetchBlock {
@@ -46,7 +54,7 @@ pub trait RemoteClient: Debug + Send + Sync {
     ) -> Result<BaseExecutionPayloadEnvelope, RemoteL2ClientError>;
 }
 
-/// Client that polls a source L2 execution layer node for block data and
+/// Client that follows an HTTP or WebSocket L2 execution layer source and
 /// converts blocks into [`BaseExecutionPayloadEnvelope`] for engine insertion.
 #[derive(Debug, Clone)]
 pub struct RemoteL2Client {
@@ -55,9 +63,51 @@ pub struct RemoteL2Client {
 
 impl RemoteL2Client {
     /// Creates a new [`RemoteL2Client`] from a source L2 node URL.
-    pub fn new(url: Url) -> Self {
-        let provider = RootProvider::<Base>::new_http(url);
-        Self { provider }
+    pub async fn new(url: Url) -> Result<Self, RemoteL2ClientError> {
+        let provider = RootProvider::<Base>::connect(url.as_str())
+            .await
+            .map_err(RemoteL2ClientError::Connect)?;
+        Ok(Self { provider })
+    }
+
+    /// Publishes coalesced wake hints; payload identity and execution remain independently checked.
+    pub(super) async fn follow_heads(
+        self,
+        sender: watch::Sender<()>,
+        cancellation: CancellationToken,
+    ) -> Result<(), crate::follow::error::FollowError> {
+        if self.provider.client().pubsub_frontend().is_none() {
+            cancellation.cancelled().await;
+            return Ok(());
+        }
+        loop {
+            let subscription = tokio::select! {
+                _ = cancellation.cancelled() => return Ok(()),
+                result = self.provider.subscribe_blocks() => result,
+            };
+            match subscription {
+                Ok(subscription) => {
+                    let mut heads = subscription.into_stream();
+                    loop {
+                        tokio::select! {
+                            _ = cancellation.cancelled() => return Ok(()),
+                            head = heads.next() => {
+                                if head.is_none() { break; }
+                                if sender.send(()).is_err() { return Ok(()); }
+                            }
+                        }
+                    }
+                    warn!(target: "follow", "Source head subscription closed; resubscribing while polling remains active");
+                }
+                Err(error) => {
+                    warn!(target: "follow", %error, "Source head subscription failed; retrying while polling remains active")
+                }
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
     }
 }
 

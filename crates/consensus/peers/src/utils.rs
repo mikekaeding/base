@@ -31,12 +31,11 @@ impl PeerUtils {
             let mut addr = Multiaddr::from(*socket.ip());
             addr.push(Protocol::Tcp(socket.port()));
             addr
-        } else if let Some(socket) = enr.tcp6_socket() {
+        } else {
+            let socket = enr.tcp6_socket()?;
             let mut addr = Multiaddr::from(*socket.ip());
             addr.push(Protocol::Tcp(socket.port()));
             addr
-        } else {
-            return None;
         };
 
         let CombinedPublicKey::Secp256k1(pub_key) = enr.public_key() else {

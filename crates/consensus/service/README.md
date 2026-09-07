@@ -5,6 +5,16 @@
 
 An implementation of the Base [RollupNode][rn-spec] service.
 
+## Source follow latency
+
+Follow mode accepts HTTP(S) or WebSocket source L2 RPC URLs. WebSocket `newHeads` messages wake the
+ordered payload fetcher immediately; they are coalesced hints, not trusted execution results.
+Head discovery polls at most every 200 ms while caught up, including during subscription recovery.
+Failed payload fetches retain a one-second backoff. Subscriptions reconnect, waits are cancellable,
+and a closed notification channel cannot cause busy polling. Engine validation, payload order and
+proof/safe/finalized gates are unchanged. Benchmark source availability, discovery and local engine
+import separately: a notification does not guarantee that its full payload is already queryable.
+
 [rn-spec]: https://specs.base.org/protocol/consensus
 
 ## Overview
