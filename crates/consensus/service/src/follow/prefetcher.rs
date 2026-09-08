@@ -7,7 +7,7 @@ use tokio::{sync::mpsc, time};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::follow::{error::FollowError, source::RemoteClient};
+use crate::follow::{error::FollowError, source::RemoteClient, source::RemoteL2ClientError};
 
 /// Number of source L2 payloads to keep prefetched ahead of the insert loop.
 pub(super) const PREFETCH_WINDOW: usize = 50;
@@ -102,11 +102,26 @@ where
                             "Failed to prefetch source payload"
                         );
                     }
-                    tokio::select! {
-                        _ = self.cancellation.cancelled() => return Ok(()),
-                        _ = time::sleep(SOURCE_FAILURE_BACKOFF) => {}
-                    }
+                    self.wait_after_payload_error(&e, &mut head_notifications).await;
                 }
+            }
+        }
+    }
+
+    async fn wait_after_payload_error(
+        &self,
+        error: &RemoteL2ClientError,
+        notifications: &mut Option<watch::Receiver<()>>,
+    ) {
+        if matches!(error, RemoteL2ClientError::BlockNotFound(_)) {
+            // Latest-head RPC and full-payload availability can race across source backends.
+            // A pushed head must wake this wait too, not sit behind transport-failure backoff.
+            debug!(target: "follow", "Advertised source head has no payload yet; waiting for head notification or bounded retry");
+            self.wait_at_source_head(notifications).await;
+        } else {
+            tokio::select! {
+                _ = self.cancellation.cancelled() => {}
+                _ = time::sleep(SOURCE_FAILURE_BACKOFF) => {}
             }
         }
     }
@@ -166,6 +181,32 @@ mod tests {
         time::timeout(Duration::from_millis(100), prefetcher.wait_at_source_head(&mut receiver))
             .await
             .expect("queued head wakes without waiting for poll interval");
+    }
+
+    #[tokio::test]
+    async fn advertised_head_payload_race_wakes_on_push_without_one_second_backoff() {
+        let prefetcher = prefetcher();
+        let (sender, receiver) = watch::channel(());
+        let mut receiver = Some(receiver);
+        sender.send(()).expect("fixture receiver is live");
+        time::timeout(
+            Duration::from_millis(100),
+            prefetcher.wait_after_payload_error(
+                &RemoteL2ClientError::BlockNotFound("42".to_owned()),
+                &mut receiver,
+            ),
+        )
+        .await
+        .expect("a new head wakes a not-yet-published payload");
+        let started = time::Instant::now();
+        prefetcher
+            .wait_after_payload_error(
+                &RemoteL2ClientError::BlockNotFound("42".to_owned()),
+                &mut receiver,
+            )
+            .await;
+        assert!(started.elapsed() >= SOURCE_HEAD_BACKOFF);
+        assert!(started.elapsed() < SOURCE_FAILURE_BACKOFF);
     }
 
     #[tokio::test]
