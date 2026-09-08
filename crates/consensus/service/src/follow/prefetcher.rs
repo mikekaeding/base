@@ -108,7 +108,8 @@ where
         }
     }
 
-    async fn wait_after_payload_error(
+    /// Waits for payload availability or a bounded retry, retaining longer backoff for RPC failures.
+    pub async fn wait_after_payload_error(
         &self,
         error: &RemoteL2ClientError,
         notifications: &mut Option<watch::Receiver<()>>,
