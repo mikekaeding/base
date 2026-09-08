@@ -91,3 +91,33 @@ while let Ok(pending) = updates.recv().await {
 ## License
 
 Licensed under the [MIT License](https://github.com/base/base/blob/main/LICENSE).
+
+## Pending RPC execution
+
+`eth_call` and `eth_estimateGas` with `pending` combine the accumulated pending account/storage
+state with the latest pending header from one immutable snapshot. The underlying database remains
+anchored to the canonical block preceding that snapshot. NUMBER, TIMESTAMP, GASLIMIT, COINBASE,
+PREVRANDAO, and BASEFEE therefore describe the same pending block as the storage being executed.
+An unavailable pending snapshot falls back to the latest canonical block.
+
+Explicit user block overrides take precedence field by field. Account overrides also preserve
+unmentioned pending balance, nonce, code, and storage. A user `state` replaces the whole storage
+map; `stateDiff` replaces only supplied slots. Invalid simultaneous user `state` and `stateDiff`
+remain invalid for the underlying RPC validator.
+
+The Flashblocks `eth_simulateV1` extension executes its first group in the latest pending block,
+with explicit user group overrides taking precedence. It applies the pending storage snapshot
+once, before that group; subsequent groups retain simulated mutations and normal Reth block/time
+progression. These compact overrides do not provide a historical archive or sequencer inclusion
+guarantee, and do not change exact state or block-hash guards.
+
+Pending snapshot acquisition uses an Arc reference. Preparing a call clones the full account and
+storage override map, so its cost scales with pending accounts and slots. Preparation acquires the
+existing RPC blocking-IO permit and performs that clone on Reth's blocking pool. It must never
+clone the complete map on a Tokio scheduler thread or once per simulated group. The preparation
+permit is released before the underlying RPC acquires its execution permit, avoiding nested
+permit acquisition. Request cancellation retains the permit until active preparation completes.
+
+The RPC regressions execute EVM environment-reading bytecode against an older canonical starting
+environment, verify explicit overrides, preserve coherent snapshots across publication, and
+check that multiple simulation groups do not reset pending storage.

@@ -56,8 +56,8 @@ use alloy_primitives::{
 };
 use alloy_rpc_types::{
     BlockOverrides,
-    simulate::{SimBlock, SimulatePayload, SimulatedBlock},
-    state::{EvmOverrides, StateOverride, StateOverridesBuilder},
+    simulate::{SimulatePayload, SimulatedBlock},
+    state::{EvmOverrides, StateOverride},
 };
 use alloy_rpc_types_eth::{Filter, Log};
 use base_common_network::Base;
@@ -78,6 +78,7 @@ use tokio::{sync::broadcast::error::RecvError, time};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{debug, trace, warn};
 
+use crate::PendingBlocks;
 use crate::{FlashblocksAPI, PendingBlocksAPI, metrics::Metrics};
 
 /// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
@@ -389,32 +390,15 @@ where
             block_overrides = ?block_overrides,
         );
 
-        let mut block_id = block_number.unwrap_or_default();
-        let mut pending_overrides = EvmOverrides::default();
-        // If the call is to pending block use cached override (if it exists)
+        let block_id = block_number.unwrap_or_default();
         if block_id.is_pending() {
             Metrics::rpc_call().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            block_id = pending_blocks.get_canonical_block_number().into();
-            pending_overrides.state = pending_blocks.get_state_overrides();
         }
-
-        // Apply user's overrides on top
-        let mut state_overrides_builder =
-            StateOverridesBuilder::new(pending_overrides.state.unwrap_or_default());
-        state_overrides_builder =
-            state_overrides_builder.extend(state_overrides.unwrap_or_default());
-        let final_overrides = state_overrides_builder.build();
-
-        // Delegate to the underlying eth_api
-        EthCall::call(
-            &self.eth_api,
-            transaction,
-            Some(block_id),
-            EvmOverrides::new(Some(final_overrides), block_overrides),
-        )
-        .await
-        .map_err(Into::into)
+        let (block_id, pending_overrides) = self.pending_execution_overrides(block_id).await?;
+        let overrides = merge_overrides(pending_overrides, state_overrides, block_overrides);
+        EthCall::call(&self.eth_api, transaction, Some(block_id), overrides)
+            .await
+            .map_err(Into::into)
     }
 
     async fn estimate_gas(
@@ -423,75 +407,31 @@ where
         block_number: Option<BlockId>,
         overrides: Option<StateOverride>,
     ) -> RpcResult<U256> {
-        debug!(
-            message = "rpc::estimate_gas",
-            transaction = ?transaction,
-            block_number = ?block_number,
-            overrides = ?overrides,
-        );
-
-        let mut block_id = block_number.unwrap_or_default();
-        let mut pending_overrides = EvmOverrides::default();
-        // If the call is to pending block use cached override (if it exists)
+        debug!(message = "rpc::estimate_gas", transaction = ?transaction, block_number = ?block_number, overrides = ?overrides);
+        let block_id = block_number.unwrap_or_default();
         if block_id.is_pending() {
             Metrics::rpc_estimate_gas().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            block_id = pending_blocks.get_canonical_block_number().into();
-            pending_overrides.state = pending_blocks.get_state_overrides();
         }
-
-        let mut state_overrides_builder =
-            StateOverridesBuilder::new(pending_overrides.state.unwrap_or_default());
-        state_overrides_builder = state_overrides_builder.extend(overrides.unwrap_or_default());
-        let final_overrides = state_overrides_builder.build();
-
-        EthCall::estimate_gas_at(
-            &self.eth_api,
-            transaction,
-            block_id,
-            EvmOverrides::new(Some(final_overrides), pending_overrides.block),
-        )
-        .await
-        .map_err(Into::into)
+        let (block_id, pending_overrides) = self.pending_execution_overrides(block_id).await?;
+        let overrides = merge_overrides(pending_overrides, overrides, None);
+        EthCall::estimate_gas_at(&self.eth_api, transaction, block_id, overrides)
+            .await
+            .map_err(Into::into)
     }
 
     async fn simulate_v1(
         &self,
-        opts: SimulatePayload<BaseTransactionRequest>,
+        mut opts: SimulatePayload<BaseTransactionRequest>,
         block_number: Option<BlockId>,
     ) -> RpcResult<Vec<SimulatedBlock<RpcBlock<Eth::NetworkTypes>>>> {
-        debug!(
-            message = "rpc::simulate_v1",
-            block_number = ?block_number,
-        );
-
-        let mut block_id = block_number.unwrap_or_default();
-        let mut pending_overrides = EvmOverrides::default();
-
-        // If the call is to pending block use cached override (if it exists)
+        debug!(message = "rpc::simulate_v1", block_number = ?block_number);
+        let block_id = block_number.unwrap_or_default();
         if block_id.is_pending() {
             Metrics::rpc_simulate_v1().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            block_id = pending_blocks.get_canonical_block_number().into();
-            pending_overrides.state = pending_blocks.get_state_overrides();
         }
-
-        // Prepend flashblocks pending overrides to the block state calls
-        let mut block_state_calls: Vec<SimBlock<BaseTransactionRequest>> = Vec::new();
-        for sim_block in opts.block_state_calls {
-            let mut state_overrides_builder =
-                StateOverridesBuilder::new(pending_overrides.state.clone().unwrap_or_default());
-            state_overrides_builder =
-                state_overrides_builder.extend(sim_block.state_overrides.unwrap_or_default());
-            let final_overrides = state_overrides_builder.build();
-
-            let block_state_call = SimBlock { state_overrides: Some(final_overrides), ..sim_block };
-            block_state_calls.push(block_state_call);
-        }
-
-        let payload = SimulatePayload { block_state_calls, ..opts };
-
-        EthCall::simulate_v1(&self.eth_api, payload, Some(block_id)).await.map_err(Into::into)
+        let (block_id, pending_overrides) = self.pending_execution_overrides(block_id).await?;
+        apply_pending_simulation_overrides(&mut opts, pending_overrides);
+        EthCall::simulate_v1(&self.eth_api, opts, Some(block_id)).await.map_err(Into::into)
     }
 
     async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<Log>> {
@@ -590,7 +530,38 @@ impl<Eth, FB> EthApiExt<Eth, FB>
 where
     Eth: FullEthApi<NetworkTypes = Base> + Send + Sync + 'static,
     FB: FlashblocksAPI + Send + Sync + 'static,
+    jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
 {
+    async fn pending_execution_overrides(
+        &self,
+        block_id: BlockId,
+    ) -> RpcResult<(BlockId, EvmOverrides)> {
+        if !block_id.is_pending() {
+            return Ok((block_id, EvmOverrides::default()));
+        }
+        let permit = self.eth_api.acquire_owned_blocking_io().await.map_err(|error| {
+            ErrorObjectOwned::owned(
+                -32603,
+                format!("failed to acquire pending state preparation permit: {error}"),
+                None::<()>,
+            )
+        })?;
+        // Capture one immutable snapshot after admission. Clone its potentially large
+        // account/storage map on the bounded blocking pool, never a Tokio worker.
+        let pending = self.flashblocks_state.get_pending_blocks().as_ref().map(Arc::clone);
+        self.eth_api
+            .spawn_blocking_io(move |_| {
+                let overrides = pending.as_deref().map_or_else(
+                    || (BlockNumberOrTag::Latest.into(), EvmOverrides::default()),
+                    pending_snapshot_overrides,
+                );
+                drop(permit);
+                Ok(overrides)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     async fn wait_for_flashblocks_receipt(&self, tx_hash: TxHash) -> Option<RpcReceipt<Base>> {
         let mut receiver = self.flashblocks_state.subscribe_to_flashblocks();
 
@@ -635,5 +606,333 @@ where
             }
         }
         None
+    }
+}
+
+fn pending_snapshot_overrides(pending: &PendingBlocks) -> (BlockId, EvmOverrides) {
+    let header = pending.latest_header();
+    let block = BlockOverrides {
+        number: Some(U256::from(header.number)),
+        difficulty: Some(header.difficulty),
+        time: Some(header.timestamp),
+        gas_limit: Some(header.gas_limit),
+        coinbase: Some(header.beneficiary),
+        random: Some(header.mix_hash),
+        base_fee: header.base_fee_per_gas.map(U256::from),
+        beacon_root: header.parent_beacon_block_root,
+        ..Default::default()
+    };
+    (
+        pending.canonical_block_number().into(),
+        EvmOverrides::new(pending.get_state_overrides(), Some(Box::new(block))),
+    )
+}
+
+fn merge_overrides(
+    mut pending: EvmOverrides,
+    state: Option<StateOverride>,
+    block: Option<Box<BlockOverrides>>,
+) -> EvmOverrides {
+    if let Some(state) = state {
+        let accounts = pending.state.get_or_insert_with(StateOverride::default);
+        for (address, user) in state {
+            let account = accounts.entry(address).or_default();
+            account.balance = user.balance.or(account.balance);
+            account.nonce = user.nonce.or(account.nonce);
+            account.code = user.code.or_else(|| account.code.take());
+            account.move_precompile_to = user.move_precompile_to.or(account.move_precompile_to);
+            if user.state.is_some() {
+                account.state = user.state;
+                // Preserve an invalid user state+stateDiff combination for normal RPC validation.
+                account.state_diff = user.state_diff;
+            } else if let Some(diff) = user.state_diff {
+                if let Some(storage) = account.state.as_mut() {
+                    storage.extend(diff);
+                } else {
+                    account.state_diff.get_or_insert_with(Default::default).extend(diff);
+                }
+            }
+        }
+    }
+    if let Some(user) = block {
+        let block = pending.block.get_or_insert_with(Default::default);
+        block.number = user.number.or(block.number);
+        block.difficulty = user.difficulty.or(block.difficulty);
+        block.time = user.time.or(block.time);
+        block.gas_limit = user.gas_limit.or(block.gas_limit);
+        block.coinbase = user.coinbase.or(block.coinbase);
+        block.random = user.random.or(block.random);
+        block.base_fee = user.base_fee.or(block.base_fee);
+        block.blob_base_fee = user.blob_base_fee.or(block.blob_base_fee);
+        block.beacon_root = user.beacon_root.or(block.beacon_root);
+        if let Some(hashes) = user.block_hash {
+            block.block_hash.get_or_insert_with(Default::default).extend(hashes);
+        }
+    }
+    pending
+}
+
+fn apply_pending_simulation_overrides(
+    opts: &mut SimulatePayload<BaseTransactionRequest>,
+    pending: EvmOverrides,
+) {
+    // Pending state is the starting state, not a reset before each simulated block.
+    if let Some(first) = opts.block_state_calls.first_mut() {
+        let merged = merge_overrides(
+            pending,
+            first.state_overrides.take(),
+            first.block_overrides.take().map(Box::new),
+        );
+        first.state_overrides = merged.state;
+        first.block_overrides = merged.block.map(|block| *block);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PendingBlocksBuilder;
+    use alloy_consensus::Header;
+    use alloy_consensus::Sealed;
+    use alloy_evm::overrides::apply_block_overrides;
+    use alloy_primitives::B256;
+    use alloy_primitives::Bytes;
+    use alloy_primitives::TxKind;
+    use alloy_rpc_types::simulate::SimBlock;
+    use alloy_rpc_types::state::AccountOverride;
+    use base_common_flashblocks::ExecutionPayloadBaseV1;
+    use base_common_flashblocks::Flashblock;
+    use base_common_flashblocks::Metadata;
+    use revm::Context;
+    use revm::ExecuteEvm;
+    use revm::MainBuilder;
+    use revm::MainContext;
+    use revm::bytecode::Bytecode;
+    use revm::context::BlockEnv;
+    use revm::context::TxEnv;
+    use revm::primitives::hardfork::SpecId;
+    use revm::state::AccountInfo;
+    use revm_database::CacheDB;
+    use revm_database::EmptyDB;
+
+    #[test]
+    fn pending_call_opcodes_use_the_same_snapshot_header_as_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pending = pending_snapshot(51_044_736, 1_788_878_819)?;
+        let (state_block, overrides) = pending_snapshot_overrides(&pending);
+        assert_eq!(state_block, BlockId::from(BlockNumberOrTag::Number(51_044_735)));
+        let block = overrides.block.ok_or("pending block environment is missing")?;
+        let mut database = CacheDB::<EmptyDB>::default();
+        let address = Address::repeat_byte(0x55);
+        let caller = Address::repeat_byte(0x66);
+        let code = Bytecode::new_legacy(Bytes::from_static(&[
+            0x43, 0x60, 0x00, 0x52, 0x42, 0x60, 0x20, 0x52, 0x45, 0x60, 0x40, 0x52, 0x41, 0x60,
+            0x60, 0x52, 0x48, 0x60, 0x80, 0x52, 0x44, 0x60, 0xa0, 0x52, 0x60, 0xc0, 0x60, 0x00,
+            0xf3,
+        ]));
+        database
+            .insert_account_info(address, AccountInfo { code: Some(code), ..Default::default() });
+        database.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(1_000_000_000_000_000_000_u64),
+                ..Default::default()
+            },
+        );
+        let mut environment = BlockEnv {
+            number: U256::from(51_044_735),
+            timestamp: U256::from(1_788_878_817),
+            ..Default::default()
+        };
+        apply_block_overrides(*block, &mut database, &mut environment);
+        let mut evm = Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(SpecId::CANCUN))
+            .with_block(environment)
+            .with_db(database)
+            .build_mainnet();
+        let result = evm.transact(
+            TxEnv::builder()
+                .caller(caller)
+                .kind(TxKind::Call(address))
+                .gas_limit(100_000)
+                .gas_price(1000)
+                .build()?,
+        )?;
+        let output = result.result.output().ok_or("pending opcode call did not succeed")?;
+        let words: Vec<U256> =
+            output.as_chunks::<32>().0.iter().map(|word| U256::from_be_bytes(*word)).collect();
+        assert_eq!(
+            words,
+            vec![
+                U256::from(51_044_736),
+                U256::from(1_788_878_819),
+                U256::from(30_000_000),
+                U256::from_be_slice(Address::repeat_byte(0x11).as_slice()),
+                U256::from(1000),
+                U256::from_be_slice(B256::repeat_byte(0x22).as_slice()),
+            ]
+        );
+        assert_eq!(
+            overrides
+                .state
+                .and_then(|state| state.get(&address).and_then(|account| account.balance)),
+            Some(U256::from(51_044_736))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn user_overrides_replace_only_explicit_pending_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pending = pending_snapshot(100, 200)?;
+        let (_, overrides) = pending_snapshot_overrides(&pending);
+        let address = Address::repeat_byte(0x55);
+        let user_state = StateOverride::from_iter([(
+            address,
+            AccountOverride {
+                nonce: Some(99),
+                state_diff: Some([(B256::ZERO, B256::repeat_byte(0x99))].into_iter().collect()),
+                ..Default::default()
+            },
+        )]);
+        let merged = merge_overrides(
+            overrides,
+            Some(user_state),
+            Some(Box::new(BlockOverrides {
+                number: Some(U256::from(123)),
+                time: Some(456),
+                ..Default::default()
+            })),
+        );
+        let block = merged.block.ok_or("merged block override missing")?;
+        assert_eq!(block.number, Some(U256::from(123)));
+        assert_eq!(block.time, Some(456));
+        assert_eq!(block.base_fee, Some(U256::from(1000)));
+        assert_eq!(block.gas_limit, Some(30_000_000));
+        let state = merged.state.ok_or("merged state override missing")?;
+        let account = state.get(&address).ok_or("merged account missing")?;
+        assert_eq!(account.balance, Some(U256::from(100)));
+        assert_eq!(account.nonce, Some(99));
+        let storage = account.state_diff.as_ref().ok_or("merged storage missing")?;
+        assert_eq!(storage.get(&B256::ZERO), Some(&B256::repeat_byte(0x99)));
+        assert_eq!(storage.get(&B256::repeat_byte(1)), Some(&B256::repeat_byte(2)));
+        Ok(())
+    }
+
+    #[test]
+    fn full_user_storage_replaces_pending_storage_before_later_diffs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, pending) = pending_snapshot_overrides(&pending_snapshot(100, 200)?);
+        let address = Address::repeat_byte(0x55);
+        let user = AccountOverride {
+            state: Some([(B256::ZERO, B256::repeat_byte(5))].into_iter().collect()),
+            ..Default::default()
+        };
+        let full =
+            merge_overrides(pending, Some(StateOverride::from_iter([(address, user)])), None);
+        let user = AccountOverride {
+            state_diff: Some([(B256::ZERO, B256::repeat_byte(6))].into_iter().collect()),
+            ..Default::default()
+        };
+        let merged = merge_overrides(full, Some(StateOverride::from_iter([(address, user)])), None);
+        let accounts = merged.state.ok_or("storage override missing")?;
+        let account = accounts.get(&address).ok_or("storage account missing")?;
+        let storage = account.state.as_ref().ok_or("full storage override missing")?;
+        assert_eq!(storage.len(), 1);
+        assert_eq!(storage.get(&B256::ZERO), Some(&B256::repeat_byte(6)));
+        assert!(account.state_diff.is_none());
+        assert_eq!(account.nonce, Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn simulation_applies_pending_state_once_and_preserves_later_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, pending) = pending_snapshot_overrides(&pending_snapshot(100, 200)?);
+        let user_block =
+            BlockOverrides { number: Some(U256::from(105)), time: Some(210), ..Default::default() };
+        let second = SimBlock::<BaseTransactionRequest> {
+            block_overrides: Some(user_block),
+            ..Default::default()
+        };
+        let mut payload = SimulatePayload {
+            block_state_calls: vec![SimBlock::default(), second.clone()],
+            ..Default::default()
+        };
+        apply_pending_simulation_overrides(&mut payload, pending);
+        let first = payload.block_state_calls.first().ok_or("first simulated block missing")?;
+        assert!(first.state_overrides.is_some());
+        assert_eq!(
+            first.block_overrides.as_ref().and_then(|block| block.number),
+            Some(U256::from(100))
+        );
+        let retained = payload.block_state_calls.get(1).ok_or("second simulated block missing")?;
+        assert_eq!(retained.block_overrides, second.block_overrides);
+        assert!(retained.state_overrides.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn captured_pending_state_and_header_remain_coherent_after_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let current = arc_swap::ArcSwapOption::from(Some(Arc::new(pending_snapshot(100, 200)?)));
+        let captured = current.load_full().ok_or("captured pending snapshot missing")?;
+        current.store(Some(Arc::new(pending_snapshot(101, 202)?)));
+        let (state_block, overrides) = pending_snapshot_overrides(&captured);
+        assert_eq!(state_block, BlockId::from(BlockNumberOrTag::Number(99)));
+        assert_eq!(overrides.block.as_ref().and_then(|block| block.number), Some(U256::from(100)));
+        assert_eq!(overrides.block.as_ref().and_then(|block| block.time), Some(200));
+        assert_eq!(
+            overrides.state.and_then(|state| state
+                .get(&Address::repeat_byte(0x55))
+                .and_then(|account| account.balance)),
+            Some(U256::from(100))
+        );
+        Ok(())
+    }
+
+    fn pending_snapshot(
+        number: u64,
+        timestamp: u64,
+    ) -> Result<PendingBlocks, crate::StateProcessorError> {
+        let header = Header {
+            number,
+            timestamp,
+            gas_limit: 30_000_000,
+            beneficiary: Address::repeat_byte(0x11),
+            mix_hash: B256::repeat_byte(0x22),
+            base_fee_per_gas: Some(1000),
+            ..Default::default()
+        };
+        let mut builder = PendingBlocksBuilder::default();
+        builder.with_header(Sealed::new(header));
+        builder.with_flashblocks([Flashblock {
+            payload_id: Default::default(),
+            index: 0,
+            base: Some(ExecutionPayloadBaseV1 {
+                block_number: number,
+                timestamp,
+                ..Default::default()
+            }),
+            diff: Default::default(),
+            metadata: Metadata::new(number),
+        }]);
+        builder.with_state_overrides(StateOverride::from_iter([(
+            Address::repeat_byte(0x55),
+            AccountOverride {
+                balance: Some(U256::from(number)),
+                nonce: Some(3),
+                state_diff: Some(
+                    [
+                        (B256::ZERO, B256::repeat_byte(3)),
+                        (B256::repeat_byte(1), B256::repeat_byte(2)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            },
+        )]));
+        builder.build()
     }
 }
