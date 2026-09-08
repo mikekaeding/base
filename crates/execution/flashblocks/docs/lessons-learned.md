@@ -1,0 +1,10 @@
+# Pending override invariants
+
+- revm `Bytecode::bytes()` contains interpreter padding for legacy code. Use `original_bytes()`
+  for RPC overrides, otherwise both `EXTCODEHASH` and `EXTCODESIZE` can change.
+- A loaded account's code is not necessarily a code change. Repeating unchanged code overrides
+  can move most RPC CPU time into hashing and jump-table analysis.
+- Compare code hashes before commit and preserve earlier pending code overrides. Dropping an
+  unloaded code field can lose a pending creation or delegation even when current storage is right.
+- Profile against a binary with proven matching executable text before trusting recovered symbol
+  addresses; a rebuilt binary with the same source name is insufficient evidence.

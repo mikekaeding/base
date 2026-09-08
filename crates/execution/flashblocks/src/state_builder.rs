@@ -10,6 +10,8 @@ use alloy_evm::{
     block::{StateDB, SystemCaller},
 };
 use alloy_primitives::B256;
+use alloy_primitives::Bytes;
+use alloy_primitives::U256;
 use alloy_rpc_types::TransactionTrait;
 use alloy_rpc_types_eth::state::StateOverride;
 use base_common_chains::Upgrades;
@@ -29,6 +31,7 @@ use revm::{
     state::EvmState,
 };
 
+use crate::ProviderError;
 use crate::{ExecutionError, PendingBlocks, StateProcessorError, UnifiedReceiptBuilder};
 
 /// Represents the result of executing or fetching a cached pending transaction.
@@ -235,11 +238,7 @@ where
             .ok_or(ExecutionError::GasOverflow)?;
         self.next_log_index += receipt.inner.logs().len();
 
-        for address in state.keys() {
-            self.evm.db_mut().basic(*address).map_err(|err| {
-                StateProcessorError::Execution(ExecutionError::EvmEnv(err.to_string()))
-            })?;
-        }
+        accumulate_pending_state_overrides(self.evm.db_mut(), &mut self.state_overrides, &state)?;
         self.evm.db_mut().commit(state.clone());
 
         Ok(ExecutedPendingTransaction {
@@ -304,21 +303,11 @@ where
         match transact_result {
             Ok(ResultAndState { state, result }) => {
                 let gas_used = result.tx_gas_used();
-                for (addr, acc) in &state {
-                    let existing_override = self.state_overrides.entry(*addr).or_default();
-                    existing_override.balance = Some(acc.info.balance);
-                    existing_override.nonce = Some(acc.info.nonce);
-                    existing_override.code = acc.info.code.clone().map(|code| code.bytes());
-
-                    let existing =
-                        existing_override.state_diff.get_or_insert_with(Default::default);
-                    let changed_slots = acc
-                        .storage
-                        .iter()
-                        .map(|(&key, slot)| (B256::from(key), B256::from(slot.present_value)));
-
-                    existing.extend(changed_slots);
-                }
+                accumulate_pending_state_overrides(
+                    self.evm.db_mut(),
+                    &mut self.state_overrides,
+                    &state,
+                )?;
 
                 self.cumulative_gas_used = self
                     .cumulative_gas_used
@@ -407,6 +396,81 @@ where
         }
     }
 }
+
+// Run before committing the transaction, including cached executions. Unchanged code stays in
+// the database: overriding it rehashes and re-analyzes every contract for every pending RPC call.
+fn accumulate_pending_state_overrides<DB: Database>(
+    database: &mut DB,
+    overrides: &mut StateOverride,
+    state: &EvmState,
+) -> Result<(), StateProcessorError> {
+    for (address, account) in state {
+        let previous = database.basic(*address).map_err(|error| {
+            ProviderError::StateProvider(format!(
+                "load precommit account {address} for pending overrides: {error}"
+            ))
+        })?;
+        if !account.is_touched() {
+            continue;
+        }
+        let pending = overrides.entry(*address).or_default();
+        if account.is_selfdestructed() {
+            pending.balance = Some(U256::ZERO);
+            pending.nonce = Some(0);
+            pending.code = Some(Bytes::new());
+            pending.state = Some(Default::default());
+            pending.state_diff = None;
+            continue;
+        }
+        pending.balance = Some(account.info.balance);
+        pending.nonce = Some(account.info.nonce);
+        if previous.unwrap_or_default().code_hash != account.info.code_hash {
+            let code = if account.info.is_code_hash_empty_or_zero() {
+                Bytes::new()
+            } else if let Some(code) = &account.info.code {
+                code.original_bytes()
+            } else {
+                let code = database.code_by_hash(account.info.code_hash).map_err(|error| {
+                    ProviderError::StateProvider(format!(
+                        "load changed pending code {} for {address}: {error}",
+                        account.info.code_hash
+                    ))
+                })?;
+                if code.hash_slow() != account.info.code_hash {
+                    return Err(ProviderError::StateProvider(format!(
+                        "changed pending code hash mismatch for {address}: expected {}",
+                        account.info.code_hash
+                    ))
+                    .into());
+                }
+                code.original_bytes()
+            };
+            pending.code = Some(code);
+        }
+        // An unchanged or unloaded code field must retain changes from earlier Flashblocks.
+        // Creation and destruction clear storage; later transactions extend that replacement.
+        if account.is_created() {
+            pending.state = Some(Default::default());
+            pending.state_diff = None;
+        }
+        let storage = if let Some(storage) = pending.state.as_mut() {
+            storage
+        } else {
+            pending.state_diff.get_or_insert_with(Default::default)
+        };
+        storage.extend(
+            account
+                .storage
+                .iter()
+                .map(|(key, slot)| (B256::from(*key), B256::from(slot.present_value))),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "state_builder_overrides_tests.rs"]
+mod overrides_tests;
 
 #[cfg(test)]
 mod tests {
@@ -969,7 +1033,8 @@ mod tests {
 
         // The EVM database must now show nonce 1 for the sender, proving that
         // execute_with_cached_data committed the state before returning.
-        let (second_db_after, _) = second_builder.into_db_and_state_overrides();
+        let (second_db_after, second_overrides) = second_builder.into_db_and_state_overrides();
+        assert_eq!(second_overrides.get(&sender).and_then(|account| account.nonce), Some(1));
         let sender_nonce_after_cached_tx_a = second_db_after
             .cache
             .accounts
