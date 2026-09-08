@@ -102,27 +102,16 @@ where
                             "Failed to prefetch source payload"
                         );
                     }
-                    self.wait_after_payload_error(&e, &mut head_notifications).await;
+                    if matches!(e, RemoteL2ClientError::BlockNotFound(_)) {
+                        // The latest-head response can precede payload availability on another backend.
+                        self.wait_at_source_head(&mut head_notifications).await;
+                    } else {
+                        tokio::select! {
+                            _ = self.cancellation.cancelled() => {}
+                            _ = time::sleep(SOURCE_FAILURE_BACKOFF) => {}
+                        }
+                    }
                 }
-            }
-        }
-    }
-
-    /// Waits for payload availability or a bounded retry, retaining longer backoff for RPC failures.
-    pub async fn wait_after_payload_error(
-        &self,
-        error: &RemoteL2ClientError,
-        notifications: &mut Option<watch::Receiver<()>>,
-    ) {
-        if matches!(error, RemoteL2ClientError::BlockNotFound(_)) {
-            // Latest-head RPC and full-payload availability can race across source backends.
-            // A pushed head must wake this wait too, not sit behind transport-failure backoff.
-            debug!(target: "follow", "Advertised source head has no payload yet; waiting for head notification or bounded retry");
-            self.wait_at_source_head(notifications).await;
-        } else {
-            tokio::select! {
-                _ = self.cancellation.cancelled() => {}
-                _ = time::sleep(SOURCE_FAILURE_BACKOFF) => {}
             }
         }
     }
@@ -186,28 +175,36 @@ mod tests {
 
     #[tokio::test]
     async fn advertised_head_payload_race_wakes_on_push_without_one_second_backoff() {
-        let prefetcher = prefetcher();
-        let (sender, receiver) = watch::channel(());
-        let mut receiver = Some(receiver);
-        sender.send(()).expect("fixture receiver is live");
-        time::timeout(
-            Duration::from_millis(100),
-            prefetcher.wait_after_payload_error(
-                &RemoteL2ClientError::BlockNotFound("42".to_owned()),
-                &mut receiver,
-            ),
-        )
-        .await
-        .expect("a new head wakes a not-yet-published payload");
-        let started = time::Instant::now();
-        prefetcher
-            .wait_after_payload_error(
-                &RemoteL2ClientError::BlockNotFound("42".to_owned()),
-                &mut receiver,
-            )
-            .await;
-        assert!(started.elapsed() >= SOURCE_HEAD_BACKOFF);
-        assert!(started.elapsed() < SOURCE_FAILURE_BACKOFF);
+        for pushed in [true, false] {
+            let cancellation = CancellationToken::new();
+            let stop = cancellation.clone();
+            let mut source = MockRemoteClient::new();
+            source.expect_get_block_number().returning(|_| Ok(42));
+            let mut calls = 0;
+            source.expect_get_payload_by_number().times(2).returning(move |number| {
+                assert_eq!(number, 42);
+                calls += 1;
+                if calls == 2 {
+                    stop.cancel();
+                }
+                Err(RemoteL2ClientError::BlockNotFound("42".to_owned()))
+            });
+            let (head, notifications) = watch::channel(());
+            if pushed {
+                head.send(()).expect("fixture receiver is live");
+            }
+            let (output, _receiver) = mpsc::channel(1);
+            let prefetcher = PayloadPrefetcher::new(Arc::new(source), cancellation, output);
+            let started = time::Instant::now();
+            let limit = Duration::from_millis(if pushed { 100 } else { 900 });
+            time::timeout(limit, prefetcher.run(41, Some(notifications)))
+                .await
+                .expect("payload availability retry must not wait one second")
+                .expect("cancellation terminates the fixture");
+            if !pushed {
+                assert!(started.elapsed() >= SOURCE_HEAD_BACKOFF);
+            }
+        }
     }
 
     #[tokio::test]
