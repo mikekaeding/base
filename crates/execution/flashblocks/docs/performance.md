@@ -3,7 +3,7 @@
 Every explicit code override makes alloy hash its bytes and build a revm jump table for each RPC
 request. This is unnecessary for code whose pre-commit hash did not change. Pending accumulation
 now loads the pre-commit account (normally already cached by execution) and compares hashes once
-per transaction. Only actual code changes carry bytecode into repeated RPC preparation. Balance,
+per transaction. Only actual transaction code changes carry bytecode into repeated RPC preparation. Balance,
 nonce and storage maps still clone and apply per request; this does not remove all preparation cost.
 
 A bounded September 8, 2026 production profile attributed 62.92% of sampled user cycles to Keccak
@@ -32,3 +32,10 @@ Run the bounded benchmark separately:
 cargo nextest run -p base-flashblocks --run-ignored only \
   -E 'test(benchmark_repeated_pending_rpc_override_preparation)' --success-output immediate
 ```
+
+Pre-execution uses a temporary commit hook once per block, cloning only the small system-call
+states (normally the two history contracts; additionally the deployer at Canyon activation). These
+accounts retain full original code because capture occurs after their internal commit. Their cost
+is bounded by protocol system calls, independently of the number and size of contracts touched by
+ordinary transactions. The hook is removed before transaction execution; it does not retain or
+clone every transaction state. No production latency claim is made without a deployment profile.

@@ -118,12 +118,15 @@ clone the complete map on a Tokio scheduler thread or once per simulated group. 
 permit is released before the underlying RPC acquires its execution permit, avoiding nested
 permit acquisition. Request cancellation retains the permit until active preparation completes.
 
-Pending overrides include bytecode only when execution changes the pre-commit code hash.
+Ordinary transaction overrides include bytecode only when execution changes the pre-commit code hash.
 Existing canonical code stays in the database, avoiding repeated hashing and jump-table analysis
 for every RPC call. A later transaction retains code overrides created by earlier pending
 Flashblocks, even if that transaction does not load the code. Real code changes use the original
 unpadded bytes; creation and destruction preserve their storage-reset semantics. Fresh and cached
-executions share this accumulation path. See [performance notes](docs/performance.md).
+executions share this accumulation path. Block system commits also enter the pending map: current
+EIP-2935/EIP-4788 storage and historical Canyon deployer installation remain visible to pending RPC.
+These few system accounts retain original code explicitly because they are captured after commit.
+See [performance notes](docs/performance.md).
 
 The RPC regressions execute EVM environment-reading bytecode against an older canonical starting
 environment, verify explicit overrides, preserve coherent snapshots across publication, and

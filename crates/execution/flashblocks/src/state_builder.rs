@@ -1,3 +1,6 @@
+use std::fmt::Debug;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::{sync::Arc, time::Instant};
 
 use alloy_consensus::{
@@ -5,10 +8,7 @@ use alloy_consensus::{
     transaction::{Recovered, TransactionMeta},
 };
 use alloy_eips::Encodable2718;
-use alloy_evm::{
-    Database as AlloyDatabase,
-    block::{StateDB, SystemCaller},
-};
+use alloy_evm::block::SystemCaller;
 use alloy_primitives::B256;
 use alloy_primitives::Bytes;
 use alloy_primitives::U256;
@@ -22,6 +22,7 @@ use base_common_rpc_types::{BaseTransactionReceipt, Transaction};
 use base_execution_rpc::BaseReceiptBuilder as BaseRpcReceiptBuilder;
 use reth_evm::{Evm, FromRecoveredTx};
 use reth_rpc_convert::transaction::ConvertReceiptInput;
+use revm::database::State;
 use revm::{
     Database, DatabaseCommit,
     context::{
@@ -169,35 +170,6 @@ where
         }
     }
 
-    /// Applies EIP-4788, EIP-2935, and Canyon create2 deployer pre-execution changes to the EVM.
-    ///
-    /// Must be called once per block, before executing any transactions. This mirrors the
-    /// `apply_pre_execution_changes` behavior of [`base_common_evm::BaseBlockExecutor`] to ensure
-    /// that the cached execution results match what the validator computes.
-    pub fn apply_pre_execution_changes(
-        &mut self,
-        parent_hash: B256,
-        parent_beacon_block_root: Option<B256>,
-    ) -> Result<(), StateProcessorError>
-    where
-        DB: AlloyDatabase + StateDB,
-        ChainSpec: Clone,
-    {
-        let spec = self.receipt_builder.chain_spec();
-        let mut system_caller = SystemCaller::new(spec.clone());
-        system_caller
-            .apply_blockhashes_contract_call(parent_hash, &mut self.evm)
-            .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
-        system_caller
-            .apply_beacon_root_contract_call(parent_beacon_block_root, &mut self.evm)
-            .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
-
-        ensure_create2_deployer(spec, self.pending_block.timestamp, self.evm.db_mut())
-            .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
-
-        Ok(())
-    }
-
     /// Builds transaction result from cached receipt and state data.
     fn execute_with_cached_data(
         &mut self,
@@ -238,7 +210,12 @@ where
             .ok_or(ExecutionError::GasOverflow)?;
         self.next_log_index += receipt.inner.logs().len();
 
-        accumulate_pending_state_overrides(self.evm.db_mut(), &mut self.state_overrides, &state)?;
+        accumulate_pending_state_overrides(
+            self.evm.db_mut(),
+            &mut self.state_overrides,
+            &state,
+            false,
+        )?;
         self.evm.db_mut().commit(state.clone());
 
         Ok(ExecutedPendingTransaction {
@@ -307,6 +284,7 @@ where
                     self.evm.db_mut(),
                     &mut self.state_overrides,
                     &state,
+                    false,
                 )?;
 
                 self.cumulative_gas_used = self
@@ -397,12 +375,69 @@ where
     }
 }
 
-// Run before committing the transaction, including cached executions. Unchanged code stays in
-// the database: overriding it rehashes and re-analyzes every contract for every pending RPC call.
+impl<E, ChainSpec, DB> PendingStateBuilder<E, ChainSpec>
+where
+    E: Evm<DB = State<DB>, HaltReason = BaseHaltReason>,
+    DB: Database + Debug,
+    ChainSpec: Upgrades + Clone,
+{
+    /// Applies block system changes to execution state and pending RPC overrides.
+    /// Call once per block before transactions; fork validation follows the canonical executor.
+    pub fn apply_pre_execution_changes(
+        &mut self,
+        parent_hash: B256,
+        parent_beacon_block_root: Option<B256>,
+    ) -> Result<(), StateProcessorError> {
+        // SystemCaller commits internally. Capture only these few system accounts, preserving
+        // an existing observer and restoring it even when a system call rejects the block.
+        let captured = Arc::new(Mutex::new((Vec::new(), self.evm.db_mut().state_hook.take())));
+        let hook_capture = Arc::clone(&captured);
+        self.evm.db_mut().set_state_hook(Some(Box::new(move |state: &EvmState| {
+            let mut captured = hook_capture.lock().unwrap_or_else(PoisonError::into_inner);
+            captured.0.push(state.clone());
+            if let Some(hook) = captured.1.as_mut() {
+                hook.on_state(state);
+            }
+        })));
+        let result = (|| {
+            let spec = self.receipt_builder.chain_spec();
+            let mut system_caller = SystemCaller::new(spec.clone());
+            system_caller.apply_blockhashes_contract_call(parent_hash, &mut self.evm).map_err(
+                |error| ExecutionError::EvmEnv(format!("apply blockhash system call: {error}")),
+            )?;
+            system_caller
+                .apply_beacon_root_contract_call(parent_beacon_block_root, &mut self.evm)
+                .map_err(|error| {
+                    ExecutionError::EvmEnv(format!("apply beacon root system call: {error}"))
+                })?;
+            ensure_create2_deployer(spec, self.pending_block.timestamp, self.evm.db_mut()).map_err(
+                |error| ExecutionError::EvmEnv(format!("install Canyon create2 deployer: {error}")),
+            )
+        })();
+        let mut captured = captured.lock().unwrap_or_else(PoisonError::into_inner);
+        self.evm.db_mut().set_state_hook(captured.1.take());
+        result?;
+        for state in &captured.0 {
+            // The local DB already contains these commits, but canonical RPC state may not even
+            // contain their code (fork installation). Retain original system code explicitly.
+            accumulate_pending_state_overrides(
+                self.evm.db_mut(),
+                &mut self.state_overrides,
+                state,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+// Transactions call before commit and omit unchanged code to avoid repeated RPC analysis.
+// Captured system commits call afterward and explicitly retain their small contract bytecode.
 fn accumulate_pending_state_overrides<DB: Database>(
     database: &mut DB,
     overrides: &mut StateOverride,
     state: &EvmState,
+    include_unchanged_code: bool,
 ) -> Result<(), StateProcessorError> {
     for (address, account) in state {
         let previous = database.basic(*address).map_err(|error| {
@@ -424,7 +459,9 @@ fn accumulate_pending_state_overrides<DB: Database>(
         }
         pending.balance = Some(account.info.balance);
         pending.nonce = Some(account.info.nonce);
-        if previous.unwrap_or_default().code_hash != account.info.code_hash {
+        if include_unchanged_code
+            || previous.unwrap_or_default().code_hash != account.info.code_hash
+        {
             let code = if account.info.is_code_hash_empty_or_zero() {
                 Bytes::new()
             } else if let Some(code) = &account.info.code {
@@ -471,6 +508,10 @@ fn accumulate_pending_state_overrides<DB: Database>(
 #[cfg(test)]
 #[path = "state_builder_overrides_tests.rs"]
 mod overrides_tests;
+
+#[cfg(test)]
+#[path = "state_builder_system_overrides_tests.rs"]
+mod system_overrides_tests;
 
 #[cfg(test)]
 mod tests {

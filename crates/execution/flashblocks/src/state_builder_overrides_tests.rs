@@ -91,7 +91,7 @@ fn unchanged_code_omitted_without_changing_pending_rpc_state_or_code_identity() 
     canonical.insert_account_info(address, account.info.clone());
     let state = EvmState::from_iter([(address, account)]);
     let mut pending = StateOverride::default();
-    accumulate_pending_state_overrides(&mut canonical.clone(), &mut pending, &state)?;
+    accumulate_pending_state_overrides(&mut canonical.clone(), &mut pending, &state, false)?;
     let account = pending.get(&address).ok_or("pending account missing")?;
     assert!(account.code.is_none());
     assert_eq!(account.balance, Some(U256::from(100)));
@@ -120,7 +120,7 @@ fn pending_creation_survives_later_flashblocks_with_unloaded_and_loaded_code() -
     let mut creation = changed_account(code.clone(), 1);
     creation.mark_created();
     let state = EvmState::from_iter([(address, creation)]);
-    accumulate_pending_state_overrides(&mut database, &mut pending, &state)?;
+    accumulate_pending_state_overrides(&mut database, &mut pending, &state, false)?;
     database.commit(state);
     for slot in [2, 3] {
         let mut account = changed_account(code.clone(), slot);
@@ -128,7 +128,7 @@ fn pending_creation_survives_later_flashblocks_with_unloaded_and_loaded_code() -
             account.info.code = None;
         }
         let state = EvmState::from_iter([(address, account)]);
-        accumulate_pending_state_overrides(&mut database, &mut pending, &state)?;
+        accumulate_pending_state_overrides(&mut database, &mut pending, &state, false)?;
         database.commit(state);
         let account = pending.get(&address).ok_or("created account missing")?;
         assert_eq!(account.code, Some(code.original_bytes()));
@@ -158,7 +158,7 @@ fn delegation_change_and_clear_are_explicit_even_when_bytecode_is_unloaded() -> 
     changed.info.code = None;
     let state = EvmState::from_iter([(address, changed)]);
     let mut pending = StateOverride::default();
-    accumulate_pending_state_overrides(&mut database, &mut pending, &state)?;
+    accumulate_pending_state_overrides(&mut database, &mut pending, &state, false)?;
     database.commit(state);
     assert_eq!(
         pending.get(&address).and_then(|account| account.code.clone()),
@@ -178,7 +178,7 @@ fn delegation_change_and_clear_are_explicit_even_when_bytecode_is_unloaded() -> 
     let mut cleared = changed_account(Bytecode::default(), 0);
     cleared.info.code = None;
     let state = EvmState::from_iter([(address, cleared)]);
-    accumulate_pending_state_overrides(&mut database, &mut pending, &state)?;
+    accumulate_pending_state_overrides(&mut database, &mut pending, &state, false)?;
     assert_eq!(pending.get(&address).and_then(|account| account.code.clone()), Some(Bytes::new()));
     assert_eq!(call_with_overrides(canonical.clone(), pending.clone(), address)?, Bytes::new());
     apply_state_overrides(pending, &mut canonical)?;
@@ -199,6 +199,7 @@ fn unresolved_changed_code_fails_closed() -> TestResult {
         &mut InMemoryDB::default(),
         &mut StateOverride::default(),
         &state,
+        false,
     );
     assert!(result.is_err_and(|error| error.to_string().contains("code hash mismatch")));
     Ok(())
@@ -214,13 +215,13 @@ fn selfdestruct_clears_pending_code_storage_balance_and_nonce() -> TestResult {
     let mut created = changed_account(code.clone(), 42);
     created.mark_created();
     let state = EvmState::from_iter([(address, created)]);
-    accumulate_pending_state_overrides(&mut database, &mut pending, &state)?;
+    accumulate_pending_state_overrides(&mut database, &mut pending, &state, false)?;
     database.commit(state);
     let mut destroyed = changed_account(code, 99);
     destroyed.mark_created();
     destroyed.mark_selfdestruct();
     let state = EvmState::from_iter([(address, destroyed)]);
-    accumulate_pending_state_overrides(&mut database, &mut pending, &state)?;
+    accumulate_pending_state_overrides(&mut database, &mut pending, &state, false)?;
     database.commit(state);
     let mut rpc_database = canonical;
     apply_state_overrides(pending, &mut rpc_database)?;
@@ -245,6 +246,7 @@ fn untouched_accounts_do_not_override_canonical_or_prior_pending_state() -> Test
         &mut InMemoryDB::default(),
         &mut pending,
         &EvmState::from_iter([(address, account)]),
+        false,
     )?;
     assert_eq!(pending, previous);
     Ok(())
@@ -268,7 +270,7 @@ fn benchmark_repeated_pending_rpc_override_preparation() -> TestResult {
         state.insert(address, account);
     }
     let mut optimized = StateOverride::default();
-    accumulate_pending_state_overrides(&mut canonical.clone(), &mut optimized, &state)?;
+    accumulate_pending_state_overrides(&mut canonical.clone(), &mut optimized, &state, false)?;
     let mut previous = optimized.clone();
     for account in previous.values_mut() {
         account.code = Some(code.bytes());

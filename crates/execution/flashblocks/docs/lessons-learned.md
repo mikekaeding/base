@@ -8,3 +8,7 @@
   unloaded code field can lose a pending creation or delegation even when current storage is right.
 - Profile against a binary with proven matching executable text before trusting recovered symbol
   addresses; a rebuilt binary with the same source name is insufficient evidence.
+- A correct transaction overlay is insufficient: block system calls may commit directly to the
+  execution database. Header beacon-root metadata does not install the corresponding contract
+  storage in RPC state. Regressions must call real system code starting from canonical state, not
+  merely inspect the mutated execution cache.

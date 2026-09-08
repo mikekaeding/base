@@ -16,3 +16,11 @@ RPC preparation applies this map to the canonical database underlying the captur
 snapshot. Only original bytecode is a valid RPC code override; interpreter padding is never part
 of a contract's on-chain identity. Header selection and explicit caller override precedence are
 unchanged by code omission.
+
+Pre-execution system calls commit inside the canonical SystemCaller helper. A temporary revm State
+hook captures those commits in order and forwards any existing hook. The previous hook is restored
+before returning, including validation failures. Successful blocks add the captured states to the
+same pending map. Their original code is explicit because the local database already includes the
+commits, while the canonical RPC baseline can precede a fork installation. This covers the active
+blockhash/beacon-root storage calls and the historical Canyon create2 installation without copying
+protocol fork checks or system-call validation. Rejected builders are discarded by the processor.
