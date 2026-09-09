@@ -12,3 +12,7 @@
   execution database. Header beacon-root metadata does not install the corresponding contract
   storage in RPC state. Regressions must call real system code starting from canonical state, not
   merely inspect the mutated execution cache.
+- Block-level fee parameters can contain a transaction-scoped calculation cache. When reused for
+  several RPC receipts, invalidate that cache at every transaction boundary. Similar L2 gas values
+  do not validate L1 data fees; compare short and long encoded transactions, including a stale
+  cache inherited by a new builder, against independent per-transaction calculations.

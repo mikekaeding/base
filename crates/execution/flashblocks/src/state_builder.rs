@@ -321,6 +321,9 @@ where
                     meta,
                 };
 
+                // This cache belongs to one transaction, not the block or Flashblock batch.
+                // Match canonical receipt conversion when reusing the block's fee parameters.
+                self.l1_block_info.clear_tx_l1_cost();
                 let mut base_receipt = BaseRpcReceiptBuilder::new(
                     self.receipt_builder.chain_spec(),
                     input,
@@ -528,6 +531,7 @@ mod tests {
     };
     use base_execution_chainspec::BaseChainSpecBuilder;
     use base_execution_evm::BaseEvmConfig;
+    use base_execution_evm::RethL1BlockInfo;
     use reth_evm::ConfigureEvm;
     use reth_revm::State;
     use revm::{
@@ -672,6 +676,98 @@ mod tests {
         ));
 
         alloy_consensus::transaction::Recovered::new_unchecked(envelope, Address::ZERO)
+    }
+
+    #[rstest::rstest]
+    #[case::bedrock(false, None)]
+    #[case::bedrock_inherited_cache(false, Some(U256::MAX))]
+    #[case::jovian(true, None)]
+    #[case::jovian_inherited_cache(true, Some(U256::MAX))]
+    fn pending_receipt_l1_fee_is_scoped_to_each_transaction(
+        #[case] jovian_active: bool,
+        #[case] inherited_transaction_fee: Option<U256>,
+    ) {
+        let chain_spec = BaseChainSpecBuilder::base_mainnet();
+        let chain_spec = Arc::new(if jovian_active {
+            chain_spec.jovian_activated().build()
+        } else {
+            chain_spec.build()
+        });
+        let header = Header {
+            number: 1,
+            timestamp: 100,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(1_000_000_000),
+            ..Default::default()
+        };
+        let l1_block_info = L1BlockInfo {
+            l1_base_fee: U256::from(1_000_000_000),
+            l1_base_fee_scalar: U256::from(1_000_000),
+            l1_blob_base_fee: Some(U256::from(1_000_000)),
+            l1_blob_base_fee_scalar: Some(U256::from(1_000_000)),
+            ..Default::default()
+        };
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            Address::ZERO,
+            AccountInfo {
+                balance: U256::from(1_000_000_000_000_000_000u128),
+                ..Default::default()
+            },
+        );
+        let evm_config = BaseEvmConfig::base(Arc::clone(&chain_spec));
+        let evm_env = evm_config.evm_env(&header).expect("fixture EVM environment is valid");
+        let evm = evm_config.evm_with_env(db, evm_env);
+        let pending_block = Block { header: header.clone(), body: Default::default() };
+        let mut builder = PendingStateBuilder::new(
+            Arc::clone(&chain_spec),
+            evm,
+            pending_block,
+            None,
+            L1BlockInfo { tx_l1_cost: inherited_transaction_fee, ..l1_block_info },
+            StateOverride::default(),
+        );
+
+        // The long input exceeds Fjord's compressed-size floor; the last short input also
+        // verifies that recomputation follows the transaction rather than the largest prior fee.
+        let long_input: Vec<u8> = (0u64..128)
+            .flat_map(|index| alloy_primitives::keccak256(index.to_be_bytes()).0)
+            .collect();
+        let mut fees = Vec::new();
+        for (nonce, input) in [(0, Bytes::new()), (1, long_input.into()), (2, Bytes::new())] {
+            let transaction = alloy_consensus::TxLegacy {
+                chain_id: Some(8453),
+                nonce,
+                gas_price: 1_000_000_000,
+                gas_limit: 500_000,
+                to: TxKind::Call(Address::repeat_byte(0x11)),
+                value: U256::ZERO,
+                input,
+            };
+            let transaction = BaseTxEnvelope::Legacy(Signed::new_unhashed(
+                transaction,
+                alloy_primitives::Signature::test_signature(),
+            ));
+            // Canonical receipt conversion resets its fee cache before every transaction.
+            // A fresh block-info copy provides that independent per-transaction reference.
+            let expected_fee = l1_block_info
+                .clone()
+                .l1_tx_data_fee(&chain_spec, header.timestamp, &transaction.encoded_2718(), false)
+                .expect("fixture L1 fee inputs are valid")
+                .to::<u128>();
+            let transaction = Recovered::new_unchecked(transaction, Address::ZERO);
+            let result = builder
+                .execute_transaction(
+                    usize::try_from(nonce).expect("fixture index fits"),
+                    transaction,
+                )
+                .expect("fixture transaction executes");
+            assert_eq!(result.receipt.l1_block_info.l1_fee, Some(expected_fee));
+            assert!(expected_fee > 0);
+            fees.push(expected_fee);
+        }
+        assert!(fees[1] > fees[0]);
+        assert!(fees[1] > fees[2]);
     }
 
     #[test]

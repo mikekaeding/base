@@ -24,3 +24,8 @@ same pending map. Their original code is explicit because the local database alr
 commits, while the canonical RPC baseline can precede a fork installation. This covers the active
 blockhash/beacon-root storage calls and the historical Canyon create2 installation without copying
 protocol fork checks or system-call validation. Rejected builders are discarded by the processor.
+
+Receipt construction shares block-level L1 fee parameters across executed transactions, but clears
+the transaction-cost cache before each new RPC receipt, as canonical conversion does. Cached
+receipts remain attached to their transaction hash and are reused unchanged. This affects receipt
+metadata only; EVM fee charging and consensus receipt execution remain on their existing paths.

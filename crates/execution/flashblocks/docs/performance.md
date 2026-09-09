@@ -39,3 +39,8 @@ accounts retain full original code because capture occurs after their internal c
 is bounded by protocol system calls, independently of the number and size of contracts touched by
 ordinary transactions. The hook is removed before transaction execution; it does not retain or
 clone every transaction state. No production latency claim is made without a deployment profile.
+
+Each newly executed transaction now recomputes its pending receipt's L1 data fee from its encoded
+bytes. Clearing the transaction-cost cache is constant time; the required calculation scales with
+transaction encoding/compression size. Cached receipt reuse does not recompute the fee. No extra RPC
+request, shared lock or state snapshot is introduced, and no throughput improvement is claimed.

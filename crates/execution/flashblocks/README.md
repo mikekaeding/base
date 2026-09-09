@@ -38,6 +38,8 @@ This crate provides pending-state-aware Ethereum RPC implementations used by
 
 - **`eth_getBlockByNumber("pending", ...)`**: returns the latest pending block built from flashblocks.
 - **`eth_getTransactionReceipt`** and **`eth_getTransactionByHash`**: check canonical data first, then flashblocks pending state.
+  Pending receipt L1 fees are computed for each encoded transaction using the block fee parameters,
+  matching canonical receipt conversion; earlier transactions cannot supply a later receipt’s fee.
 - **`eth_getBalance`**, **`eth_getTransactionCount`**, **`eth_call`**, **`eth_estimateGas`**, and **`eth_simulateV1`**: use flashblocks pending state when requested with the `pending` tag.
 - **`eth_getLogs`**: combines historical logs with pending flashblock logs when the range ends at `pending`.
 - **`eth_getBlockTransactionCountByNumber("pending")`**: returns the transaction count from the latest pending flashblock state.
