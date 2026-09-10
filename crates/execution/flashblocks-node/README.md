@@ -57,6 +57,29 @@ The `FlashblocksExtension` wires up:
 3. **RPC Extensions**: Provides extended Ethereum RPC methods with flashblock awareness
 4. **WebSocket Subscriber**: Connects to and streams updates from the flashblock service
 
+## Historical replay validation
+
+The opt-in `historical_parent` integration test replays sixteen captured mainnet blocks through
+the production processor. It checks canonical transaction order, headers, resulting state roots,
+and parent reuse without a canonical notification. Set `BASE_REPLAY_DATA_DIR` to an explicitly
+read-only mainnet database view and `BASE_REPLAY_CAPTURE` to JSONL records containing `payload`.
+Run the ignored test in release mode; `BASE_REPLAY_CANONICAL_NOTICES=1` compares the same blocks
+with canonical notifications. State-root verification is excluded from publication timing.
+The archive already contains canonical headers: withholding notifications does not simulate a
+missing canonical header. The current authentication gate still requires that header.
+
+Receipt and complete touched-account/storage comparisons run before the separate root phase, so an
+archive visibility failure cannot masquerade as an execution mismatch or a fully passed test.
+On-demand read-only synchronization remains enabled; the background index watcher is disabled so
+it cannot change the verifier's file index mid-calculation. The database snapshot must expose its
+tip header after bounded static-file synchronization. Full root reconstruction can be expensive:
+bound the job and retain incomplete output without interpreting it as acceptance.
+
+For an active database, retain MDBX reader locking and the writer's PID namespace. Only its shared
+`mdbx.lck` needs a writable bind mount; keep database contents read-only and RocksDB secondary
+scratch in a separate writable directory. The archive must have persisted the captured blocks.
+Never copy an active database file or disable reader safety to bypass a failed precondition.
+
 ## License
 
 Licensed under the [MIT License](https://github.com/base/base/blob/main/LICENSE).
