@@ -28,6 +28,7 @@ use base_flashblocks_node::test_harness::{
 use base_node_runner::test_utils::L1_BLOCK_INFO_DEPOSIT_TX;
 use base_test_utils::{Account, DoubleCounter, ParentBlockhashGuard};
 use eyre::Result;
+use eyre::WrapErr;
 use futures::{SinkExt, StreamExt};
 use reth_primitives_traits::Block;
 use reth_provider::BlockReader;
@@ -286,7 +287,7 @@ impl TestSetup {
                 prev_randao: B256::default(),
                 block_number: 1,
                 gas_limit: 30_000_000,
-                timestamp: 0,
+                timestamp: self.harness.latest_block().header().timestamp.saturating_add(2),
                 extra_data: Bytes::new(),
                 base_fee_per_gas: U256::ZERO,
             }),
@@ -733,10 +734,11 @@ async fn test_eth_simulate_v1() -> Result<()> {
         validation: true,
         return_full_transactions: true,
     };
-    let simulate_res =
-        provider.simulate(&simulate_call).block_id(BlockNumberOrTag::Pending.into()).await;
-    assert!(simulate_res.is_ok());
-    let block = simulate_res.unwrap();
+    let block = provider
+        .simulate(&simulate_call)
+        .block_id(BlockNumberOrTag::Pending.into())
+        .await
+        .wrap_err("pending simulation RPC failed")?;
     assert_eq!(block.len(), 1);
     assert_eq!(block[0].calls.len(), 3);
     assert_eq!(

@@ -9,3 +9,8 @@
   provider, not substitute for it.
 - Verify resulting balances, nonce, receipt status and gas, not only publication. Separate test-node
   startup and fixed harness sleeps from measured processing, and do not extrapolate toy-block timings.
+# Source notification contents
+
+Discarding an available pushed height forces a redundant latest-height query and can consult a
+lagging backend after a newer header was already observed. Retain the height only as a bounded,
+sequential fetch hint; never treat a notification as proof of payload identity or execution validity.

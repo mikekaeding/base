@@ -1,5 +1,10 @@
 # Flashblocks boundary costs
 
+The source follower uses pushed heights to avoid one serial latest-height RPC per newly announced
+head. This is an off-path fetch optimization; it adds no work to same-block Flashblock execution.
+It does not eliminate source payload availability or Engine API validation time. Benchmark those
+stages separately before attributing all boundary latency to polling.
+
 Same-block append is unchanged by parent authentication. Next-block reuse performs a local header
 lookup, header hash and fixed-size comparison; no network request or state-root computation.
 

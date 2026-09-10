@@ -39,31 +39,27 @@ pub struct ParentBoundary {
 }
 
 impl ParentBoundary {
-    /// Builds equivalent canonical/pending inputs without mutating the pending processor's head.
-    pub async fn new() -> Result<Self> {
+    /// Builds equivalent canonical/pending inputs with the requested number of synthetic transfers.
+    /// Canonical delivery to the pending processor remains under the test's control.
+    pub async fn new(transfers: u64) -> Result<Self> {
         let mut harness = FlashblocksBuilderTestHarness::new().await;
         let mut parent = FlashblockBuilder::new_base(&harness).build();
-        let deposit = parent
-            .diff
-            .transactions
-            .first()
-            .ok_or_else(|| eyre!("parent deposit missing"))?;
+        let deposit =
+            parent.diff.transactions.first().ok_or_else(|| eyre!("parent deposit missing"))?;
         let deposit = BaseTransactionSigned::decode_2718(&mut deposit.as_ref())
             .wrap_err("decode parent L1 attributes deposit")?;
-        let transaction = harness.build_transaction_to_send_eth_with_nonce(
-            Account::Alice,
-            Account::Bob,
-            100_000,
-            0,
-        );
-        let canonical = harness
-            .new_canonical_block_without_processing(vec![deposit, transaction])
-            .await;
+        let mut transactions = vec![deposit];
+        for nonce in 0..transfers {
+            transactions.push(harness.build_transaction_to_send_eth_with_nonce(
+                Account::Alice,
+                Account::Bob,
+                100_000,
+                nonce,
+            ));
+        }
+        let canonical = harness.new_canonical_block_without_processing(transactions).await;
         let header = canonical.header();
-        let base = parent
-            .base
-            .as_mut()
-            .ok_or_else(|| eyre!("parent base payload missing"))?;
+        let base = parent.base.as_mut().ok_or_else(|| eyre!("parent base payload missing"))?;
         base.parent_hash = header.parent_hash;
         base.fee_recipient = header.beneficiary;
         base.prev_randao = header.mix_hash;
@@ -72,9 +68,7 @@ impl ParentBoundary {
         base.timestamp = header.timestamp;
         base.extra_data = header.extra_data.clone();
         base.base_fee_per_gas = U256::from(
-            header
-                .base_fee_per_gas
-                .ok_or_else(|| eyre!("canonical parent base fee missing"))?,
+            header.base_fee_per_gas.ok_or_else(|| eyre!("canonical parent base fee missing"))?,
         );
         base.parent_beacon_block_root = header
             .parent_beacon_block_root
@@ -94,12 +88,7 @@ impl ParentBoundary {
         parent.diff.block_hash = B256::with_last_byte(42);
         parent.diff.state_root = B256::ZERO;
         let child = FlashblockBuilder::new_base(&harness).build();
-        Ok(Self {
-            harness,
-            canonical,
-            parent,
-            child,
-        })
+        Ok(Self { harness, canonical, parent, child })
     }
 
     /// Measures actual receive-to-publication latency, excluding harness sleeps and node startup.
@@ -115,17 +104,14 @@ impl ParentBoundary {
             .await
             .wrap_err("pending publication deadline expired")?
             .wrap_err("pending publication channel closed")?;
-        eprintln!(
-            "parent_boundary label={label} publication_us={}",
-            started.elapsed().as_micros()
-        );
+        eprintln!("parent_boundary label={label} publication_us={}", started.elapsed().as_micros());
         Ok(pending)
     }
 }
 
 #[tokio::test]
 async fn complete_parent_reuses_state_despite_different_provisional_hash() -> Result<()> {
-    let scenario = ParentBoundary::new().await?;
+    let scenario = ParentBoundary::new(1).await?;
     let state = &scenario.harness.flashblocks;
     let mut resets = state.subscribe_to_resets();
     assert_ne!(scenario.parent.diff.block_hash, scenario.canonical.hash());
@@ -147,9 +133,8 @@ async fn complete_parent_reuses_state_despite_different_provisional_hash() -> Re
         1,
     );
     let transaction_hash = *transaction.hash();
-    let transfer = FlashblockBuilder::new(&scenario.harness, 1)
-        .with_transactions(vec![transaction])
-        .build();
+    let transfer =
+        FlashblockBuilder::new(&scenario.harness, 1).with_transactions(vec![transaction]).build();
     let appended = ParentBoundary::publish(state, transfer, "same_block_append").await?;
     assert_eq!(appended.latest_block_transaction_count(), 2);
     assert_eq!(
@@ -161,50 +146,63 @@ async fn complete_parent_reuses_state_despite_different_provisional_hash() -> Re
         .ok_or_else(|| eyre!("child transfer receipt missing"))?;
     assert!(receipt.status());
     assert_eq!(receipt.gas_used(), 21_000);
-    let overrides = appended
-        .get_state_overrides()
-        .ok_or_else(|| eyre!("child state missing"))?;
-    assert_eq!(
-        overrides
-            .get(&Account::Alice.address())
-            .and_then(|account| account.nonce),
-        Some(2)
-    );
-    assert!(
-        resets.try_recv().is_err(),
-        "a complete parent must not reset consumers"
-    );
+    let overrides = appended.get_state_overrides().ok_or_else(|| eyre!("child state missing"))?;
+    assert_eq!(overrides.get(&Account::Alice.address()).and_then(|account| account.nonce), Some(2));
+    assert!(resets.try_recv().is_err(), "a complete parent must not reset consumers");
+    Ok(())
+}
+
+#[tokio::test]
+async fn larger_complete_parents_preserve_child_state_and_receipts() -> Result<()> {
+    // Transaction-count scaling only: these transfers are not representative DEX execution load.
+    for transfers in [64, 256, 512] {
+        let scenario = ParentBoundary::new(transfers).await?;
+        let state = &scenario.harness.flashblocks;
+        let mut resets = state.subscribe_to_resets();
+        let parent = ParentBoundary::publish(state, scenario.parent, "load_parent").await?;
+        assert!(parent.matches_canonical_parent(scenario.canonical.header()));
+        let child = ParentBoundary::publish(state, scenario.child, "load_child").await?;
+        assert_eq!(child.earliest_block_number(), 1);
+        let transaction = scenario.harness.build_transaction_to_send_eth_with_nonce(
+            Account::Alice,
+            Account::Bob,
+            200_000,
+            transfers,
+        );
+        let transaction_hash = *transaction.hash();
+        let payload = FlashblockBuilder::new(&scenario.harness, 1)
+            .with_transactions(vec![transaction])
+            .build();
+        let appended = ParentBoundary::publish(state, payload, "load_append").await?;
+        assert_eq!(
+            appended.get_balance(Account::Bob.address()),
+            Some(scenario.harness.canonical_balance(Account::Bob) + U256::from(200_000))
+        );
+        let receipt = appended
+            .get_receipt(transaction_hash)
+            .ok_or_else(|| eyre!("load child transfer receipt missing"))?;
+        assert!(receipt.status());
+        assert_eq!(receipt.gas_used(), 21_000);
+        assert!(resets.try_recv().is_err());
+        eprintln!("parent_boundary completed_transfer_count={transfers}");
+    }
     Ok(())
 }
 
 #[tokio::test]
 async fn conflicting_parent_environment_waits_then_recovers_child() -> Result<()> {
-    let mut scenario = ParentBoundary::new().await?;
-    scenario
-        .parent
-        .base
-        .as_mut()
-        .ok_or_else(|| eyre!("parent base missing"))?
-        .prev_randao = B256::with_last_byte(99);
+    let mut scenario = ParentBoundary::new(1).await?;
+    scenario.parent.base.as_mut().ok_or_else(|| eyre!("parent base missing"))?.prev_randao =
+        B256::with_last_byte(99);
     let state = &scenario.harness.flashblocks;
     let parent = ParentBoundary::publish(state, scenario.parent, "conflicting_parent").await?;
     assert!(!parent.matches_canonical_parent(scenario.canonical.header()));
     let mut published = state.subscribe_to_flashblocks();
     let mut resets = state.subscribe_to_resets();
     state.on_flashblock_received(scenario.child);
-    assert!(
-        timeout(Duration::from_millis(25), published.recv())
-            .await
-            .is_err()
-    );
-    assert!(
-        state.get_pending_blocks().is_none(),
-        "unverified lineage must not stay tradable"
-    );
-    assert!(
-        resets.try_recv().is_err(),
-        "finalization waits are not discontinuities"
-    );
+    assert!(timeout(Duration::from_millis(25), published.recv()).await.is_err());
+    assert!(state.get_pending_blocks().is_none(), "unverified lineage must not stay tradable");
+    assert!(resets.try_recv().is_err(), "finalization waits are not discontinuities");
 
     state.on_canonical_block_received(scenario.canonical);
     let recovered = timeout(Duration::from_secs(2), published.recv())
@@ -222,27 +220,17 @@ async fn conflicting_parent_environment_waits_then_recovers_child() -> Result<()
 
 #[tokio::test]
 async fn wrong_parent_hash_stays_unpublished_after_canonical_recovery() -> Result<()> {
-    let mut scenario = ParentBoundary::new().await?;
-    scenario
-        .child
-        .base
-        .as_mut()
-        .ok_or_else(|| eyre!("child base missing"))?
-        .parent_hash = B256::with_last_byte(77);
+    let mut scenario = ParentBoundary::new(1).await?;
+    scenario.child.base.as_mut().ok_or_else(|| eyre!("child base missing"))?.parent_hash =
+        B256::with_last_byte(77);
     let state = &scenario.harness.flashblocks;
     ParentBoundary::publish(state, scenario.parent, "parent_before_wrong_child").await?;
     let mut published = state.subscribe_to_flashblocks();
     state.on_flashblock_received(scenario.child);
-    assert!(
-        timeout(Duration::from_millis(25), published.recv())
-            .await
-            .is_err()
-    );
+    assert!(timeout(Duration::from_millis(25), published.recv()).await.is_err());
     state.on_canonical_block_received(scenario.canonical);
     assert!(
-        timeout(Duration::from_millis(100), published.recv())
-            .await
-            .is_err(),
+        timeout(Duration::from_millis(100), published.recv()).await.is_err(),
         "canonical recovery must not authenticate a child naming a different parent"
     );
     assert!(state.get_pending_blocks().is_none());
