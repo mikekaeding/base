@@ -159,7 +159,7 @@ The complete channel graph between actors is as follows. The L1 watcher actor wr
 Licensed under the [MIT License](https://github.com/base/base/blob/main/LICENSE).
 # Source-stage timing
 
-The follower records source-head receipt, payload fetch duration/retry count, and queue wait per
+The follower records source-head receipt, fallback height-query duration, payload fetch duration/retry count, and queue wait per
 block. The first failed fetch and every fifth consecutive failure include the error and selected
 backoff. Correlate these block-numbered records with Engine insertion and pending publication before
 attributing a slow boundary to the source, retries, execution or IPC. This logging is on the

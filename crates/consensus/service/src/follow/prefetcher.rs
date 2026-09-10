@@ -141,10 +141,17 @@ where
     }
 
     async fn refresh_source_latest(&self, current: u64) -> u64 {
+        let started = Instant::now();
         match self.source.get_block_number(BlockNumberOrTag::Latest).await {
-            Ok(latest) => latest,
+            Ok(latest) => {
+                info!(target: "follow", block = latest, previous_block = current,
+                    fetch_duration_us = started.elapsed().as_micros(), "Fetched source height");
+                latest
+            }
             Err(e) => {
-                debug!(target: "follow", error = %e, "Failed to fetch source latest head");
+                warn!(target: "follow", previous_block = current,
+                    fetch_duration_us = started.elapsed().as_micros(), error = %e,
+                    "Failed to fetch source latest head");
                 current
             }
         }
