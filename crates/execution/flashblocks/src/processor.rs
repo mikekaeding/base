@@ -10,7 +10,7 @@ use alloy_consensus::{
     Block, BlockBody, Header,
     transaction::{Recovered, SignerRecoverable},
 };
-use alloy_eips::{BlockNumberOrTag, Decodable2718};
+use alloy_eips::Decodable2718;
 use alloy_network::TransactionResponse;
 use alloy_primitives::{Address, BlockNumber};
 use alloy_rpc_types_eth::state::StateOverride;
@@ -822,11 +822,12 @@ where
             .header_by_number(canonical_block)
             .map_err(|e| ProviderError::StateProvider(e.to_string()))?
             .ok_or(ProviderError::MissingCanonicalHeader { block_number: canonical_block })?;
+        let mut previous_executed_gas = last_block_header.gas_used;
 
         let evm_config = BaseEvmConfig::base(self.client.chain_spec());
         let state_provider = self
             .client
-            .state_by_block_number_or_tag(BlockNumberOrTag::Number(canonical_block))
+            .state_by_block_hash(last_block_header.hash_slow())
             .map_err(|e| ProviderError::StateProvider(e.to_string()))?;
         let state_provider_db = StateProviderDatabase::new(state_provider);
         let mut pending_blocks_builder = PendingBlocksBuilder::new();
@@ -844,6 +845,36 @@ where
         for (_block_number, flashblocks) in flashblocks_per_block {
             // Use BlockAssembler to reconstruct the block from flashblocks
             let assembled = BlockAssembler::assemble(&flashblocks)?;
+            // Recovery is not authority to execute a different lineage. Authenticate every boundary
+            // before inserting its BLOCKHASH or applying system calls, just as on the reuse path.
+            let canonical_parent = if last_block_header.number == canonical_block {
+                last_block_header.clone()
+            } else {
+                self.client
+                    .header_by_number(last_block_header.number)
+                    .map_err(|e| ProviderError::StateProvider(e.to_string()))?
+                    .ok_or(StateProcessorError::ParentUnverified {
+                        parent_block: last_block_header.number,
+                    })?
+            };
+            let calculated_parent_hash = canonical_parent.hash_slow();
+            if calculated_parent_hash != assembled.base.parent_hash {
+                return Err(StateProcessorError::ParentHashMismatch {
+                    parent_block: last_block_header.number,
+                    calculated_parent_hash,
+                    declared_parent_hash: assembled.base.parent_hash,
+                });
+            }
+            if last_block_header.state_root.is_zero() {
+                last_block_header.state_root = canonical_parent.state_root;
+            }
+            if last_block_header != canonical_parent
+                || previous_executed_gas != canonical_parent.gas_used
+            {
+                return Err(StateProcessorError::ParentPrefixMismatch {
+                    parent_block: last_block_header.number,
+                });
+            }
             let latest_flashblock_tx_count =
                 flashblocks.last().map(|latest| latest.diff.transactions.len()).unwrap_or_default();
             let latest_block_base = assembled.base.clone();
@@ -949,12 +980,13 @@ where
             let latest_flashblock_tx_start = total_transaction_count
                 .saturating_add(latest_block_transaction_count)
                 .saturating_sub(latest_flashblock_tx_count);
+            previous_executed_gas = pending_state_builder.cumulative_gas_used();
             pending_blocks_builder.with_latest_block_context(
                 latest_flashblock_tx_start,
                 latest_block_base,
                 latest_block_l1_block_info,
                 latest_block_transaction_count,
-                pending_state_builder.cumulative_gas_used(),
+                previous_executed_gas,
                 pending_state_builder.next_log_index(),
             );
             total_transaction_count += latest_block_transaction_count;
