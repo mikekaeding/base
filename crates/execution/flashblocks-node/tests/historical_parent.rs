@@ -32,7 +32,6 @@ use reth_provider::BlockReader;
 use reth_provider::ReceiptProvider;
 use reth_provider::StaticFileProviderFactory;
 use reth_provider::TransactionVariant;
-use reth_provider::TryIntoHistoricalStateProvider;
 use reth_provider::providers::BlockchainProvider;
 use reth_provider::providers::ReadOnlyConfig;
 use reth_tasks::Runtime;
@@ -244,41 +243,43 @@ async fn historical_parent_replay_matches_canonical_state_roots() -> Result<()> 
         "{}",
         json!({"kind":"execution_complete", "blocks":verified_blocks, "root_checks_pending":root_checks.len()})
     );
-    for (canonical, pending) in root_checks {
-        let number = canonical.number;
-        // Pin the database transaction before refreshing the read-only file index:
-        // archive commits can publish their MDBX and static-file metadata separately.
-        let database = factory.provider().wrap_err("pin historical verification snapshot")?;
+    // Share one immutable snapshot and its revert cache across all roots. Reopening it for every
+    // root would chase the advancing writer and repeatedly expand the historical unwind range.
+    let database = factory.provider().wrap_err("pin historical verification snapshot")?;
+    // Archive commits can publish MDBX and static-file metadata separately.
+    database
+        .static_file_provider()
+        .initialize_index()
+        .wrap_err("refresh static-file visibility for pinned snapshot")?;
+    let tip = database.best_block_number().wrap_err("read pinned verification tip")?;
+    let static_tip = database.last_block_number().wrap_err("read static-file tip")?;
+    println!(
+        "{}",
+        json!({"kind":"verification_snapshot", "database_tip":tip, "static_tip":static_tip})
+    );
+    for _attempt in 0..50 {
+        if database.block_hash(tip).wrap_err("check pinned tip header visibility")?.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
         database
             .static_file_provider()
             .initialize_index()
-            .wrap_err("refresh static-file visibility for pinned snapshot")?;
-        let tip = database.best_block_number().wrap_err("read pinned verification tip")?;
-        let static_tip = database.last_block_number().wrap_err("read static-file tip")?;
-        println!(
-            "{}",
-            json!({"kind":"verification_snapshot", "database_tip":tip, "static_tip":static_tip})
-        );
-        for _attempt in 0..50 {
-            if database.block_hash(tip).wrap_err("check pinned tip header visibility")?.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            database
-                .static_file_provider()
-                .initialize_index()
-                .wrap_err("refresh pinned snapshot's pending static-file commit")?;
-        }
-        ensure!(
-            database.block_hash(tip).wrap_err("verify pinned tip header visibility")?.is_some(),
-            "static files do not expose pinned database tip {tip} after bounded synchronization"
-        );
+            .wrap_err("refresh pinned snapshot's pending static-file commit")?;
+    }
+    ensure!(
+        database.block_hash(tip).wrap_err("verify pinned tip header visibility")?.is_some(),
+        "static files do not expose pinned database tip {tip} after bounded synchronization"
+    );
+    for (canonical, pending) in root_checks {
+        let number = canonical.number;
         let parent_number = database
             .block_number(pending.parent_hash())
             .wrap_err("resolve immutable replay parent")?
             .ok_or_else(|| eyre!("replay parent unavailable"))?;
+        ensure!(parent_number <= tip, "replay parent is beyond the pinned state tip");
         let base = database
-            .try_into_history_at_block(parent_number)
+            .history_by_block_number(parent_number)
             .wrap_err("open canonical replay parent state")?;
         let bundle = pending.get_bundle_state();
         let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(&bundle.state);

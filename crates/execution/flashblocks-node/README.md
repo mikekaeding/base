@@ -73,10 +73,11 @@ archive visibility failure cannot masquerade as an execution mismatch or a fully
 On-demand read-only synchronization remains enabled; the background index watcher is disabled so
 it cannot change the verifier's file index mid-calculation. The database snapshot must expose its
 tip header after bounded static-file synchronization. Full root reconstruction can be expensive:
-bound the job and retain incomplete output without interpreting it as acceptance.
+all roots share one pinned snapshot and revert cache, so the target does not chase an advancing
+writer. Bound the job and retain incomplete output without interpreting it as acceptance.
 
 For an active database, retain MDBX reader locking and the writer's PID namespace. Only its shared
-`mdbx.lck` needs a writable bind mount; keep database contents read-only and RocksDB secondary
+`mdbx.lck` needs a writable bind mount; keep database contents read-only and `RocksDB` secondary
 scratch in a separate writable directory. The archive must have persisted the captured blocks.
 Never copy an active database file or disable reader safety to bypass a failed precondition.
 
