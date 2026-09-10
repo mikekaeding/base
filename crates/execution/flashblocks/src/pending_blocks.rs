@@ -993,7 +993,8 @@ mod tests {
     -> Result<(), StateProcessorError> {
         let mut builder = PendingBlocksBuilder::new();
         builder.with_flashblocks([test_flashblock()]);
-        builder.with_header(Header { state_root: B256::ZERO, ..Header::default() }.seal(B256::ZERO));
+        builder
+            .with_header(Header { state_root: B256::ZERO, ..Header::default() }.seal(B256::ZERO));
         let mut pending = builder.build()?;
         let canonical = Header { state_root: B256::repeat_byte(1), ..Header::default() };
         assert!(pending.matches_canonical_parent(&canonical));
