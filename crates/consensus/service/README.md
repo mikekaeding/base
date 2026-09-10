@@ -164,3 +164,8 @@ block. The first failed fetch and every fifth consecutive failure include the er
 backoff. Correlate these block-numbered records with Engine insertion and pending publication before
 attributing a slow boundary to the source, retries, execution or IPC. This logging is on the
 two-second canonical follower, not the Flashblock execution path, and does not add RPC requests.
+
+For an already-announced block whose payload is not available yet, retries wait at most
+10/20/40/80/160/200 ms, then remain capped at 200 ms; a new head notification may wake them sooner.
+Ordinary head polling stays at 200 ms and transport failures retain a one-second backoff. This
+handles source-backend publication races without changing sequential fetch or Engine validation.

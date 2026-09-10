@@ -70,7 +70,7 @@ where
                     latest = self.refresh_source_latest(source_latest) => latest,
                 };
                 if next_fetch > source_latest {
-                    self.wait_at_source_head(&mut head_notifications).await;
+                    self.wait_at_source_head(&mut head_notifications, SOURCE_HEAD_BACKOFF).await;
                     continue;
                 }
             }
@@ -102,8 +102,20 @@ where
                 Err(e) => {
                     consecutive_payload_failures += 1;
                     let unavailable = matches!(e, RemoteL2ClientError::BlockNotFound(_));
-                    let backoff =
-                        if unavailable { SOURCE_HEAD_BACKOFF } else { SOURCE_FAILURE_BACKOFF };
+                    let backoff = if unavailable {
+                        // An announced block may briefly be absent on another source backend.
+                        // Retry that race promptly, then return to the ordinary polling bound.
+                        Duration::from_millis(match consecutive_payload_failures {
+                            1 => 10,
+                            2 => 20,
+                            3 => 40,
+                            4 => 80,
+                            5 => 160,
+                            _ => 200,
+                        })
+                    } else {
+                        SOURCE_FAILURE_BACKOFF
+                    };
                     if consecutive_payload_failures == 1
                         || consecutive_payload_failures % PREFETCH_FAILURE_WARN_INTERVAL == 0
                     {
@@ -128,7 +140,7 @@ where
                     }
                     if unavailable {
                         // The latest-head response can precede payload availability on another backend.
-                        self.wait_at_source_head(&mut head_notifications).await;
+                        self.wait_at_source_head(&mut head_notifications, backoff).await;
                     } else {
                         tokio::select! {
                             _ = self.cancellation.cancelled() => {}
@@ -157,12 +169,16 @@ where
         }
     }
 
-    async fn wait_at_source_head(&self, notifications: &mut Option<watch::Receiver<u64>>) {
+    async fn wait_at_source_head(
+        &self,
+        notifications: &mut Option<watch::Receiver<u64>>,
+        maximum_wait: Duration,
+    ) {
         // Watch retains a wake arriving between the latest-head query and this wait.
         // The fallback covers HTTP sources, lost notifications and subscription reconnects.
         tokio::select! {
             _ = self.cancellation.cancelled() => {}
-            _ = time::sleep(SOURCE_HEAD_BACKOFF) => {}
+            _ = time::sleep(maximum_wait) => {}
             changed = async {
                 match notifications.as_mut() {
                     Some(receiver) => receiver.changed().await,
@@ -174,7 +190,7 @@ where
                     // A closed notification channel must not become a busy-poll loop.
                     tokio::select! {
                         _ = self.cancellation.cancelled() => {}
-                        _ = time::sleep(SOURCE_HEAD_BACKOFF) => {}
+                        _ = time::sleep(maximum_wait) => {}
                     }
                 }
             }
@@ -199,9 +215,12 @@ mod tests {
         let (sender, receiver) = watch::channel(0);
         sender.send(42).expect("test receiver is alive");
         let mut receiver = Some(receiver);
-        time::timeout(Duration::from_millis(100), prefetcher.wait_at_source_head(&mut receiver))
-            .await
-            .expect("queued head wakes without waiting for poll interval");
+        time::timeout(
+            Duration::from_millis(100),
+            prefetcher.wait_at_source_head(&mut receiver, SOURCE_HEAD_BACKOFF),
+        )
+        .await
+        .expect("queued head wakes without waiting for poll interval");
     }
 
     #[tokio::test]
@@ -281,7 +300,7 @@ mod tests {
                 .expect("payload availability retry must not wait one second")
                 .expect("cancellation terminates the fixture");
             if !pushed {
-                assert!(started.elapsed() >= SOURCE_HEAD_BACKOFF);
+                assert!(started.elapsed() >= Duration::from_millis(10));
             }
         }
     }
@@ -293,9 +312,12 @@ mod tests {
         drop(sender);
         let mut receiver = Some(receiver);
         assert!(
-            time::timeout(Duration::from_millis(20), prefetcher.wait_at_source_head(&mut receiver))
-                .await
-                .is_err()
+            time::timeout(
+                Duration::from_millis(20),
+                prefetcher.wait_at_source_head(&mut receiver, SOURCE_HEAD_BACKOFF)
+            )
+            .await
+            .is_err()
         );
         assert!(receiver.is_none());
     }
@@ -304,16 +326,93 @@ mod tests {
     async fn cancellation_interrupts_head_wait() {
         let prefetcher = prefetcher();
         prefetcher.cancellation.cancel();
-        time::timeout(Duration::from_millis(100), prefetcher.wait_at_source_head(&mut None))
-            .await
-            .expect("cancellation does not wait for poll interval");
+        time::timeout(
+            Duration::from_millis(100),
+            prefetcher.wait_at_source_head(&mut None, SOURCE_HEAD_BACKOFF),
+        )
+        .await
+        .expect("cancellation does not wait for poll interval");
     }
 
     #[tokio::test]
     async fn polling_still_advances_without_notifications() {
         let prefetcher = prefetcher();
-        time::timeout(Duration::from_secs(1), prefetcher.wait_at_source_head(&mut None))
+        time::timeout(
+            Duration::from_secs(1),
+            prefetcher.wait_at_source_head(&mut None, SOURCE_HEAD_BACKOFF),
+        )
+        .await
+        .expect("HTTP and disconnected sources retain bounded polling");
+    }
+
+    #[tokio::test]
+    async fn unavailable_payload_retries_promptly_then_caps_without_busy_loop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cancellation = CancellationToken::new();
+        let stop = cancellation.clone();
+        let mut source = MockRemoteClient::new();
+        source.expect_get_block_number().times(1).returning(|_| Ok(42));
+        let mut calls = 0;
+        let mut previous = time::Instant::now();
+        source.expect_get_payload_by_number().times(8).returning(move |number| {
+            assert_eq!(number, 42);
+            if calls > 0 {
+                let expected = match calls {
+                    1 => 10,
+                    2 => 20,
+                    3 => 40,
+                    4 => 80,
+                    5 => 160,
+                    _ => 200,
+                };
+                assert!(previous.elapsed() >= Duration::from_millis(expected));
+            }
+            previous = time::Instant::now();
+            calls += 1;
+            if calls == 8 {
+                stop.cancel();
+            }
+            Err(RemoteL2ClientError::BlockNotFound(number.to_string()))
+        });
+        let (output, receiver) = mpsc::channel(1);
+        let prefetcher = PayloadPrefetcher::new(Arc::new(source), cancellation, output);
+        time::timeout(Duration::from_secs(2), prefetcher.run(41, None))
             .await
-            .expect("HTTP and disconnected sources retain bounded polling");
+            .map_err(|e| format!("bounded retry sequence exceeded deadline: {e}"))?
+            .map_err(|e| format!("bounded retry fixture failed: {e}"))?;
+        drop(receiver);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transport_failure_keeps_one_second_backoff() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use alloy_transport::TransportErrorKind;
+
+        let cancellation = CancellationToken::new();
+        let stop = cancellation.clone();
+        let mut source = MockRemoteClient::new();
+        source.expect_get_block_number().times(1).returning(|_| Ok(42));
+        let mut previous = None;
+        source.expect_get_payload_by_number().times(2).returning(move |number| {
+            assert_eq!(number, 42);
+            if let Some(previous) = previous {
+                assert!(time::Instant::now() - previous >= SOURCE_FAILURE_BACKOFF);
+                stop.cancel();
+            }
+            previous = Some(time::Instant::now());
+            Err(RemoteL2ClientError::FetchBlock {
+                tag: number.to_string(),
+                source: TransportErrorKind::custom_str("transport fixture"),
+            })
+        });
+        let (output, receiver) = mpsc::channel(1);
+        let prefetcher = PayloadPrefetcher::new(Arc::new(source), cancellation, output);
+        time::timeout(Duration::from_secs(2), prefetcher.run(41, None))
+            .await
+            .map_err(|e| format!("transport retry exceeded deadline: {e}"))?
+            .map_err(|e| format!("transport retry fixture failed: {e}"))?;
+        drop(receiver);
+        Ok(())
     }
 }
