@@ -1,3 +1,4 @@
+use std::time::Instant;
 use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use alloy_eips::BlockNumberOrTag;
@@ -5,6 +6,7 @@ use base_common_rpc_types_engine::BaseExecutionPayloadEnvelope;
 use tokio::sync::watch;
 use tokio::{sync::mpsc, time};
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 use tracing::{debug, warn};
 
 use crate::follow::{error::FollowError, source::RemoteClient, source::RemoteL2ClientError};
@@ -73,6 +75,7 @@ where
                 }
             }
 
+            let fetch_started = Instant::now();
             let payload = tokio::select! {
                 _ = self.cancellation.cancelled() => return Ok(()),
                 payload = self.source.get_payload_by_number(next_fetch) => payload,
@@ -80,6 +83,10 @@ where
 
             match payload {
                 Ok(payload) => {
+                    let fetch_duration_us = fetch_started.elapsed().as_micros();
+                    info!(target: "follow", block = next_fetch, fetch_duration_us,
+                        retries = consecutive_payload_failures, "Fetched source payload");
+                    let queue_started = Instant::now();
                     let sent = tokio::select! {
                         _ = self.cancellation.cancelled() => return Ok(()),
                         sent = self.blocks_to_insert_tx.send(payload) => sent,
@@ -87,18 +94,28 @@ where
                     if sent.is_err() {
                         return Ok(());
                     }
+                    info!(target: "follow", block = next_fetch,
+                        queue_duration_us = queue_started.elapsed().as_micros(), "Queued source payload");
                     consecutive_payload_failures = 0;
                     next_fetch = next_fetch.saturating_add(1);
                 }
                 Err(e) => {
                     consecutive_payload_failures += 1;
-                    if consecutive_payload_failures % PREFETCH_FAILURE_WARN_INTERVAL == 0 {
+                    let unavailable = matches!(e, RemoteL2ClientError::BlockNotFound(_));
+                    let backoff =
+                        if unavailable { SOURCE_HEAD_BACKOFF } else { SOURCE_FAILURE_BACKOFF };
+                    if consecutive_payload_failures == 1
+                        || consecutive_payload_failures % PREFETCH_FAILURE_WARN_INTERVAL == 0
+                    {
                         warn!(
                             target: "follow",
                             block = next_fetch,
                             attempts = consecutive_payload_failures,
+                            fetch_duration_us = fetch_started.elapsed().as_micros(),
+                            maximum_backoff_ms = backoff.as_millis(),
+                            unavailable,
                             error = %e,
-                            "Repeatedly failed to prefetch source payload"
+                            "Failed to prefetch source payload"
                         );
                     } else {
                         debug!(
@@ -109,7 +126,7 @@ where
                             "Failed to prefetch source payload"
                         );
                     }
-                    if matches!(e, RemoteL2ClientError::BlockNotFound(_)) {
+                    if unavailable {
                         // The latest-head response can precede payload availability on another backend.
                         self.wait_at_source_head(&mut head_notifications).await;
                     } else {

@@ -13,6 +13,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 use tracing::warn;
 use url::Url;
 
@@ -93,6 +94,8 @@ impl RemoteL2Client {
                             _ = cancellation.cancelled() => return Ok(()),
                             head = heads.next() => {
                                 let Some(head) = head else { break; };
+                                info!(target: "follow", block = head.number, block_timestamp = head.timestamp,
+                                    "Received source head");
                                 if sender.send(head.number).is_err() { return Ok(()); }
                             }
                         }
