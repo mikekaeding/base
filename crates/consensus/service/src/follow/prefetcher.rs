@@ -44,7 +44,7 @@ where
     pub(super) async fn run(
         self,
         start_from_local_head: u64,
-        mut head_notifications: Option<watch::Receiver<()>>,
+        mut head_notifications: Option<watch::Receiver<u64>>,
     ) -> Result<(), FollowError> {
         let mut next_fetch = start_from_local_head.saturating_add(1);
         let mut source_latest = start_from_local_head;
@@ -55,6 +55,13 @@ where
                 return Ok(());
             }
 
+            if next_fetch > source_latest {
+                // A pushed height is a fetch hint, not authority to skip payload validation.
+                // Re-querying latest here adds a round trip and can hit a lagging RPC backend.
+                if let Some(notifications) = &head_notifications {
+                    source_latest = source_latest.max(*notifications.borrow());
+                }
+            }
             if next_fetch > source_latest {
                 source_latest = tokio::select! {
                     _ = self.cancellation.cancelled() => return Ok(()),
@@ -126,7 +133,7 @@ where
         }
     }
 
-    async fn wait_at_source_head(&self, notifications: &mut Option<watch::Receiver<()>>) {
+    async fn wait_at_source_head(&self, notifications: &mut Option<watch::Receiver<u64>>) {
         // Watch retains a wake arriving between the latest-head query and this wait.
         // The fallback covers HTTP sources, lost notifications and subscription reconnects.
         tokio::select! {
@@ -165,12 +172,60 @@ mod tests {
     #[tokio::test]
     async fn notification_received_before_wait_is_not_lost() {
         let prefetcher = prefetcher();
-        let (sender, receiver) = watch::channel(());
-        sender.send(()).expect("test receiver is alive");
+        let (sender, receiver) = watch::channel(0);
+        sender.send(42).expect("test receiver is alive");
         let mut receiver = Some(receiver);
         time::timeout(Duration::from_millis(100), prefetcher.wait_at_source_head(&mut receiver))
             .await
             .expect("queued head wakes without waiting for poll interval");
+    }
+
+    #[tokio::test]
+    async fn pushed_height_fetches_next_payload_without_latest_rpc()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for advertised in [42, u64::MAX] {
+            let cancellation = CancellationToken::new();
+            let stop = cancellation.clone();
+            let mut source = MockRemoteClient::new();
+            source.expect_get_block_number().times(0);
+            source.expect_get_payload_by_number().times(1).returning(move |number| {
+                // Even an extreme hint cannot skip a block or authorize its insertion.
+                assert_eq!(number, 42);
+                stop.cancel();
+                Err(RemoteL2ClientError::BlockNotFound(number.to_string()))
+            });
+            let (head, notifications) = watch::channel(0);
+            head.send(advertised).map_err(|e| format!("publish advertised-height fixture: {e}"))?;
+            let (output, _receiver) = mpsc::channel(1);
+            let prefetcher = PayloadPrefetcher::new(Arc::new(source), cancellation, output);
+            time::timeout(Duration::from_millis(100), prefetcher.run(41, Some(notifications)))
+                .await
+                .map_err(|e| format!("advertised-height fetch exceeded deadline: {e}"))?
+                .map_err(|e| format!("advertised-height prefetch failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn old_height_hint_keeps_http_fallback_and_sequential_fetch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cancellation = CancellationToken::new();
+        let stop = cancellation.clone();
+        let mut source = MockRemoteClient::new();
+        source.expect_get_block_number().times(1).returning(|_| Ok(42));
+        source.expect_get_payload_by_number().times(1).returning(move |number| {
+            assert_eq!(number, 42);
+            stop.cancel();
+            Err(RemoteL2ClientError::BlockNotFound(number.to_string()))
+        });
+        let (_head, notifications) = watch::channel(40);
+        let (output, _receiver) = mpsc::channel(1);
+        let prefetcher = PayloadPrefetcher::new(Arc::new(source), cancellation, output);
+        time::timeout(Duration::from_millis(100), prefetcher.run(41, Some(notifications)))
+            .await
+            .map_err(|e| format!("fallback fetch exceeded deadline: {e}"))?
+            .map_err(|e| format!("fallback prefetch failed: {e}"))?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -189,9 +244,9 @@ mod tests {
                 }
                 Err(RemoteL2ClientError::BlockNotFound("42".to_owned()))
             });
-            let (head, notifications) = watch::channel(());
+            let (head, notifications) = watch::channel(0);
             if pushed {
-                head.send(()).expect("fixture receiver is live");
+                head.send(42).expect("fixture receiver is live");
             }
             let (output, _receiver) = mpsc::channel(1);
             let prefetcher = PayloadPrefetcher::new(Arc::new(source), cancellation, output);
@@ -210,7 +265,7 @@ mod tests {
     #[tokio::test]
     async fn closed_notifications_fall_back_without_busy_loop() {
         let prefetcher = prefetcher();
-        let (sender, receiver) = watch::channel(());
+        let (sender, receiver) = watch::channel(0);
         drop(sender);
         let mut receiver = Some(receiver);
         assert!(
