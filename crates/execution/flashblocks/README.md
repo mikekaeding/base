@@ -19,10 +19,13 @@ Canonical reconciliation rebuilds any still-pending future flashblocks from a fr
 provider. Pending state must not carry a database read transaction across canonical blocks because
 long-lived snapshots can expire and interrupt flashblock processing.
 
-The normal Flashblock path never waits for canonical state. At block boundaries it validates the
-next block's parent hash and base fee against the speculative parent in constant time. A
-block-boundary mismatch means the producer sealed a hidden tail after the last public prefix, so the
-next index-zero payload is held briefly and rebuilt from canonical state without resetting consumers.
+Same-block processing does not wait for canonical state. Across a block boundary, the incoming
+parent hash must authenticate the locally available canonical header. Its complete header must match
+the executed public prefix, including the ordered transaction root and cumulative executed gas;
+only a zero provisional state root can be replaced by the authenticated canonical root. A public
+`diff.block_hash` is not that canonical identity, and a hash difference alone does not prove a hidden
+tail. An unavailable header, different canonical hash, or differing prefix is reported separately;
+the next index-zero payload is retained and rebuilt from canonical state without resetting consumers.
 Cached payloads retain their original receive time and recovery republishes them in index order so
 downstream state machines see the missing index zero. The trader adapter uses that timestamp to mark
 payloads older than the 200 ms freshness budget as synchronization-only rather than trade signals.
@@ -30,6 +33,10 @@ An in-line sequence or execution divergence still quarantines that lineage. Cano
 updates have queue priority. Directly queued snapshots delayed by at least one 200 ms Flashblock
 interval are still published in sequence for downstream state continuity, while the trader adapter
 marks them synchronization-only and suppresses decisions.
+
+Boundary verification performs one local header lookup, header hash and fixed-size field comparison,
+not a network request or state-trie rebuild. It does not remove waits for unavailable canonical data;
+any latency reduction requires measurement on a running node.
 
 ## RPC Extensions
 

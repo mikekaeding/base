@@ -210,12 +210,7 @@ where
                         block_number = flashblock.metadata.block_number,
                         flashblock_index = flashblock.index
                     );
-                    self.apply_flashblock(
-                        prev_pending_blocks,
-                        flashblock,
-                        Some(received_at),
-                    )
-                    .await;
+                    self.apply_flashblock(prev_pending_blocks, flashblock, Some(received_at)).await;
                 }
             }
         }
@@ -230,10 +225,9 @@ where
         let start_time = Instant::now();
         match self.process_flashblock(prev_pending_blocks.clone(), &flashblock) {
             Ok(new_pending_blocks) => {
-                if let (Some(recovery_only), Some(pb)) = (
-                    publication_is_recovery_only(received_at),
-                    new_pending_blocks.as_ref(),
-                ) {
+                if let (Some(recovery_only), Some(pb)) =
+                    (publication_is_recovery_only(received_at), new_pending_blocks.as_ref())
+                {
                     _ = self.sender.send(Arc::clone(pb));
                     if recovery_only {
                         Metrics::stale_flashblock_recovery_publications().increment(1);
@@ -272,6 +266,8 @@ where
             }
             Err(
                 e @ (StateProcessorError::ParentHashMismatch { .. }
+                | StateProcessorError::ParentUnverified { .. }
+                | StateProcessorError::ParentPrefixMismatch { .. }
                 | StateProcessorError::ParentStateIncomplete { .. }),
             ) => {
                 debug!(
@@ -661,6 +657,30 @@ where
             return Err(StateProcessorError::MissingFirstFlashblock);
         };
 
+        // diff.block_hash identifies a partial block, not the final parent named by the next block.
+        // Authenticate the complete predecessor before taking ownership of its execution database.
+        let previous_header = prev_pending_blocks.latest_header();
+        let canonical_parent = self
+            .client
+            .header_by_number(previous_header.number)
+            .map_err(|e| ProviderError::StateProvider(e.to_string()))?
+            .ok_or(StateProcessorError::ParentUnverified {
+                parent_block: previous_header.number,
+            })?;
+        let calculated_parent_hash = canonical_parent.hash_slow();
+        if calculated_parent_hash != base.parent_hash {
+            return Err(StateProcessorError::ParentHashMismatch {
+                parent_block: previous_header.number,
+                calculated_parent_hash,
+                declared_parent_hash: base.parent_hash,
+            });
+        }
+        if !prev_pending_blocks.matches_canonical_parent(&canonical_parent) {
+            return Err(StateProcessorError::ParentPrefixMismatch {
+                parent_block: previous_header.number,
+            });
+        }
+
         let mut live_state = self.lock_live_state();
         let Some(LivePendingState { mut db, state_overrides }) = live_state.take() else {
             warn!(
@@ -675,15 +695,6 @@ where
         };
         drop(live_state);
 
-        let previous_header = prev_pending_blocks.latest_header();
-        let calculated_parent_hash = prev_pending_blocks.latest_declared_block_hash();
-        if !calculated_parent_hash.is_zero() && calculated_parent_hash != base.parent_hash {
-            return Err(StateProcessorError::ParentHashMismatch {
-                parent_block: previous_header.number,
-                calculated_parent_hash,
-                declared_parent_hash: base.parent_hash,
-            });
-        }
         let current_block = BlockAssembler::assemble(std::slice::from_ref(flashblock))?;
         let l1_block_info = current_block.l1_block_info()?;
         let AssembledBlock { block: assembled_block, header: assembled_header, .. } = current_block;
