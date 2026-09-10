@@ -623,7 +623,10 @@ impl<'a> FlashblockBuilder<'a> {
             let pending = self.harness.flashblocks.get_pending_blocks();
             pending
                 .as_ref()
-                .filter(|pending| pending.latest_block_number() + 1 == canonical_block_num)
+                .filter(|pending| {
+                    pending.latest_block_number() + 1 == canonical_block_num
+                        && pending.latest_block_number() > current_block.number
+                })
                 .map(|pending| pending.latest_header())
         };
         let parent_header = pending_parent.as_deref().unwrap_or_else(|| current_block.header());

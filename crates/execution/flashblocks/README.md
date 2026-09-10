@@ -37,6 +37,15 @@ marks them synchronization-only and suppresses decisions.
 Boundary verification performs one local header lookup, header hash and fixed-size field comparison,
 not a network request or state-trie rebuild. It does not remove waits for unavailable canonical data;
 any latency reduction requires measurement on a running node.
+Cold initialization and canonical rebuilds enforce the same parent identity and executed-prefix
+checks before changing `BLOCKHASH` or applying system calls. A recovery notification must never
+turn a previously rejected parent hash into an executable snapshot merely by matching block height.
+
+The `base-flashblocks-node` parent-boundary integration tests build real Engine API blocks and
+separately control canonical delivery. They cover authenticated reuse despite a different provisional
+hash, conflicting-header recovery, and rejection of the wrong parent throughout recovery. Printed
+receive-to-publication timings exclude test-harness sleeps, but use small test blocks and are not
+production-load latency estimates.
 
 ## RPC Extensions
 

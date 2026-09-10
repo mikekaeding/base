@@ -88,7 +88,7 @@ async fn test_state_overrides_persisted_across_flashblocks() {
 
 #[tokio::test]
 async fn test_state_overrides_persisted_across_blocks() {
-    let test = FlashblocksBuilderTestHarness::new().await;
+    let mut test = FlashblocksBuilderTestHarness::new().await;
 
     let initial_base = FlashblockBuilder::new_base(&test).build();
     let initial_block_number = initial_base.metadata.block_number;
@@ -145,6 +145,14 @@ async fn test_state_overrides_persisted_across_blocks() {
         test.expected_pending_balance(Account::Bob, 100_000)
     );
 
+    // A real canonical parent, not a provisional zero hash, anchors the following block.
+    test.new_canonical_block(vec![test.build_transaction_to_send_eth_with_nonce(
+        Account::Alice,
+        Account::Bob,
+        100_000,
+        0,
+    )])
+    .await;
     test.send_flashblock(
         FlashblockBuilder::new_base(&test)
             .with_canonical_block_number(initial_block_number)
@@ -172,13 +180,7 @@ async fn test_state_overrides_persisted_across_blocks() {
     );
 
     assert!(test.flashblocks.get_pending_blocks().get_state_overrides().is_some());
-    assert!(
-        test.flashblocks
-            .get_pending_blocks()
-            .get_state_overrides()
-            .unwrap()
-            .contains_key(&Account::Alice.address())
-    );
+    assert_eq!(test.canonical_account(Account::Alice).nonce, 1);
 
     test.send_flashblock(
         FlashblockBuilder::new(&test, 1)
@@ -205,7 +207,7 @@ async fn test_state_overrides_persisted_across_blocks() {
             .expect("should be set as txn receiver")
             .balance
             .expect("should be changed due to receiving funds"),
-        test.expected_pending_balance(Account::Bob, 200_000)
+        test.expected_pending_balance(Account::Bob, 100_000)
     );
 }
 
@@ -264,48 +266,27 @@ async fn test_only_current_pending_state_cleared_upon_canonical_block_reorg() {
         test.expected_pending_balance(Account::Bob, 100_000)
     );
 
-    test.send_flashblock(FlashblockBuilder::new_base(&test).with_canonical_block_number(1).build())
+    let canonical = test
+        .new_canonical_block_without_processing(vec![
+            test.build_transaction_to_send_eth_with_nonce(Account::Alice, Account::Bob, 100, 0),
+        ])
         .await;
-
+    test.send_flashblock(FlashblockBuilder::new_base(&test).build()).await;
+    assert!(test.flashblocks.get_pending_blocks().is_none(), "changed parent must wait");
     test.send_flashblock(
         FlashblockBuilder::new(&test, 1)
-            .with_canonical_block_number(1)
-            .with_transactions(vec![test.build_transaction_to_send_eth(
+            .with_transactions(vec![test.build_transaction_to_send_eth_with_nonce(
                 Account::Alice,
                 Account::Bob,
                 100_000,
+                1,
             )])
             .build(),
     )
     .await;
-    let pending = test.flashblocks.get_pending_blocks().get_block(true);
-    assert!(pending.is_some());
-    let pending = pending.unwrap();
-    assert_eq!(pending.transactions.len(), 2);
-
-    let overrides = test
-        .flashblocks
-        .get_pending_blocks()
-        .get_state_overrides()
-        .expect("should be set from txn execution");
-
-    assert!(overrides.contains_key(&Account::Alice.address()));
-    assert_eq!(
-        overrides
-            .get(&Account::Bob.address())
-            .expect("should be set as txn receiver")
-            .balance
-            .expect("should be changed due to receiving funds"),
-        test.expected_pending_balance(Account::Bob, 200_000)
-    );
-
-    test.new_canonical_block(vec![test.build_transaction_to_send_eth_with_nonce(
-        Account::Alice,
-        Account::Bob,
-        100,
-        0,
-    )])
-    .await;
+    assert!(test.flashblocks.get_pending_blocks().is_none(), "child delta must remain cached");
+    test.flashblocks.on_canonical_block_received(canonical);
+    sleep(Duration::from_millis(10)).await;
 
     let pending = test.flashblocks.get_pending_blocks().get_block(true);
     assert!(pending.is_some());
@@ -341,6 +322,7 @@ async fn test_matching_canonical_block_prunes_pending_prefix() {
             .build(),
     )
     .await;
+    let canonical = test.new_canonical_block_without_processing(vec![block_one_transaction]).await;
     test.send_flashblock(FlashblockBuilder::new_base(&test).with_canonical_block_number(1).build())
         .await;
     test.send_flashblock(
@@ -356,7 +338,8 @@ async fn test_matching_canonical_block_prunes_pending_prefix() {
     )
     .await;
 
-    test.new_canonical_block(vec![block_one_transaction]).await;
+    test.flashblocks.on_canonical_block_received(canonical);
+    sleep(Duration::from_millis(10)).await;
 
     let pending = test.flashblocks.get_pending_blocks();
     let pending = pending.as_ref().expect("future pending block should remain");
@@ -495,7 +478,7 @@ async fn test_flashblock_for_new_canonical_block_clears_older_flashblocks_if_non
 
 #[tokio::test]
 async fn test_flashblock_for_new_canonical_block_works_if_sequential() {
-    let test = FlashblocksBuilderTestHarness::new().await;
+    let mut test = FlashblocksBuilderTestHarness::new().await;
 
     test.send_flashblock(FlashblockBuilder::new_base(&test).build()).await;
 
@@ -505,6 +488,7 @@ async fn test_flashblock_for_new_canonical_block_works_if_sequential() {
     assert_eq!(current_block.header().number, 1);
     assert_eq!(current_block.transactions.len(), 1);
 
+    test.new_canonical_block(vec![]).await;
     test.send_flashblock(FlashblockBuilder::new_base(&test).with_canonical_block_number(1).build())
         .await;
 
@@ -704,12 +688,13 @@ async fn test_sequential_nonces_across_flashblocks() {
 #[tokio::test]
 async fn test_flashblock_cached_and_applied_after_canonical_block() {
     let mut test = FlashblocksBuilderTestHarness::new().await;
+    let mut builder = FlashblocksBuilderTestHarness::new().await;
+    builder.new_canonical_block(vec![]).await;
 
     // Send a flashblock targeting block 2 (canonical_block_number=1) before
     // canonical block 1 exists. This triggers MissingCanonicalHeader and should
     // be cached by the processor.
-    test.send_flashblock(FlashblockBuilder::new_base(&test).with_canonical_block_number(1).build())
-        .await;
+    test.send_flashblock(FlashblockBuilder::new_base(&builder).build()).await;
 
     assert!(
         test.flashblocks.get_pending_blocks().is_none(),
@@ -728,10 +713,11 @@ async fn test_flashblock_cached_and_applied_after_canonical_block() {
 #[tokio::test]
 async fn test_stale_cached_flashblock_republishes_for_state_recovery() {
     let mut test = FlashblocksBuilderTestHarness::new().await;
+    let mut builder = FlashblocksBuilderTestHarness::new().await;
+    builder.new_canonical_block(vec![]).await;
     let mut pending = test.flashblocks.subscribe_to_flashblocks();
 
-    test.send_flashblock(FlashblockBuilder::new_base(&test).with_canonical_block_number(1).build())
-        .await;
+    test.send_flashblock(FlashblockBuilder::new_base(&builder).build()).await;
     sleep(Duration::from_millis(250)).await;
     test.new_canonical_block(vec![]).await;
 
@@ -752,12 +738,13 @@ async fn test_stale_cached_flashblock_republishes_for_state_recovery() {
 #[tokio::test]
 async fn test_cached_flashblock_with_transactions_applied_after_canonical() {
     let mut test = FlashblocksBuilderTestHarness::new().await;
+    let mut builder = FlashblocksBuilderTestHarness::new().await;
+    builder.new_canonical_block(vec![]).await;
 
     let transfer_amount = 100_000u128;
 
     // Cache a base flashblock for block 2 (needs canonical block 1).
-    test.send_flashblock(FlashblockBuilder::new_base(&test).with_canonical_block_number(1).build())
-        .await;
+    test.send_flashblock(FlashblockBuilder::new_base(&builder).build()).await;
     assert!(test.flashblocks.get_pending_blocks().is_none());
 
     // Also cache a second flashblock (index 1) with a transaction.

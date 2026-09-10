@@ -281,7 +281,7 @@ impl TestSetup {
             index: 0,
             base: Some(ExecutionPayloadBaseV1 {
                 parent_beacon_block_root: TEST_PARENT_BEACON_BLOCK_ROOT,
-                parent_hash: B256::default(),
+                parent_hash: self.harness.latest_block().hash(),
                 fee_recipient: Address::ZERO,
                 prev_randao: B256::default(),
                 block_number: 1,
@@ -536,6 +536,7 @@ async fn test_blockhash_dependent_transaction_receipt_pending() -> Result<()> {
     // Step 2. Random flashblocks for canon block 2
     // Created by builder_setup, but inserted into client_setup
     let block_two_fb_base = FlashblockBuilder::new_base(&builder_setup).build();
+    let canonical_transactions = block_two_fb_base.diff.transactions.clone();
     let block_two_fb_one = FlashblockBuilder::new(&builder_setup, 1).build();
     let mut block_two_fb_two = FlashblockBuilder::new(&builder_setup, 2).build();
     let declared_block_two_gas_used = block_two_fb_two.diff.gas_used;
@@ -576,6 +577,9 @@ async fn test_blockhash_dependent_transaction_receipt_pending() -> Result<()> {
         .clone();
     let flashblock = FlashblockBuilder::new_base(&builder_setup).build();
     client_setup.send_flashblock(flashblock).await;
+    assert!(client_setup.flashblocks.get_pending_blocks().is_none());
+    // A canonical callback in production follows Engine API insertion on this same node.
+    client_setup.node.build_block_from_transactions(canonical_transactions).await?;
     client_setup.flashblocks.on_canonical_block_received(canon_block_two);
     let flashblock = FlashblockBuilder::new(&builder_setup, 1)
         .with_transactions(vec![BaseTransactionSigned::Eip1559(txn.clone())])
