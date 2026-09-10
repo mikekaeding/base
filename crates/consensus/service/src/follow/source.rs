@@ -70,10 +70,10 @@ impl RemoteL2Client {
         Ok(Self { provider })
     }
 
-    /// Publishes coalesced wake hints; payload identity and execution remain independently checked.
+    /// Publishes coalesced height hints; payload identity and execution remain independently checked.
     pub(super) async fn follow_heads(
         self,
-        sender: watch::Sender<()>,
+        sender: watch::Sender<u64>,
         cancellation: CancellationToken,
     ) -> Result<(), crate::follow::error::FollowError> {
         if self.provider.client().pubsub_frontend().is_none() {
@@ -92,8 +92,8 @@ impl RemoteL2Client {
                         tokio::select! {
                             _ = cancellation.cancelled() => return Ok(()),
                             head = heads.next() => {
-                                if head.is_none() { break; }
-                                if sender.send(()).is_err() { return Ok(()); }
+                                let Some(head) = head else { break; };
+                                if sender.send(head.number).is_err() { return Ok(()); }
                             }
                         }
                     }

@@ -195,7 +195,7 @@ where
 {
     pub(super) async fn start(
         mut self,
-        head_notifications: Option<tokio::sync::watch::Receiver<()>>,
+        head_notifications: Option<tokio::sync::watch::Receiver<u64>>,
     ) -> Result<(), FollowError> {
         let next_insert = self.follow_from_block.block_info.number.saturating_add(1);
         let (blocks_to_insert_tx, blocks_to_insert_rx) = mpsc::channel(PREFETCH_WINDOW);

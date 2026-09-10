@@ -136,7 +136,7 @@ where
         );
 
         let mut tasks = JoinSet::new();
-        let (head_sender, head_notifications) = tokio::sync::watch::channel(());
+        let (head_sender, head_notifications) = tokio::sync::watch::channel(0);
         tasks.spawn(self.l2_source.clone().follow_heads(head_sender, cancellation.clone()));
         tasks.spawn(runtime.start(Some(head_notifications)));
         if let Some(rpc) = rpc {

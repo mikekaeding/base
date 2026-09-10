@@ -9,6 +9,9 @@ An implementation of the Base [RollupNode][rn-spec] service.
 
 Follow mode accepts HTTP(S) or WebSocket source L2 RPC URLs. WebSocket `newHeads` messages wake the
 ordered payload fetcher immediately; they are coalesced hints, not trusted execution results.
+The pushed height permits a direct fetch of the next sequential payload without another latest-head
+RPC, which could add latency or consult a lagging backend. Hints cannot skip blocks or bypass the
+bounded prefetch queue.
 Head discovery polls at most every 200 ms while caught up, including during subscription recovery.
 Transport failures retain a one-second backoff. An advertised head whose full payload is not yet
 available instead waits for a pushed head or the bounded 200 ms availability retry; source readiness
