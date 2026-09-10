@@ -151,6 +151,20 @@ pub enum StateProcessorError {
     #[error("missing first flashblock: cannot build pending blocks without first flashblock")]
     MissingFirstFlashblock,
 
+    /// The final parent header is not yet available to authenticate a provisional prefix.
+    #[error("pending parent block {parent_block} is awaiting its canonical header")]
+    ParentUnverified {
+        /// Parent block awaiting canonical authentication.
+        parent_block: u64,
+    },
+
+    /// The authenticated canonical header differs from the locally executed public prefix.
+    #[error("pending parent block {parent_block} differs from its canonical execution prefix")]
+    ParentPrefixMismatch {
+        /// Parent block with differing execution or header fields.
+        parent_block: u64,
+    },
+
     /// The next block extends a sealed parent that differs from the last public prefix.
     #[error(
         "pending parent block {parent_block} hash mismatch: calculated {calculated_parent_hash}, declared {declared_parent_hash}"
@@ -158,7 +172,7 @@ pub enum StateProcessorError {
     ParentHashMismatch {
         /// Parent block whose public Flashblock prefix is incomplete.
         parent_block: u64,
-        /// Hash declared by the latest speculative parent Flashblock.
+        /// Hash of the locally available canonical parent header.
         calculated_parent_hash: B256,
         /// Parent hash declared by the incoming next-block Flashblock.
         declared_parent_hash: B256,

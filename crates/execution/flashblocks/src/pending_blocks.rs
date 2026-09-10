@@ -564,16 +564,16 @@ impl PendingBlocks {
             .map(|flashblock| flashblock.payload_id)
     }
 
-    /// Returns the block hash declared by the latest Flashblock without cloning its payload.
-    #[inline]
-    pub fn latest_declared_block_hash(&self) -> B256 {
-        let latest_block = self.latest_block_number();
-        self.flashblocks
-            .iter()
-            .rev()
-            .find(|flashblock| flashblock.metadata.block_number == latest_block)
-            .map(|flashblock| flashblock.diff.block_hash)
-            .unwrap_or_default()
+    /// Matches the executed parent prefix to a canonical header, excluding only its provisional state root.
+    /// The ordered transaction root, receipts, gas, withdrawals and every execution-environment field
+    /// must match. The caller must separately authenticate the canonical header's hash.
+    pub fn matches_canonical_parent(&self, canonical: &Header) -> bool {
+        let mut pending = self.latest_header.inner().clone();
+        if !pending.state_root.is_zero() && pending.state_root != canonical.state_root {
+            return false;
+        }
+        pending.state_root = canonical.state_root;
+        pending == *canonical && self.latest_block_cumulative_gas_used == canonical.gas_used
     }
 
     /// Returns the index of the latest flashblock.
@@ -986,6 +986,47 @@ mod tests {
 
     fn test_sender() -> Address {
         Address::repeat_byte(0x01)
+    }
+
+    #[test]
+    fn canonical_parent_requires_complete_header_and_executed_gas()
+    -> Result<(), StateProcessorError> {
+        let mut builder = PendingBlocksBuilder::new();
+        builder.with_flashblocks([test_flashblock()]);
+        builder.with_header(Header { state_root: B256::ZERO, ..Header::default() }.seal(B256::ZERO));
+        let mut pending = builder.build()?;
+        let canonical = Header { state_root: B256::repeat_byte(1), ..Header::default() };
+        assert!(pending.matches_canonical_parent(&canonical));
+        let mutations: [fn(&mut Header); 16] = [
+            |h| h.parent_hash = B256::repeat_byte(2),
+            |h| h.transactions_root = B256::repeat_byte(2),
+            |h| h.receipts_root = B256::repeat_byte(2),
+            |h| h.number = 1,
+            |h| h.timestamp = 1,
+            |h| h.gas_limit = 1,
+            |h| h.gas_used = 1,
+            |h| h.base_fee_per_gas = Some(1),
+            |h| h.beneficiary = Address::repeat_byte(2),
+            |h| h.mix_hash = B256::repeat_byte(2),
+            |h| h.extra_data = Bytes::from_static(b"different"),
+            |h| h.parent_beacon_block_root = Some(B256::repeat_byte(2)),
+            |h| h.withdrawals_root = Some(B256::repeat_byte(2)),
+            |h| h.blob_gas_used = Some(1),
+            |h| h.excess_blob_gas = Some(1),
+            |h| h.requests_hash = Some(B256::repeat_byte(2)),
+        ];
+        for mutation in mutations {
+            let mut different = canonical.clone();
+            mutation(&mut different);
+            assert!(!pending.matches_canonical_parent(&different));
+        }
+        pending.latest_block_cumulative_gas_used = 1;
+        assert!(!pending.matches_canonical_parent(&canonical));
+        pending.latest_block_cumulative_gas_used = 0;
+        pending.latest_header =
+            Header { state_root: B256::repeat_byte(3), ..Header::default() }.seal(B256::ZERO);
+        assert!(!pending.matches_canonical_parent(&canonical));
+        Ok(())
     }
 
     fn test_flashblock() -> Flashblock {
