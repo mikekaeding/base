@@ -1,3 +1,6 @@
+use std::fmt::Debug;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::{sync::Arc, time::Instant};
 
 use alloy_consensus::{
@@ -5,11 +8,10 @@ use alloy_consensus::{
     transaction::{Recovered, TransactionMeta},
 };
 use alloy_eips::Encodable2718;
-use alloy_evm::{
-    Database as AlloyDatabase,
-    block::{StateDB, SystemCaller},
-};
+use alloy_evm::block::SystemCaller;
 use alloy_primitives::B256;
+use alloy_primitives::Bytes;
+use alloy_primitives::U256;
 use alloy_rpc_types::TransactionTrait;
 use alloy_rpc_types_eth::state::StateOverride;
 use base_common_chains::Upgrades;
@@ -22,6 +24,7 @@ use base_common_rpc_types::{BaseTransactionReceipt, Transaction};
 use base_execution_rpc::BaseReceiptBuilder as BaseRpcReceiptBuilder;
 use reth_evm::{Evm, FromRecoveredTx};
 use reth_rpc_convert::transaction::ConvertReceiptInput;
+use revm::database::State;
 use revm::{
     Database, DatabaseCommit,
     context::{
@@ -31,6 +34,7 @@ use revm::{
     state::EvmState,
 };
 
+use crate::ProviderError;
 use crate::{ExecutionError, PendingBlocks, StateProcessorError, UnifiedReceiptBuilder};
 
 /// Represents the result of executing or fetching a cached pending transaction.
@@ -168,42 +172,6 @@ where
         }
     }
 
-    /// Applies EIP-4788, EIP-2935, and Canyon create2 deployer pre-execution changes to the EVM.
-    ///
-    /// Must be called once per block, before executing any transactions. This mirrors the
-    /// `apply_pre_execution_changes` behavior of [`base_common_evm::BaseBlockExecutor`] to ensure
-    /// that the cached execution results match what the validator computes.
-    pub fn apply_pre_execution_changes(
-        &mut self,
-        parent_hash: B256,
-        parent_beacon_block_root: Option<B256>,
-    ) -> Result<(), StateProcessorError>
-    where
-        DB: AlloyDatabase + StateDB,
-        ChainSpec: Clone,
-    {
-        let spec = self.receipt_builder.chain_spec();
-        let mut system_caller = SystemCaller::new(spec.clone());
-        system_caller
-            .apply_blockhashes_contract_call(parent_hash, &mut self.evm)
-            .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
-        system_caller
-            .apply_beacon_root_contract_call(parent_beacon_block_root, &mut self.evm)
-            .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
-
-        ensure_create2_deployer(spec, self.pending_block.timestamp, self.evm.db_mut())
-            .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
-
-        // At the Zenith (EIP-8130) transition, plant a code stub on the code-less
-        // enshrined system accounts (the 2D nonce manager) so the persistent state
-        // the enshrined path writes to them is not reaped by EIP-161 end-of-block
-        // state clearing.
-        ensure_eip8130_system_accounts(spec, self.pending_block.timestamp, self.evm.db_mut())
-            .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
-
-        Ok(())
-    }
-
     /// Builds transaction result from cached receipt and state data.
     fn execute_with_cached_data(
         &mut self,
@@ -245,11 +213,12 @@ where
             .ok_or(ExecutionError::GasOverflow)?;
         self.next_log_index += receipt.inner.logs().len();
 
-        for address in state.keys() {
-            self.evm.db_mut().basic(*address).map_err(|err| {
-                StateProcessorError::Execution(ExecutionError::EvmEnv(err.to_string()))
-            })?;
-        }
+        accumulate_pending_state_overrides(
+            self.evm.db_mut(),
+            &mut self.state_overrides,
+            &state,
+            false,
+        )?;
         self.evm.db_mut().commit(state.clone());
 
         Ok(ExecutedPendingTransaction {
@@ -314,25 +283,12 @@ where
         match transact_result {
             Ok(ResultAndState { state, result }) => {
                 let gas_used = result.tx_gas_used();
-                for (addr, acc) in &state {
-                    let existing_override = self.state_overrides.entry(*addr).or_default();
-                    existing_override.balance = Some(acc.info.balance);
-                    existing_override.nonce = Some(acc.info.nonce);
-                    // `bytes()` is REVM's execution-padded form (empty code becomes a
-                    // trailing STOP / `0x00`). Pending RPC overrides must use the
-                    // unpadded original so `EXTCODESIZE` stays 0 for code-less EOAs.
-                    existing_override.code =
-                        acc.info.code.clone().map(|code| code.original_bytes());
-
-                    let existing =
-                        existing_override.state_diff.get_or_insert_with(Default::default);
-                    let changed_slots = acc
-                        .storage
-                        .iter()
-                        .map(|(&key, slot)| (B256::from(key), B256::from(slot.present_value)));
-
-                    existing.extend(changed_slots);
-                }
+                accumulate_pending_state_overrides(
+                    self.evm.db_mut(),
+                    &mut self.state_overrides,
+                    &state,
+                    false,
+                )?;
 
                 self.cumulative_gas_used = self
                     .cumulative_gas_used
@@ -368,6 +324,9 @@ where
                     meta,
                 };
 
+                // This cache belongs to one transaction, not the block or Flashblock batch.
+                // Match canonical receipt conversion when reusing the block's fee parameters.
+                self.l1_block_info.clear_tx_l1_cost();
                 let mut base_receipt = BaseRpcReceiptBuilder::new(
                     self.receipt_builder.chain_spec(),
                     input,
@@ -423,6 +382,149 @@ where
     }
 }
 
+impl<E, ChainSpec, DB> PendingStateBuilder<E, ChainSpec>
+where
+    E: Evm<DB = State<DB>, HaltReason = BaseHaltReason>,
+    DB: Database + Debug,
+    ChainSpec: Upgrades + Clone,
+{
+    /// Applies block system changes to execution state and pending RPC overrides.
+    /// Call once per block before transactions; fork validation follows the canonical executor.
+    pub fn apply_pre_execution_changes(
+        &mut self,
+        parent_hash: B256,
+        parent_beacon_block_root: Option<B256>,
+    ) -> Result<(), StateProcessorError> {
+        // SystemCaller commits internally. Capture only these few system accounts, preserving
+        // an existing observer and restoring it even when a system call rejects the block.
+        let captured = Arc::new(Mutex::new((Vec::new(), self.evm.db_mut().state_hook.take())));
+        let hook_capture = Arc::clone(&captured);
+        self.evm.db_mut().set_state_hook(Some(Box::new(move |state: EvmState| {
+            let mut captured = hook_capture.lock().unwrap_or_else(PoisonError::into_inner);
+            captured.0.push(state.clone());
+            if let Some(hook) = captured.1.as_mut() {
+                hook.on_state(state);
+            }
+        })));
+        let result = (|| {
+            let spec = self.receipt_builder.chain_spec();
+            let mut system_caller = SystemCaller::new(spec.clone());
+            system_caller.apply_blockhashes_contract_call(parent_hash, &mut self.evm).map_err(
+                |error| ExecutionError::EvmEnv(format!("apply blockhash system call: {error}")),
+            )?;
+            system_caller
+                .apply_beacon_root_contract_call(parent_beacon_block_root, &mut self.evm)
+                .map_err(|error| {
+                    ExecutionError::EvmEnv(format!("apply beacon root system call: {error}"))
+                })?;
+            ensure_create2_deployer(spec, self.pending_block.timestamp, self.evm.db_mut())
+                .map_err(|error| {
+                    ExecutionError::EvmEnv(format!("install Canyon create2 deployer: {error}"))
+                })?;
+            ensure_eip8130_system_accounts(spec, self.pending_block.timestamp, self.evm.db_mut())
+                .map_err(|error| {
+                    ExecutionError::EvmEnv(format!("install EIP-8130 system accounts: {error}"))
+                })
+        })();
+        let mut captured = captured.lock().unwrap_or_else(PoisonError::into_inner);
+        self.evm.db_mut().set_state_hook(captured.1.take());
+        result?;
+        for state in &captured.0 {
+            // The local DB already contains these commits, but canonical RPC state may not even
+            // contain their code (fork installation). Retain original system code explicitly.
+            accumulate_pending_state_overrides(
+                self.evm.db_mut(),
+                &mut self.state_overrides,
+                state,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+// Transactions call before commit and omit unchanged code to avoid repeated RPC analysis.
+// Captured system commits call afterward and explicitly retain their small contract bytecode.
+fn accumulate_pending_state_overrides<DB: Database>(
+    database: &mut DB,
+    overrides: &mut StateOverride,
+    state: &EvmState,
+    include_unchanged_code: bool,
+) -> Result<(), StateProcessorError> {
+    for (address, account) in state {
+        let previous = database.basic(*address).map_err(|error| {
+            ProviderError::StateProvider(format!(
+                "load precommit account {address} for pending overrides: {error}"
+            ))
+        })?;
+        if !account.is_touched() {
+            continue;
+        }
+        let pending = overrides.entry(*address).or_default();
+        if account.is_selfdestructed() {
+            pending.balance = Some(U256::ZERO);
+            pending.nonce = Some(0);
+            pending.code = Some(Bytes::new());
+            pending.state = Some(Default::default());
+            pending.state_diff = None;
+            continue;
+        }
+        pending.balance = Some(account.info.balance);
+        pending.nonce = Some(account.info.nonce);
+        if include_unchanged_code
+            || previous.unwrap_or_default().code_hash != account.info.code_hash
+        {
+            let code = if account.info.is_code_hash_empty_or_zero() {
+                Bytes::new()
+            } else if let Some(code) = &account.info.code {
+                code.original_bytes()
+            } else {
+                let code = database.code_by_hash(account.info.code_hash).map_err(|error| {
+                    ProviderError::StateProvider(format!(
+                        "load changed pending code {} for {address}: {error}",
+                        account.info.code_hash
+                    ))
+                })?;
+                if code.hash_slow() != account.info.code_hash {
+                    return Err(ProviderError::StateProvider(format!(
+                        "changed pending code hash mismatch for {address}: expected {}",
+                        account.info.code_hash
+                    ))
+                    .into());
+                }
+                code.original_bytes()
+            };
+            pending.code = Some(code);
+        }
+        // An unchanged or unloaded code field must retain changes from earlier Flashblocks.
+        // Creation and destruction clear storage; later transactions extend that replacement.
+        if account.is_created() {
+            pending.state = Some(Default::default());
+            pending.state_diff = None;
+        }
+        let storage = if let Some(storage) = pending.state.as_mut() {
+            storage
+        } else {
+            pending.state_diff.get_or_insert_with(Default::default)
+        };
+        storage.extend(
+            account
+                .storage
+                .iter()
+                .map(|(key, slot)| (B256::from(*key), B256::from(slot.present_value))),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "state_builder_overrides_tests.rs"]
+mod overrides_tests;
+
+#[cfg(test)]
+#[path = "state_builder_system_overrides_tests.rs"]
+mod system_overrides_tests;
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -438,6 +540,7 @@ mod tests {
     };
     use base_execution_chainspec::BaseChainSpecBuilder;
     use base_execution_evm::BaseEvmConfig;
+    use base_execution_evm::RethL1BlockInfo;
     use reth_evm::ConfigureEvm;
     use reth_revm::State;
     use revm::{
@@ -582,6 +685,98 @@ mod tests {
         ));
 
         alloy_consensus::transaction::Recovered::new_unchecked(envelope, Address::ZERO)
+    }
+
+    #[rstest::rstest]
+    #[case::bedrock(false, None)]
+    #[case::bedrock_inherited_cache(false, Some(U256::MAX))]
+    #[case::jovian(true, None)]
+    #[case::jovian_inherited_cache(true, Some(U256::MAX))]
+    fn pending_receipt_l1_fee_is_scoped_to_each_transaction(
+        #[case] jovian_active: bool,
+        #[case] inherited_transaction_fee: Option<U256>,
+    ) {
+        let chain_spec = BaseChainSpecBuilder::base_mainnet();
+        let chain_spec = Arc::new(if jovian_active {
+            chain_spec.jovian_activated().build()
+        } else {
+            chain_spec.build()
+        });
+        let header = Header {
+            number: 1,
+            timestamp: 100,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(1_000_000_000),
+            ..Default::default()
+        };
+        let l1_block_info = L1BlockInfo {
+            l1_base_fee: U256::from(1_000_000_000),
+            l1_base_fee_scalar: U256::from(1_000_000),
+            l1_blob_base_fee: Some(U256::from(1_000_000)),
+            l1_blob_base_fee_scalar: Some(U256::from(1_000_000)),
+            ..Default::default()
+        };
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            Address::ZERO,
+            AccountInfo {
+                balance: U256::from(1_000_000_000_000_000_000u128),
+                ..Default::default()
+            },
+        );
+        let evm_config = BaseEvmConfig::base(Arc::clone(&chain_spec));
+        let evm_env = evm_config.evm_env(&header).expect("fixture EVM environment is valid");
+        let evm = evm_config.evm_with_env(db, evm_env);
+        let pending_block = Block { header: header.clone(), body: Default::default() };
+        let mut builder = PendingStateBuilder::new(
+            Arc::clone(&chain_spec),
+            evm,
+            pending_block,
+            None,
+            L1BlockInfo { tx_l1_cost: inherited_transaction_fee, ..l1_block_info },
+            StateOverride::default(),
+        );
+
+        // The long input exceeds Fjord's compressed-size floor; the last short input also
+        // verifies that recomputation follows the transaction rather than the largest prior fee.
+        let long_input: Vec<u8> = (0u64..128)
+            .flat_map(|index| alloy_primitives::keccak256(index.to_be_bytes()).0)
+            .collect();
+        let mut fees = Vec::new();
+        for (nonce, input) in [(0, Bytes::new()), (1, long_input.into()), (2, Bytes::new())] {
+            let transaction = alloy_consensus::TxLegacy {
+                chain_id: Some(8453),
+                nonce,
+                gas_price: 1_000_000_000,
+                gas_limit: 500_000,
+                to: TxKind::Call(Address::repeat_byte(0x11)),
+                value: U256::ZERO,
+                input,
+            };
+            let transaction = BaseTxEnvelope::Legacy(Signed::new_unhashed(
+                transaction,
+                alloy_primitives::Signature::test_signature(),
+            ));
+            // Canonical receipt conversion resets its fee cache before every transaction.
+            // A fresh block-info copy provides that independent per-transaction reference.
+            let expected_fee = l1_block_info
+                .clone()
+                .l1_tx_data_fee(&chain_spec, header.timestamp, &transaction.encoded_2718(), false)
+                .expect("fixture L1 fee inputs are valid")
+                .to::<u128>();
+            let transaction = Recovered::new_unchecked(transaction, Address::ZERO);
+            let result = builder
+                .execute_transaction(
+                    usize::try_from(nonce).expect("fixture index fits"),
+                    transaction,
+                )
+                .expect("fixture transaction executes");
+            assert_eq!(result.receipt.l1_block_info.l1_fee, Some(expected_fee));
+            assert!(expected_fee > 0);
+            fees.push(expected_fee);
+        }
+        assert!(fees[1] > fees[0]);
+        assert!(fees[1] > fees[2]);
     }
 
     #[test]
@@ -984,7 +1179,8 @@ mod tests {
 
         // The EVM database must now show nonce 1 for the sender, proving that
         // execute_with_cached_data committed the state before returning.
-        let (second_db_after, _) = second_builder.into_db_and_state_overrides();
+        let (second_db_after, second_overrides) = second_builder.into_db_and_state_overrides();
+        assert_eq!(second_overrides.get(&sender).and_then(|account| account.nonce), Some(1));
         let sender_nonce_after_cached_tx_a = second_db_after
             .cache
             .accounts
@@ -1116,10 +1312,6 @@ mod tests {
         let contract_override = state_overrides
             .get(&contract)
             .expect("touched contract must be present in pending overrides");
-        assert_eq!(
-            contract_override.code.as_ref(),
-            Some(&original_contract_code),
-            "contract override must store original_bytes(), not REVM padding"
-        );
+        assert!(contract_override.code.is_none(), "unchanged code stays in canonical state");
     }
 }

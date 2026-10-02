@@ -28,6 +28,7 @@ use reth_revm::{State, database::StateProviderDatabase};
 use revm_database::states::bundle_state::BundleRetention;
 use tokio::sync::{Mutex, broadcast::Sender, mpsc::UnboundedReceiver};
 
+use crate::FlashblocksReset;
 use crate::{
     AssembledBlock, BlockAssembler, ExecutionError, FlashblockCache, PendingBlocks,
     PendingBlocksBuilder, PendingStateBuilder, ProtocolError, ProviderError, Result,
@@ -65,6 +66,7 @@ pub struct StateProcessor<Client> {
     max_depth: u64,
     client: Client,
     sender: Sender<Arc<PendingBlocks>>,
+    reset_sender: Sender<FlashblocksReset>,
     cache: Arc<Mutex<FlashblockCache>>,
     live_state: StdMutex<Option<LivePendingState>>,
 }
@@ -83,6 +85,13 @@ where
 
     fn clear_live_state(&self) {
         *self.lock_live_state() = None;
+    }
+
+    fn invalidate_pending_state(&self, block_number: u64, flashblock_index: u64) {
+        self.clear_live_state();
+        self.pending_blocks.store(None);
+        // Subscribers may not exist during startup; never retain an invalid overlay for them.
+        let _ = self.reset_sender.send(FlashblocksReset { block_number, flashblock_index });
     }
 
     fn set_live_state(&self, db: PendingExecutionDb, state_overrides: StateOverride) {
@@ -190,9 +199,10 @@ where
             max_depth = self.max_depth,
         );
         Metrics::pending_drop_stale().increment(1);
-        self.clear_live_state();
-        self.pending_blocks.store(None);
-
+        self.invalidate_pending_state(
+            pending_blocks.latest_block_number(),
+            pending_blocks.latest_flashblock_index(),
+        );
         None
     }
 
@@ -232,6 +242,7 @@ where
         max_depth: u64,
         rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
         sender: Sender<Arc<PendingBlocks>>,
+        reset_sender: Sender<FlashblocksReset>,
     ) -> Self {
         let cache = client
             .best_block_number()
@@ -243,6 +254,7 @@ where
             max_depth,
             rx,
             sender,
+            reset_sender,
             cache: Arc::new(Mutex::new(cache)),
             live_state: StdMutex::new(None),
         }
@@ -277,6 +289,7 @@ where
                             }
                         }
                         Err(e) => {
+                            self.invalidate_pending_state(block.number, 0);
                             error!(message = "could not process canonical block", error = %e);
                         }
                     }
@@ -317,6 +330,8 @@ where
         }
 
         let start_time = Instant::now();
+        let block_number = flashblock.metadata.block_number;
+        let flashblock_index = flashblock.index;
         match self.process_flashblock(prev_pending_blocks, &flashblock) {
             Ok(new_pending_blocks) => {
                 if let Some(ref pb) = new_pending_blocks {
@@ -354,6 +369,7 @@ where
                     _ => {}
                 }
 
+                self.invalidate_pending_state(block_number, flashblock_index);
                 // skip logging expected caching case
                 if !matches!(
                     e,
@@ -1046,8 +1062,14 @@ mod tests {
         let pending = Arc::new(ArcSwapOption::from(Some(Arc::new(builder.build().unwrap()))));
         let (tx, rx) = mpsc::unbounded_channel();
         let (sender, _) = broadcast::channel(1);
-        let processor =
-            StateProcessor::new(client, Arc::clone(&pending), 0, Arc::new(Mutex::new(rx)), sender);
+        let processor = StateProcessor::new(
+            client,
+            Arc::clone(&pending),
+            0,
+            Arc::new(Mutex::new(rx)),
+            sender,
+            broadcast::channel(16).0,
+        );
         tx.send(StateUpdate::Canonical(RecoveredBlock::new_unhashed(
             Block {
                 header: Header { number: 2, ..Default::default() },
@@ -1070,8 +1092,14 @@ mod tests {
         let pending = Arc::new(ArcSwapOption::empty());
         let (tx, rx) = mpsc::unbounded_channel();
         let (sender, _) = broadcast::channel(1);
-        let processor =
-            StateProcessor::new(client, Arc::clone(&pending), 3, Arc::new(Mutex::new(rx)), sender);
+        let processor = StateProcessor::new(
+            client,
+            Arc::clone(&pending),
+            3,
+            Arc::new(Mutex::new(rx)),
+            sender,
+            broadcast::channel(16).0,
+        );
         tx.send(StateUpdate::Flashblock(Flashblock {
             payload_id: PayloadId::default(),
             index: 0,

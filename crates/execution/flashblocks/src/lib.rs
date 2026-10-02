@@ -31,7 +31,7 @@ mod processor;
 pub use processor::{StateProcessor, StateUpdate};
 
 mod state;
-pub use state::FlashblocksState;
+pub use state::{FlashblocksReset, FlashblocksState};
 
 mod subscription;
 pub use subscription::FlashblocksSubscriber;

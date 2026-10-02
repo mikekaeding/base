@@ -28,6 +28,15 @@ use crate::{
 // Buffer 4s of flashblocks for flashblock_sender
 const BUFFER_SIZE: usize = 20;
 
+/// Identifies an invalidated speculative lineage so consumers can discard stale state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlashblocksReset {
+    /// Last affected block number.
+    pub block_number: u64,
+    /// Last affected Flashblock index.
+    pub flashblock_index: u64,
+}
+
 /// Manages the pending flashblock state and processes incoming updates.
 #[derive(Debug)]
 pub struct FlashblocksState {
@@ -35,6 +44,7 @@ pub struct FlashblocksState {
     queue: mpsc::UnboundedSender<StateUpdate>,
     rx: Arc<Mutex<mpsc::UnboundedReceiver<StateUpdate>>>,
     flashblock_sender: Sender<Arc<PendingBlocks>>,
+    reset_sender: Sender<FlashblocksReset>,
     max_pending_blocks_depth: u64,
     last_canonical_block: AtomicU64,
 }
@@ -48,12 +58,14 @@ impl FlashblocksState {
         let (tx, rx) = mpsc::unbounded_channel::<StateUpdate>();
         let pending_blocks: Arc<ArcSwapOption<PendingBlocks>> = Arc::new(ArcSwapOption::new(None));
         let (flashblock_sender, _) = broadcast::channel(BUFFER_SIZE);
+        let (reset_sender, _) = broadcast::channel(16);
 
         Self {
             pending_blocks,
             queue: tx,
             rx: Arc::new(Mutex::new(rx)),
             flashblock_sender,
+            reset_sender,
             max_pending_blocks_depth,
             last_canonical_block: AtomicU64::new(0),
         }
@@ -77,11 +89,17 @@ impl FlashblocksState {
             self.max_pending_blocks_depth,
             Arc::clone(&self.rx),
             self.flashblock_sender.clone(),
+            self.reset_sender.clone(),
         );
 
         tokio::spawn(async move {
             state_processor.start().await;
         });
+    }
+
+    /// Subscribes to invalidations; a receiver must discard its speculative snapshot on reset.
+    pub fn subscribe_to_resets(&self) -> broadcast::Receiver<FlashblocksReset> {
+        self.reset_sender.subscribe()
     }
 
     /// Drops the published snapshot when its tip is more than `max_pending_blocks_depth`
@@ -120,6 +138,11 @@ impl FlashblocksState {
             max_depth = self.max_pending_blocks_depth,
         );
         Metrics::pending_drop_stale().increment(1);
+        // No subscribers is normal while startup is hydrating; the state is already cleared.
+        let _ = self.reset_sender.send(FlashblocksReset {
+            block_number: stale.latest_block_number(),
+            flashblock_index: stale.latest_flashblock_index(),
+        });
     }
 
     /// Handles a canonical block being received.
@@ -283,6 +306,7 @@ mod tests {
     #[test]
     fn canonical_notification_drops_stale_pending_without_the_processor() {
         let state = FlashblocksState::new(MAX_DEPTH);
+        let mut resets = state.subscribe_to_resets();
         state.set_pending_blocks_for_testing(Some(pending_anchored_at(1)));
 
         state.on_canonical_block_received(canonical_block(1 + MAX_DEPTH + 1));
@@ -291,11 +315,13 @@ mod tests {
             state.get_pending_blocks().is_none(),
             "a snapshot whose tip is past max_pending_blocks_depth must not survive the notification"
         );
+        assert_eq!(resets.try_recv().map(|reset| reset.block_number), Ok(1));
     }
 
     #[test]
     fn canonical_notification_keeps_pending_within_max_depth() {
         let state = FlashblocksState::new(MAX_DEPTH);
+        let mut resets = state.subscribe_to_resets();
         state.set_pending_blocks_for_testing(Some(pending_anchored_at(1)));
 
         state.on_canonical_block_received(canonical_block(1 + MAX_DEPTH));
@@ -304,6 +330,7 @@ mod tests {
             state.get_pending_blocks().is_some(),
             "normal lag must not clear pending, or every notification would drop live state"
         );
+        assert_eq!(resets.try_recv(), Err(broadcast::error::TryRecvError::Empty));
     }
 
     #[test]
