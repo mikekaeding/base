@@ -93,10 +93,8 @@ impl AttributesBuilder for StandaloneAttributesBuilder {
         // upgrade that activates the native sub-second block cadence, matching the production
         // stateful attributes builder.
         if self.rollup_config.is_denim_active(next_l2_time) {
-            let base_time =
-                BaseTimeUpdateTx::new(next_l2_timestamp_millis_part).map_err(|error| {
-                    PipelineError::AttributesBuilder(BuilderError::BaseTimeUpdate(error)).crit()
-                })?;
+            let base_time = BaseTimeUpdateTx::new(next_l2_timestamp_millis_part)
+                .map_err(|error| PipelineError::from(BuilderError::BaseTimeUpdate(error)).crit())?;
             let deposit = base_time.into_deposit_tx(next_l2_block_number);
             let mut encoded = Vec::new();
             deposit.encode_2718(&mut encoded);
