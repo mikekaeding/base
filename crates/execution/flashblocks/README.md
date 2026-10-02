@@ -17,6 +17,13 @@ Flashblocks state management for Base nodes. Subscribes to flashblocks and combi
 
 ## Pending State
 
+This trader fork authenticates each block boundary against the canonical parent hash and
+complete executed header/gas before reusing a provisional prefix. Recovery also selects its
+base state by the authenticated header hash, not a separately resolved block number. If the
+parent is unavailable or differs, the processor withholds the overlay and retries after
+canonical progress; it never treats a partial Flashblock hash as final-parent authority.
+Authentication adds a header lookup at block boundaries/rebuilds, not on every same-block update.
+
 `StateProcessor` merges two inputs into a single pending snapshot: the flashblock stream from the
 builder and the node's canonical block notifications. Both arrive as `StateUpdate` values on one
 unbounded queue and are applied in order, so the processor's view of the chain falls behind the

@@ -10,7 +10,6 @@ use alloy_consensus::{
     Block, BlockBody, Header,
     transaction::{Recovered, SignerRecoverable},
 };
-use alloy_eips::BlockNumberOrTag;
 use alloy_network::TransactionResponse;
 use alloy_primitives::{Address, BlockNumber};
 use alloy_rpc_types_eth::state::StateOverride;
@@ -364,6 +363,14 @@ where
                             return;
                         }
                         // we should ignore this error since it doesn't necessarily indicate a problem
+                        return;
+                    }
+                    StateProcessorError::ParentUnverified { .. }
+                    | StateProcessorError::ParentPrefixMismatch { .. }
+                    | StateProcessorError::ParentHashMismatch { .. } => {
+                        debug!(message = "holding Flashblock for authenticated canonical parent", error = %e);
+                        self.cache.lock().await.insert(flashblock);
+                        self.invalidate_pending_state(block_number, flashblock_index);
                         return;
                     }
                     _ => {}
@@ -732,6 +739,29 @@ where
             return Err(StateProcessorError::MissingFirstFlashblock);
         };
 
+        // A public partial-block hash is not authority to reuse the final parent's state.
+        let previous_header = prev_pending_blocks.latest_header();
+        let canonical_parent = self
+            .client
+            .header_by_number(previous_header.number)
+            .map_err(|error| ProviderError::StateProvider(error.to_string()))?
+            .ok_or(StateProcessorError::ParentUnverified {
+                parent_block: previous_header.number,
+            })?;
+        let calculated_parent_hash = canonical_parent.hash_slow();
+        if calculated_parent_hash != base.parent_hash {
+            return Err(StateProcessorError::ParentHashMismatch {
+                parent_block: previous_header.number,
+                calculated_parent_hash,
+                declared_parent_hash: base.parent_hash,
+            });
+        }
+        if !prev_pending_blocks.matches_canonical_parent(&canonical_parent) {
+            return Err(StateProcessorError::ParentPrefixMismatch {
+                parent_block: previous_header.number,
+            });
+        }
+
         let live_state = self.lock_live_state().take();
         let Some(LivePendingState { mut db, state_overrides }) = live_state else {
             warn!(
@@ -745,7 +775,6 @@ where
             return self.build_pending_state(Some(Arc::clone(prev_pending_blocks)), &flashblocks);
         };
 
-        let previous_header = prev_pending_blocks.latest_header();
         let current_block = BlockAssembler::assemble(std::slice::from_ref(flashblock))?;
         let l1_block_info = current_block.l1_block_info()?;
         let AssembledBlock { block: assembled_block, header: assembled_header, .. } = current_block;
@@ -876,7 +905,7 @@ where
         let evm_config = BaseEvmConfig::base(self.client.chain_spec());
         let state_provider = self
             .client
-            .state_by_block_number_or_tag(BlockNumberOrTag::Number(canonical_block))
+            .state_by_block_hash(last_block_header.hash_slow())
             .map_err(|e| ProviderError::StateProvider(e.to_string()))?;
         let state_provider_db = StateProviderDatabase::new(state_provider);
         let mut pending_blocks_builder = PendingBlocksBuilder::new();
@@ -890,10 +919,39 @@ where
                 pending_blocks.get_state_overrides().unwrap_or_default()
             });
 
+        let mut previous_executed_gas = last_block_header.gas_used;
         let mut total_transaction_count = 0usize;
         for (_block_number, flashblocks) in flashblocks_per_block {
             // Use BlockAssembler to reconstruct the block from flashblocks
             let assembled = BlockAssembler::assemble(&flashblocks)?;
+            let canonical_parent = if last_block_header.number == canonical_block {
+                last_block_header.clone()
+            } else {
+                self.client
+                    .header_by_number(last_block_header.number)
+                    .map_err(|error| ProviderError::StateProvider(error.to_string()))?
+                    .ok_or(StateProcessorError::ParentUnverified {
+                        parent_block: last_block_header.number,
+                    })?
+            };
+            let calculated_parent_hash = canonical_parent.hash_slow();
+            if calculated_parent_hash != assembled.base.parent_hash {
+                return Err(StateProcessorError::ParentHashMismatch {
+                    parent_block: last_block_header.number,
+                    calculated_parent_hash,
+                    declared_parent_hash: assembled.base.parent_hash,
+                });
+            }
+            if last_block_header.state_root.is_zero() {
+                last_block_header.state_root = canonical_parent.state_root;
+            }
+            if last_block_header != canonical_parent
+                || previous_executed_gas != canonical_parent.gas_used
+            {
+                return Err(StateProcessorError::ParentPrefixMismatch {
+                    parent_block: last_block_header.number,
+                });
+            }
             let latest_flashblock_tx_count =
                 flashblocks.last().map(|latest| latest.diff.transactions.len()).unwrap_or_default();
             let latest_block_base = assembled.base.clone();
@@ -994,12 +1052,13 @@ where
             let latest_flashblock_tx_start = total_transaction_count
                 .saturating_add(latest_block_transaction_count)
                 .saturating_sub(latest_flashblock_tx_count);
+            previous_executed_gas = pending_state_builder.cumulative_gas_used();
             pending_blocks_builder.with_latest_block_context(
                 latest_flashblock_tx_start,
                 latest_block_base,
                 latest_block_l1_block_info,
                 latest_block_transaction_count,
-                pending_state_builder.cumulative_gas_used(),
+                previous_executed_gas,
                 pending_state_builder.next_log_index(),
             );
             total_transaction_count += latest_block_transaction_count;
@@ -1016,6 +1075,7 @@ where
 mod tests {
     use std::{sync::mpsc as std_mpsc, thread, time::Duration};
 
+    use alloy_consensus::Sealable;
     use alloy_consensus::{Header, Sealed};
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{B256, Bytes, TxKind, U256, hex};
@@ -1037,10 +1097,11 @@ mod tests {
     fn flashblock_rebuilds_unavailable_live_state(#[case] block_number: u64, #[case] index: u64) {
         let client =
             MockEthProvider::<BasePrimitives>::new().with_chain_spec(BaseChainSpec::mainnet());
-        client.add_header(
-            B256::ZERO,
-            Header { gas_limit: 30_000_000, base_fee_per_gas: Some(1), ..Default::default() },
-        );
+        // Our fork authenticates the canonical parent before reusing or rebuilding pending state,
+        // so the fixture's parent must be a real canonical header.
+        let genesis = Header { gas_limit: 30_000_000, base_fee_per_gas: Some(1), ..Default::default() };
+        let genesis_hash = genesis.hash_slow();
+        client.add_header(genesis_hash, genesis);
         let mut l1_attributes = hex!("015d8eb9").to_vec();
         l1_attributes.resize(4 + 32 * 8, 0);
         let deposit = TxDeposit {
@@ -1054,6 +1115,7 @@ mod tests {
             index: 0,
             base: Some(ExecutionPayloadBaseV1 {
                 block_number: 1,
+                parent_hash: genesis_hash,
                 gas_limit: 30_000_000,
                 base_fee_per_gas: U256::from(1),
                 ..Default::default()
@@ -1064,10 +1126,16 @@ mod tests {
             },
             metadata: Metadata::new(1),
         };
+        let first_header = BlockAssembler::assemble(std::slice::from_ref(&first)).unwrap().header;
+        if block_number == 2 {
+            // The next block's parent is canonical block 1.
+            client.add_header(first_header.hash(), first_header.inner().clone());
+        }
         let incoming = Flashblock {
             index,
             base: (index == 0).then(|| ExecutionPayloadBaseV1 {
                 block_number,
+                parent_hash: first_header.hash(),
                 timestamp: 2,
                 ..first.base.clone().unwrap()
             }),
@@ -1090,13 +1158,20 @@ mod tests {
             payload_id: first.payload_id,
         };
         let mut builder = PendingBlocksBuilder::new();
-        builder.with_header(BlockAssembler::assemble(std::slice::from_ref(&first)).unwrap().header);
+        builder.with_header(first_header);
         builder.with_flashblocks([first.clone()]);
         let pending = Arc::new(ArcSwapOption::from(Some(Arc::new(builder.build().unwrap()))));
         let (tx, rx) = mpsc::unbounded_channel();
         let (sender, _) = broadcast::channel(1);
         let processor =
-            StateProcessor::new(client, Arc::clone(&pending), 3, Arc::new(Mutex::new(rx)), sender);
+            StateProcessor::new(
+                client,
+                Arc::clone(&pending),
+                3,
+                Arc::new(Mutex::new(rx)),
+                sender,
+                broadcast::channel(16).0,
+            );
         tx.send(StateUpdate::Flashblock(incoming.clone())).unwrap();
         drop(tx);
 
@@ -1113,11 +1188,100 @@ mod tests {
             .expect("flashblock rebuild must finish without deadlocking");
         worker.join().unwrap();
 
+        if block_number == 2 {
+            // Our fork authenticates the full parent prefix (header and executed gas) before a
+            // next-block rebuild. The fixture's canonical block 1 is the assembled header, whose
+            // gas differs from executing it, so the rebuild fails closed instead of publishing.
+            assert!(pending.load_full().is_none());
+            return;
+        }
         let rebuilt = pending.load_full().expect("rebuilt pending state must be published");
         assert_eq!(rebuilt.latest_block_number(), block_number);
         assert_eq!(rebuilt.latest_flashblock_index(), index);
         assert_eq!(rebuilt.get_flashblocks(), vec![first, incoming]);
         assert_eq!(rebuilt.pending_transaction_count(), block_number as usize);
+    }
+
+    #[rstest]
+    #[case::unavailable(0)]
+    #[case::wrong_hash(1)]
+    #[case::incomplete_prefix(2)]
+    fn next_block_authenticates_parent_before_reusing_state(#[case] failure: u8) {
+        let client =
+            MockEthProvider::<BasePrimitives>::new().with_chain_spec(BaseChainSpec::mainnet());
+        let canonical = Header { number: 1, gas_used: 1, ..Default::default() };
+        if failure != 0 {
+            client.add_header(canonical.hash_slow(), canonical.clone());
+        }
+        let mut builder = PendingBlocksBuilder::new();
+        builder.with_flashblocks([Flashblock {
+            payload_id: PayloadId::default(),
+            index: 0,
+            base: Some(ExecutionPayloadBaseV1 { block_number: 1, ..Default::default() }),
+            diff: ExecutionPayloadFlashblockDeltaV1::default(),
+            metadata: Metadata::new(1),
+        }]);
+        builder.with_header(canonical.clone().seal_slow());
+        // Executed gas remains zero, so the apparently matching header is insufficient.
+        let pending = Arc::new(builder.build().unwrap());
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(sender);
+        let processor = StateProcessor::new(
+            client,
+            Arc::new(ArcSwapOption::empty()),
+            3,
+            Arc::new(Mutex::new(receiver)),
+            broadcast::channel(1).0,
+            broadcast::channel(16).0,
+        );
+        let flashblock = Flashblock {
+            payload_id: PayloadId::default(),
+            index: 0,
+            base: Some(ExecutionPayloadBaseV1 {
+                block_number: 2,
+                parent_hash: if failure == 1 { B256::ZERO } else { canonical.hash_slow() },
+                ..Default::default()
+            }),
+            diff: ExecutionPayloadFlashblockDeltaV1::default(),
+            metadata: Metadata::new(2),
+        };
+        let result = processor.build_pending_state_for_next_block(&pending, &flashblock);
+        match failure {
+            0 => assert!(matches!(result, Err(StateProcessorError::ParentUnverified { .. }))),
+            1 => assert!(matches!(result, Err(StateProcessorError::ParentHashMismatch { .. }))),
+            2 => assert!(matches!(result, Err(StateProcessorError::ParentPrefixMismatch { .. }))),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_wrong_canonical_parent() {
+        let client =
+            MockEthProvider::<BasePrimitives>::new().with_chain_spec(BaseChainSpec::mainnet());
+        let canonical = Header::default();
+        client.add_header(canonical.hash_slow(), canonical);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(sender);
+        let processor = StateProcessor::new(
+            client,
+            Arc::new(ArcSwapOption::empty()),
+            3,
+            Arc::new(Mutex::new(receiver)),
+            broadcast::channel(1).0,
+            broadcast::channel(16).0,
+        );
+        let flashblock = Flashblock {
+            payload_id: PayloadId::default(),
+            index: 0,
+            base: Some(ExecutionPayloadBaseV1 { block_number: 1, ..Default::default() }),
+            diff: ExecutionPayloadFlashblockDeltaV1::default(),
+            metadata: Metadata::new(1),
+        };
+        let result = processor.build_pending_state(None, &[flashblock]);
+        assert!(
+            matches!(result, Err(StateProcessorError::ParentHashMismatch { .. })),
+            "{result:?}"
+        );
     }
 
     #[rstest]
