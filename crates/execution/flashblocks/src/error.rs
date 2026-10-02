@@ -154,6 +154,31 @@ pub enum StateProcessorError {
     /// Missing first flashblock, so this one can't be processed.
     #[error("missing first flashblock: cannot build pending blocks without first flashblock")]
     MissingFirstFlashblock,
+
+    /// A boundary cannot reuse a prefix until its canonical parent is available.
+    #[error("pending parent block {parent_block} is awaiting its canonical header")]
+    ParentUnverified {
+        /// Parent awaiting canonical authentication.
+        parent_block: u64,
+    },
+    /// The executed provisional prefix differs from the canonical parent.
+    #[error("pending parent block {parent_block} differs from its canonical execution prefix")]
+    ParentPrefixMismatch {
+        /// Parent with differing header or execution fields.
+        parent_block: u64,
+    },
+    /// The incoming payload does not extend the authenticated canonical header.
+    #[error(
+        "pending parent block {parent_block} hash mismatch: calculated {calculated_parent_hash}, declared {declared_parent_hash}"
+    )]
+    ParentHashMismatch {
+        /// Parent being authenticated.
+        parent_block: u64,
+        /// Hash of the canonical parent header.
+        calculated_parent_hash: B256,
+        /// Parent hash declared by the next payload.
+        declared_parent_hash: B256,
+    },
 }
 
 impl From<RecoveryError> for StateProcessorError {
