@@ -37,6 +37,7 @@ where
     proofs_enabled: bool,
     proofs_max_blocks_ahead: u64,
     insert_delay: Duration,
+    stall_exit: Option<Duration>,
     rpc_builder: Option<RpcBuilder>,
 }
 
@@ -64,6 +65,8 @@ where
     pub proofs_max_blocks_ahead: u64,
     /// Delay after each successful source payload insert.
     pub insert_delay: Duration,
+    /// Exit with an error when no block is imported for this long (`None`: never).
+    pub stall_exit: Option<Duration>,
 }
 
 impl<E> FollowNode<E>
@@ -82,6 +85,7 @@ where
             proofs_enabled: config.proofs_enabled,
             proofs_max_blocks_ahead: config.proofs_max_blocks_ahead,
             insert_delay: config.insert_delay,
+            stall_exit: config.stall_exit,
         }
     }
 
@@ -151,7 +155,8 @@ where
             latest,
             proof_gate,
             self.insert_delay,
-        );
+        )
+        .with_stall_exit(self.stall_exit);
 
         let mut tasks = JoinSet::new();
         let (head_sender, head_notifications) = tokio::sync::watch::channel(0);

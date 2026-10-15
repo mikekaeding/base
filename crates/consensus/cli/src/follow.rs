@@ -8,6 +8,7 @@ use base_common_genesis::RollupConfig;
 use base_common_network::Base;
 use base_consensus_node::{
     EngineConfig, FollowNode, FollowNodeConfig, L1Config, NodeOperatingMode, RemoteL2Client,
+    RemoteL2ClientOptions,
 };
 use base_consensus_providers::{L1RpcProvider, OnlineBeaconClient};
 use base_consensus_rpc::RpcBuilder;
@@ -160,6 +161,42 @@ pub struct ConsensusFollowNodeConfigArgs {
     )]
     pub insert_delay: Duration,
 
+    /// Ordered, comma-separated HTTP(S) sources for follow-mode reads (opt-in).
+    ///
+    /// When set, block heights, payloads and labels are read from these sources in order, each
+    /// request bounded by `--follow.request-timeout-ms`, and `--source-l2-rpc` is used only as a
+    /// newHeads wake-up push (when it is a WebSocket URL). Empty keeps the single-connection
+    /// follower unchanged.
+    #[arg(long = "follow.http-sources", env = "BASE_NODE_FOLLOW_HTTP_SOURCES", default_value = "")]
+    pub http_sources: String,
+
+    /// Per-request timeout for `--follow.http-sources` reads, in milliseconds.
+    #[arg(
+        long = "follow.request-timeout-ms",
+        env = "BASE_NODE_FOLLOW_REQUEST_TIMEOUT_MS",
+        default_value_t = 1000
+    )]
+    pub request_timeout_ms: u64,
+
+    /// Keepalive of the newHeads push WebSocket when `--follow.http-sources` is set, in
+    /// milliseconds.
+    #[arg(
+        long = "follow.ws-keepalive-ms",
+        env = "BASE_NODE_FOLLOW_WS_KEEPALIVE_MS",
+        default_value_t = 2000
+    )]
+    pub ws_keepalive_ms: u64,
+
+    /// Exit with an error when no block has been imported for this many seconds, so a process
+    /// supervisor restarts the follower. 0 disables (the follower keeps waiting). With `--proofs`,
+    /// time spent paused behind the proofs gate also counts as no progress.
+    #[arg(
+        long = "follow.stall-exit-secs",
+        env = "BASE_NODE_FOLLOW_STALL_EXIT_SECS",
+        default_value_t = 0
+    )]
+    pub stall_exit_secs: u64,
+
     /// RPC CLI arguments.
     #[command(flatten)]
     pub rpc_flags: RpcArgs,
@@ -229,6 +266,42 @@ pub struct EmbeddedConsensusFollowNodeConfigArgs {
     )]
     pub insert_delay: Duration,
 
+    /// Ordered, comma-separated HTTP(S) sources for follow-mode reads (opt-in).
+    ///
+    /// When set, block heights, payloads and labels are read from these sources in order, each
+    /// request bounded by `--follow.request-timeout-ms`, and `--source-l2-rpc` is used only as a
+    /// newHeads wake-up push (when it is a WebSocket URL). Empty keeps the single-connection
+    /// follower unchanged.
+    #[arg(long = "follow.http-sources", env = "BASE_NODE_FOLLOW_HTTP_SOURCES", default_value = "")]
+    pub http_sources: String,
+
+    /// Per-request timeout for `--follow.http-sources` reads, in milliseconds.
+    #[arg(
+        long = "follow.request-timeout-ms",
+        env = "BASE_NODE_FOLLOW_REQUEST_TIMEOUT_MS",
+        default_value_t = 1000
+    )]
+    pub request_timeout_ms: u64,
+
+    /// Keepalive of the newHeads push WebSocket when `--follow.http-sources` is set, in
+    /// milliseconds.
+    #[arg(
+        long = "follow.ws-keepalive-ms",
+        env = "BASE_NODE_FOLLOW_WS_KEEPALIVE_MS",
+        default_value_t = 2000
+    )]
+    pub ws_keepalive_ms: u64,
+
+    /// Exit with an error when no block has been imported for this many seconds, so a process
+    /// supervisor restarts the follower. 0 disables (the follower keeps waiting). With `--proofs`,
+    /// time spent paused behind the proofs gate also counts as no progress.
+    #[arg(
+        long = "follow.stall-exit-secs",
+        env = "BASE_NODE_FOLLOW_STALL_EXIT_SECS",
+        default_value_t = 0
+    )]
+    pub stall_exit_secs: u64,
+
     /// RPC CLI arguments.
     #[command(flatten)]
     pub rpc_flags: EmbeddedRpcArgs,
@@ -257,10 +330,50 @@ impl From<EmbeddedConsensusFollowNodeConfigArgs> for ConsensusFollowNodeConfigAr
             proofs: args.proofs,
             proofs_max_blocks_ahead: args.proofs_max_blocks_ahead,
             insert_delay: args.insert_delay,
+            http_sources: args.http_sources,
+            request_timeout_ms: args.request_timeout_ms,
+            ws_keepalive_ms: args.ws_keepalive_ms,
+            stall_exit_secs: args.stall_exit_secs,
             rpc_flags: args.rpc_flags.into(),
             l2_config: args.l2_config,
             l1_config: args.l1_config,
             l1_rpc_args: args.l1_rpc_args,
+        }
+    }
+}
+
+/// Parses `--follow.http-sources`: comma-separated http(s) URLs; blanks are ignored.
+pub(crate) fn parse_follow_http_sources(raw: &str) -> eyre::Result<Vec<Url>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let url = Url::parse(s)
+                .map_err(|e| eyre::eyre!("invalid --follow.http-sources entry: {e}"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                eyre::bail!("--follow.http-sources entries must be http(s) URLs");
+            }
+            Ok(url)
+        })
+        .collect()
+}
+
+impl ConsensusFollowNodeConfigArgs {
+    /// Source options derived from the opt-in follow flags.
+    pub fn source_options(&self) -> eyre::Result<RemoteL2ClientOptions> {
+        Ok(RemoteL2ClientOptions {
+            http_sources: parse_follow_http_sources(&self.http_sources)?,
+            request_timeout: Duration::from_millis(self.request_timeout_ms),
+            ws_keepalive: Duration::from_millis(self.ws_keepalive_ms),
+        })
+    }
+
+    /// The stall-exit limit, `None` when disabled.
+    pub const fn stall_exit(&self) -> Option<Duration> {
+        if self.stall_exit_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.stall_exit_secs))
         }
     }
 }
@@ -318,9 +431,12 @@ impl ConsensusFollowNodeArgs {
             self.config.l1_rpc_args.l1_eth_rpc.clone(),
             self.config.l1_rpc_args.l1_rpc_timeout,
         );
-        let l2_source = RemoteL2Client::new(self.config.source_l2_rpc.clone())
-            .await
-            .map_err(|error| eyre::eyre!("connect follow-mode source: {error}"))?;
+        let l2_source = RemoteL2Client::with_options(
+            self.config.source_l2_rpc.clone(),
+            self.config.source_options()?,
+        )
+        .await
+        .map_err(|error| eyre::eyre!("connect follow-mode source: {error}"))?;
         let rpc_builder = Option::<RpcBuilder>::from(self.config.rpc_flags.clone());
 
         Ok(FollowNode::new(FollowNodeConfig {
@@ -333,6 +449,7 @@ impl ConsensusFollowNodeArgs {
             proofs_enabled: self.config.proofs,
             proofs_max_blocks_ahead: self.config.proofs_max_blocks_ahead,
             insert_delay: self.config.insert_delay,
+            stall_exit: self.config.stall_exit(),
         }))
     }
 
@@ -479,6 +596,45 @@ mod tests {
     #[test]
     fn proofs_accept_bare_flag() {
         assert!(parse_config(&["--proofs"]).proofs);
+    }
+
+    #[test]
+    fn follow_fallback_flags_default_to_legacy_behaviour() {
+        let config = parse_config(&[]);
+        assert_eq!(config.http_sources, "");
+        assert_eq!(config.stall_exit(), None);
+        let options = config.source_options().unwrap();
+        assert!(options.http_sources.is_empty(), "no fallback sources unless configured");
+        assert_eq!(options.request_timeout, Duration::from_millis(1000));
+        assert_eq!(options.ws_keepalive, Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn follow_fallback_flags_parse_in_order() {
+        let config = parse_config(&[
+            "--follow.http-sources",
+            "https://base-rpc.publicnode.com, https://mainnet.base.org ,,http://10.0.64.4:18547",
+            "--follow.request-timeout-ms",
+            "750",
+            "--follow.ws-keepalive-ms",
+            "1500",
+            "--follow.stall-exit-secs",
+            "45",
+        ]);
+        let options = config.source_options().unwrap();
+        let hosts: Vec<_> =
+            options.http_sources.iter().map(|u| u.host_str().unwrap().to_owned()).collect();
+        assert_eq!(hosts, ["base-rpc.publicnode.com", "mainnet.base.org", "10.0.64.4"]);
+        assert_eq!(options.request_timeout, Duration::from_millis(750));
+        assert_eq!(options.ws_keepalive, Duration::from_millis(1500));
+        assert_eq!(config.stall_exit(), Some(Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn follow_http_sources_reject_websocket_and_garbage() {
+        assert!(parse_follow_http_sources("wss://base-rpc.publicnode.com").is_err());
+        assert!(parse_follow_http_sources("not a url").is_err());
+        assert!(parse_follow_http_sources(" , ").unwrap().is_empty());
     }
 
     #[test]

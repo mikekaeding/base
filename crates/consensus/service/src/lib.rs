@@ -17,7 +17,9 @@ pub use service::{
 };
 
 mod follow;
-pub use follow::{FollowError, RemoteClient, RemoteL2Client, RemoteL2ClientError};
+pub use follow::{
+    FollowError, RemoteClient, RemoteL2Client, RemoteL2ClientError, RemoteL2ClientOptions,
+};
 
 mod standalone;
 pub use standalone::{

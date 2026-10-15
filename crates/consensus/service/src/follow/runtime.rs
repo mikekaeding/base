@@ -1,6 +1,6 @@
 use std::{
     fmt::Debug,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -26,6 +26,24 @@ use crate::{
 
 const SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Time of the last imported block, shared by the insert loop and the stall watchdog.
+#[derive(Debug)]
+pub(super) struct ImportClock(Mutex<Instant>);
+
+impl ImportClock {
+    pub(super) fn new() -> Self {
+        Self(Mutex::new(Instant::now()))
+    }
+
+    fn touch(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    fn idle(&self) -> Duration {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).elapsed()
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct FollowRuntime<Local, Remote, Gate> {
     local: Arc<Local>,
@@ -35,6 +53,7 @@ pub(super) struct FollowRuntime<Local, Remote, Gate> {
     follow_from_block: L2BlockInfo,
     proof_gate: Gate,
     insert_delay: Duration,
+    stall_exit: Option<Duration>,
 }
 
 impl<Local, Remote, Gate> FollowRuntime<Local, Remote, Gate>
@@ -52,16 +71,54 @@ where
         proof_gate: Gate,
         insert_delay: Duration,
     ) -> Self {
-        Self { local, source, engine, cancellation, follow_from_block, proof_gate, insert_delay }
+        Self {
+            local,
+            source,
+            engine,
+            cancellation,
+            follow_from_block,
+            proof_gate,
+            insert_delay,
+            stall_exit: None,
+        }
     }
 
+    /// Exits with [`FollowError::NoProgress`] when no block is imported for `limit` (opt-in;
+    /// `None` keeps the follower running indefinitely, the previous behaviour).
+    pub(super) const fn with_stall_exit(mut self, limit: Option<Duration>) -> Self {
+        self.stall_exit = limit;
+        self
+    }
+
+    #[cfg(test)]
     async fn run_ordered_insert_loop<GateInner: ProofGate>(
+        engine: Arc<dyn FollowEngine>,
+        cancellation: CancellationToken,
+        blocks_to_insert_rx: mpsc::Receiver<PrefetchedPayload>,
+        start_block: u64,
+        proof_gate: &mut GateInner,
+        insert_delay: Duration,
+    ) -> Result<(), FollowError> {
+        Self::run_ordered_insert_loop_with_clock(
+            engine,
+            cancellation,
+            blocks_to_insert_rx,
+            start_block,
+            proof_gate,
+            insert_delay,
+            &ImportClock::new(),
+        )
+        .await
+    }
+
+    async fn run_ordered_insert_loop_with_clock<GateInner: ProofGate>(
         engine: Arc<dyn FollowEngine>,
         cancellation: CancellationToken,
         mut blocks_to_insert_rx: mpsc::Receiver<PrefetchedPayload>,
         start_block: u64,
         proof_gate: &mut GateInner,
         insert_delay: Duration,
+        clock: &ImportClock,
     ) -> Result<(), FollowError> {
         let mut current_block = start_block;
 
@@ -92,6 +149,7 @@ where
                 elapsed = ?validation_started_at.elapsed(),
                 "Source payload validated"
             );
+            clock.touch();
             if !insert_delay.is_zero() {
                 debug!(
                     target: "follow",
@@ -102,6 +160,35 @@ where
                 time::sleep(insert_delay).await;
             }
             current_block = current_block.saturating_add(1);
+        }
+    }
+
+    /// Returns [`FollowError::NoProgress`] once no block has been imported for `limit`.
+    /// With `None` it never completes.
+    async fn run_stall_watchdog(
+        clock: Arc<ImportClock>,
+        limit: Option<Duration>,
+        cancellation: CancellationToken,
+    ) -> Result<(), FollowError> {
+        let Some(limit) = limit else {
+            std::future::pending::<()>().await;
+            return Ok(());
+        };
+        let tick = (limit / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => return Ok(()),
+                _ = time::sleep(tick) => {}
+            }
+            let idle = clock.idle();
+            if idle >= limit {
+                error!(target: "follow", idle_s = idle.as_secs(), limit_s = limit.as_secs(),
+                    "No block imported within the stall limit; exiting so the supervisor restarts the follower");
+                return Err(FollowError::NoProgress {
+                    idle_secs: idle.as_secs(),
+                    limit_secs: limit.as_secs(),
+                });
+            }
         }
     }
 
@@ -290,13 +377,20 @@ where
         );
         let fetch_loop =
             prefetcher.run(self.follow_from_block.block_info.number, head_notifications);
-        let insert_loop = Self::run_ordered_insert_loop(
+        let clock = Arc::new(ImportClock::new());
+        let insert_loop = Self::run_ordered_insert_loop_with_clock(
             Arc::clone(&self.engine),
             self.cancellation.clone(),
             blocks_to_insert_rx,
             next_insert,
             &mut self.proof_gate,
             self.insert_delay,
+            &clock,
+        );
+        let stall_watchdog = Self::run_stall_watchdog(
+            Arc::clone(&clock),
+            self.stall_exit,
+            self.cancellation.clone(),
         );
         let safety_loop = Self::run_update_safe_finalized_heads_loop(
             Arc::clone(&self.local),
@@ -309,6 +403,7 @@ where
             result = fetch_loop => result,
             result = insert_loop => result,
             result = safety_loop => result,
+            result = stall_watchdog => result,
         }
     }
 }
@@ -925,6 +1020,105 @@ mod tests {
 
         assert!(matches!(error, FollowError::SourceBlockHashMismatch { number: 8, .. }));
         assert!(engine.labels.lock().await.is_empty());
+    }
+
+    fn stalled_source() -> MockRemoteClient {
+        let mut source = MockRemoteClient::new();
+        source.expect_get_block_number().returning(|_| Ok(10));
+        source
+            .expect_get_payload_by_number()
+            .returning(|n| Err(crate::RemoteL2ClientError::BlockNotFound(n.to_string())));
+        source.expect_get_block_info().returning(|_| Ok(source_block_info(0)));
+        source
+    }
+
+    fn recording_engine() -> Arc<RecordingEngine> {
+        Arc::new(RecordingEngine {
+            inserted: Mutex::new(Vec::new()),
+            labels: Mutex::new(Vec::new()),
+            delay: Duration::ZERO,
+        })
+    }
+
+    #[tokio::test]
+    async fn stall_exit_fires_when_no_block_is_imported() {
+        let engine = recording_engine();
+        let engine_for_runtime: Arc<dyn FollowEngine> = Arc::<RecordingEngine>::clone(&engine);
+        let runtime = FollowRuntime::new(
+            Arc::new(local_client(0, 0, 0, 100)),
+            Arc::new(stalled_source()),
+            engine_for_runtime,
+            CancellationToken::new(),
+            block_info(0),
+            NoopProofGate,
+            Duration::ZERO,
+        )
+        .with_stall_exit(Some(Duration::from_millis(300)));
+        let started = Instant::now();
+        let err = time::timeout(Duration::from_secs(3), runtime.start(None))
+            .await
+            .expect("stall exit ends the runtime")
+            .expect_err("a stall is an error");
+        let took = started.elapsed();
+        assert!(matches!(err, FollowError::NoProgress { limit_secs: 0, .. }), "{err:?}");
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_millis(1500),
+            "{took:?}"
+        );
+        assert!(engine.inserted.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stall_exit_disabled_keeps_the_previous_behaviour() {
+        let runtime = FollowRuntime::new(
+            Arc::new(local_client(0, 0, 0, 100)),
+            Arc::new(stalled_source()),
+            recording_engine(),
+            CancellationToken::new(),
+            block_info(0),
+            NoopProofGate,
+            Duration::ZERO,
+        );
+        assert!(
+            time::timeout(Duration::from_millis(1200), runtime.start(None)).await.is_err(),
+            "without --follow.stall-exit-secs the follower keeps waiting"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn imports_reset_the_stall_clock() {
+        // 25 blocks import ~40 ms apart (well inside the 400 ms limit); then the source stops
+        // having new blocks and the limit is reached after the last import.
+        let local = Arc::new(local_client(0, 0, 0, 100));
+        let source = DelayedSource { latest: 25, fetch_delay: Duration::from_millis(5) };
+        let engine = Arc::new(RecordingEngine {
+            inserted: Mutex::new(Vec::new()),
+            labels: Mutex::new(Vec::new()),
+            delay: Duration::from_millis(40),
+        });
+        let engine_for_runtime: Arc<dyn FollowEngine> = Arc::<RecordingEngine>::clone(&engine);
+        let runtime = FollowRuntime::new(
+            local,
+            Arc::new(source),
+            engine_for_runtime,
+            CancellationToken::new(),
+            block_info(0),
+            NoopProofGate,
+            Duration::ZERO,
+        )
+        .with_stall_exit(Some(Duration::from_millis(400)));
+        let started = Instant::now();
+        let err = time::timeout(Duration::from_secs(5), runtime.start(None))
+            .await
+            .expect("ends after the source runs dry")
+            .expect_err("stall after the last import");
+        assert!(matches!(err, FollowError::NoProgress { .. }), "{err:?}");
+        assert_eq!(engine.inserted.lock().await.len(), 25, "no exit while blocks were importing");
+        assert!(
+            started.elapsed() >= Duration::from_millis(25 * 40 + 400),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
