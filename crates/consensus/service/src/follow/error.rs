@@ -111,6 +111,17 @@ pub enum FollowError {
         expected: u64,
     },
 
+    /// No block was imported for longer than `--follow.stall-exit-secs`.
+    #[error(
+        "no block imported for {idle_secs} s (limit {limit_secs} s); exiting so the supervisor restarts the follower"
+    )]
+    NoProgress {
+        /// Seconds since the last imported block (or since start).
+        idle_secs: u64,
+        /// The configured limit in seconds.
+        limit_secs: u64,
+    },
+
     /// Joining a follow-mode task failed.
     #[error("follow task join failed: {0}")]
     TaskJoin(#[from] tokio::task::JoinError),
