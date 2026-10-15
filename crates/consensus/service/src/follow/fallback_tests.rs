@@ -349,3 +349,54 @@ async fn replay_oct15_1408_28_closes_then_one_silent_socket() {
     fb.assert_complete();
     assert!(fb.max_delay() < Duration::from_millis(1500), "fallback worst {:?}", fb.worst());
 }
+
+/// Live smoke test against public Base endpoints (real blocks, real TLS): fallback reads over
+/// HTTPS with the wss newHeads push, for 40 s. Needs network; set `FOLLOW_LIVE_SMOKE=1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "network: FOLLOW_LIVE_SMOKE=1 cargo test ... live_public -- --ignored --nocapture"]
+async fn live_public_endpoints_smoke() {
+    if std::env::var("FOLLOW_LIVE_SMOKE").as_deref() != Ok("1") {
+        return;
+    }
+    let push = url::Url::parse("wss://base-rpc.publicnode.com").unwrap();
+    let sources = vec![
+        url::Url::parse("https://base-rpc.publicnode.com").unwrap(),
+        url::Url::parse("https://mainnet.base.org").unwrap(),
+    ];
+    let client = RemoteL2Client::with_options(push, opts(sources, 1000, 2000)).await.unwrap();
+    let head = client.get_block_number(alloy_eips::BlockNumberOrTag::Latest).await.unwrap();
+    let cancel = CancellationToken::new();
+    let (head_tx, head_rx) = watch::channel(0);
+    let (blocks_tx, mut blocks_rx) = mpsc::channel(PREFETCH_WINDOW);
+    let push_task = tokio::spawn(client.clone().follow_heads(head_tx, cancel.clone()));
+    let prefetcher = PayloadPrefetcher::new(Arc::new(client), cancel.clone(), blocks_tx);
+    let fetch = tokio::spawn(prefetcher.run(head, Some(head_rx)));
+    let end = Instant::now() + Duration::from_secs(40);
+    let mut lags = Vec::new();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(end) => break,
+            p = blocks_rx.recv() => {
+                let Some(p) = p else { break };
+                let ts = p.execution_payload.timestamp();
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+                lags.push((p.execution_payload.block_number(), now - ts as f64));
+            }
+        }
+    }
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), fetch).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), push_task).await;
+    let mut l: Vec<f64> = lags.iter().map(|x| x.1).collect();
+    l.sort_by(f64::total_cmp);
+    println!(
+        "LIVE: {} blocks from {head}; payload-in-hand after block timestamp p50 {:.3} s, p90 {:.3} s, max {:.3} s",
+        l.len(),
+        l[l.len() / 2],
+        l[l.len() * 9 / 10],
+        l[l.len() - 1]
+    );
+    assert!(l.len() >= 15, "about 20 blocks in 40 s");
+    let numbers: Vec<u64> = lags.iter().map(|x| x.0).collect();
+    assert_eq!(numbers, (head + 1..=head + numbers.len() as u64).collect::<Vec<_>>());
+}
