@@ -6,9 +6,10 @@ use alloy_provider::{Provider, RootProvider};
 use base_cli_utils::{LogConfig, RuntimeManager};
 use base_common_genesis::RollupConfig;
 use base_common_network::Base;
+use base_common_chains::ChainConfig;
 use base_consensus_node::{
-    EngineConfig, FollowNode, FollowNodeConfig, L1Config, NodeMode, RemoteL2Client,
-    RemoteL2ClientOptions,
+    EngineConfig, FollowNode, FollowNodeConfig, FollowP2pConfig, FollowP2pMode, L1Config,
+    NetworkBuilder, NodeMode, RemoteL2Client, RemoteL2ClientOptions,
 };
 use base_consensus_providers::{L1RpcProvider, OnlineBeaconClient};
 use base_consensus_rpc::RpcBuilder;
@@ -19,9 +20,14 @@ use tracing::{error, info, warn};
 use url::Url;
 
 use crate::{
-    ConsensusChainArgs, EmbeddedL2ClientArgs, EmbeddedRpcArgs, L1ClientArgs, L1ConfigFile,
-    L2ClientArgs, L2ConfigFile, LogArgs, MetricsArgs, RpcArgs, metrics::CliMetrics,
+    ConsensusChainArgs, EmbeddedL2ClientArgs, EmbeddedP2PArgs, EmbeddedRpcArgs, L1ClientArgs,
+    L1ConfigFile, L2ClientArgs, L2ConfigFile, LogArgs, MetricsArgs, P2PArgs, RpcArgs,
+    metrics::CliMetrics,
 };
+
+/// Upper bound on resolving the unsafe-block signer from L1 before falling back to the built-in
+/// signer, so a slow L1 endpoint never delays the follower's start.
+const P2P_SIGNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Overrides supplied by callers that embed a follow node alongside an execution node.
 #[derive(Clone, Debug, Default)]
@@ -71,6 +77,9 @@ impl ConsensusFollowNodeCommand {
         let metrics_config = if self.metrics.enabled {
             let cfg = args.load_rollup_config()?;
             CliMetrics::init_rollup_config(&cfg);
+            if args.config.p2p_mode.enabled() {
+                CliMetrics::init_p2p(&P2PArgs::from(args.config.p2p_flags.clone()));
+            }
             Some(cfg)
         } else {
             None
@@ -196,6 +205,17 @@ pub struct ConsensusFollowNodeConfigArgs {
         default_value_t = 0
     )]
     pub stall_exit_secs: u64,
+
+    /// P2P unsafe-block gossip: `off` (default, no P2P stack), `shadow` (join the network and
+    /// measure gossip; payloads still come from the RPC sources) or `primary` (use validated
+    /// gossip payloads first; the RPC sources remain the fallback).
+    #[arg(long = "follow.p2p", env = "BASE_NODE_FOLLOW_P2P", default_value = "off")]
+    pub p2p_mode: FollowP2pMode,
+
+    /// P2P network flags (the node-mode `--p2p.*` set), used only when `--follow.p2p` is not
+    /// `off`.
+    #[command(flatten)]
+    pub p2p_flags: EmbeddedP2PArgs,
 
     /// RPC CLI arguments.
     #[command(flatten)]
@@ -334,6 +354,9 @@ impl From<EmbeddedConsensusFollowNodeConfigArgs> for ConsensusFollowNodeConfigAr
             request_timeout_ms: args.request_timeout_ms,
             ws_keepalive_ms: args.ws_keepalive_ms,
             stall_exit_secs: args.stall_exit_secs,
+            // The embedded follower has no P2P flags; it always follows RPC sources only.
+            p2p_mode: FollowP2pMode::Off,
+            p2p_flags: EmbeddedP2PArgs::default(),
             rpc_flags: args.rpc_flags.into(),
             l2_config: args.l2_config,
             l1_config: args.l1_config,
@@ -438,6 +461,7 @@ impl ConsensusFollowNodeArgs {
         .await
         .map_err(|error| eyre::eyre!("connect follow-mode source: {error}"))?;
         let rpc_builder = Option::<RpcBuilder>::from(self.config.rpc_flags.clone());
+        let p2p = self.p2p_config(&cfg).await;
 
         Ok(FollowNode::new(FollowNodeConfig {
             rollup_config,
@@ -450,7 +474,63 @@ impl ConsensusFollowNodeArgs {
             proofs_max_blocks_ahead: self.config.proofs_max_blocks_ahead,
             insert_delay: self.config.insert_delay,
             stall_exit: self.config.stall_exit(),
+            p2p,
         }))
+    }
+
+    /// Builds the optional P2P network. Any failure leaves the follower on its RPC sources.
+    async fn p2p_config(&self, cfg: &RollupConfig) -> Option<FollowP2pConfig> {
+        let mode = self.config.p2p_mode;
+        if !mode.enabled() {
+            return None;
+        }
+        match self.p2p_network(cfg).await {
+            Ok(network) => {
+                info!(target: "rollup_node", %mode, "Follow node will join P2P unsafe-block gossip");
+                Some(FollowP2pConfig::new(mode, network))
+            }
+            Err(error) => {
+                warn!(target: "rollup_node", %mode, %error,
+                    "P2P configuration failed; following RPC sources only");
+                None
+            }
+        }
+    }
+
+    async fn p2p_network(&self, cfg: &RollupConfig) -> eyre::Result<NetworkBuilder> {
+        let p2p = P2PArgs::from(self.config.p2p_flags.clone());
+        p2p.check_ports()?;
+        let chain_id = cfg.l2_chain_id.id();
+        let genesis_signer =
+            ChainConfig::by_chain_id(chain_id).and_then(|chain| chain.unsafe_block_signer);
+        let timeout = self.config.l1_rpc_args.l1_rpc_timeout;
+        let from_l1 = tokio::time::timeout(
+            P2P_SIGNER_LOOKUP_TIMEOUT,
+            p2p.clone().config(
+                cfg,
+                chain_id,
+                Some(self.config.l1_rpc_args.l1_eth_rpc.clone()),
+                timeout,
+                genesis_signer,
+            ),
+        )
+        .await;
+        let network = match from_l1 {
+            Ok(Ok(network)) => network,
+            Ok(Err(error)) => {
+                warn!(target: "rollup_node", %error,
+                    "Unsafe block signer lookup on L1 failed; using the built-in signer");
+                p2p.config(cfg, chain_id, None, timeout, genesis_signer).await?
+            }
+            Err(_) => {
+                warn!(target: "rollup_node",
+                    "Unsafe block signer lookup on L1 timed out; using the built-in signer");
+                p2p.config(cfg, chain_id, None, timeout, genesis_signer).await?
+            }
+        };
+        info!(target: "rollup_node", signer = %network.unsafe_block_signer,
+            peer_id = %network.keypair.public().to_peer_id(), "P2P network configured");
+        Ok(NetworkBuilder::from(network))
     }
 
     /// Starts a follow node with default external endpoint configuration.
@@ -635,6 +715,52 @@ mod tests {
         assert!(parse_follow_http_sources("wss://base-rpc.publicnode.com").is_err());
         assert!(parse_follow_http_sources("not a url").is_err());
         assert!(parse_follow_http_sources(" , ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn follow_p2p_defaults_off_and_parses_modes() {
+        assert_eq!(parse_config(&[]).p2p_mode, FollowP2pMode::Off);
+        assert_eq!(parse_config(&["--follow.p2p", "shadow"]).p2p_mode, FollowP2pMode::Shadow);
+        let config = parse_config(&[
+            "--follow.p2p",
+            "primary",
+            "--p2p.listen.tcp",
+            "9222",
+            "--p2p.listen.udp",
+            "9222",
+            "--p2p.advertise.ip",
+            "54.197.210.239",
+            "--p2p.peers.hi",
+            "40",
+        ]);
+        assert_eq!(config.p2p_mode, FollowP2pMode::Primary);
+        assert_eq!(config.p2p_flags.network.listen_udp_port, 9222);
+        assert_eq!(config.p2p_flags.network.peers_hi, 40);
+    }
+
+    #[test]
+    fn follow_p2p_rejects_unknown_mode() {
+        #[derive(Parser)]
+        struct Cmd {
+            #[command(flatten)]
+            args: ConsensusFollowNodeConfigArgs,
+        }
+        assert!(
+            Cmd::try_parse_from([
+                "test",
+                "--source-l2-rpc",
+                "http://localhost:8545",
+                "--l2-engine-rpc",
+                "http://localhost:8551",
+                "--l1-eth-rpc",
+                "http://localhost:8545",
+                "--l1-beacon",
+                "http://localhost:5052",
+                "--follow.p2p",
+                "on",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

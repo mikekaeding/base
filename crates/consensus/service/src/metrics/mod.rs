@@ -17,6 +17,21 @@ base_metrics::define_metrics! {
     #[describe("Advisory follow-mode L1 origin check failures by reason")]
     #[label(name = "reason", default = ["unavailable", "fetch_failed", "not_canonical"])]
     follow_l1_origin_check_failures_total: counter,
+    #[describe("Validated P2P gossip blocks cached by the follow node")]
+    follow_p2p_gossip_blocks_total: counter,
+    #[describe("Arrival of each new gossip block after its header timestamp, in seconds")]
+    follow_p2p_gossip_lag_seconds: histogram,
+    #[describe("How much earlier gossip had a block than the RPC payload fetch completed, in seconds")]
+    follow_p2p_lead_seconds: histogram,
+    #[describe("Follow payloads by source")]
+    #[label(name = "source", default = ["p2p", "rpc"])]
+    follow_p2p_payload_source_total: counter,
+    #[describe("Follow payloads that did not use gossip, by reason")]
+    #[label(
+        name = "reason",
+        default = ["missing", "no_parent", "parent_mismatch", "ambiguous", "retry", "hash_mismatch"]
+    )]
+    follow_p2p_fallback_total: counter,
     #[describe("Wall-clock duration of a single derivation pipeline step() call")]
     derivation_pipeline_step_duration_seconds: histogram,
     #[describe("Wall-clock duration the derivation actor waits for an inbound request")]
