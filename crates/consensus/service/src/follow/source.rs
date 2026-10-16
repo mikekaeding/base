@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use url::Url;
 
-use crate::follow::sources::{SOURCE_COOLDOWN, SourceSet};
+use crate::follow::sources::{SourcePolicy, SourceSet};
 
 /// A push connection that delivered no head for this long is rebuilt (Base makes a block every
 /// 2 s). Only used with `--follow.http-sources`.
@@ -152,6 +152,9 @@ impl RemoteL2Client {
         if options.request_timeout.is_zero() {
             return Err(RemoteL2ClientError::InvalidSource("request timeout must be > 0".into()));
         }
+        if options.ws_keepalive.is_zero() {
+            return Err(RemoteL2ClientError::InvalidSource("push keepalive must be > 0".into()));
+        }
         let mut sources = Vec::with_capacity(options.http_sources.len());
         for u in &options.http_sources {
             if !matches!(u.scheme(), "http" | "https") {
@@ -162,7 +165,8 @@ impl RemoteL2Client {
             }
             sources.push((url_label(u), RootProvider::<Base>::new_http(u.clone())));
         }
-        let reads = Arc::new(SourceSet::new(sources, options.request_timeout, SOURCE_COOLDOWN));
+        let reads =
+            Arc::new(SourceSet::new(sources, SourcePolicy::with_timeout(options.request_timeout)));
         let push = matches!(url.scheme(), "ws" | "wss")
             .then(|| PushSource { url: url.clone(), keepalive: options.ws_keepalive });
         info!(target: "follow", reads = ?reads.labels(), push = ?push.as_ref().map(|p| url_label(&p.url)),
@@ -424,7 +428,13 @@ impl RemoteClient for RemoteL2Client {
         match &self.mode {
             Mode::Legacy { provider } => fetch_payload(provider, number).await,
             Mode::Fallback { reads, .. } => {
-                reads.call("payload", |p| async move { fetch_payload(&p, number).await }).await
+                reads
+                    .call_block(
+                        "payload",
+                        number,
+                        |p| async move { fetch_payload(&p, number).await },
+                    )
+                    .await
             }
         }
     }
@@ -473,6 +483,24 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, RemoteL2ClientError::InvalidSource(_)));
+    }
+
+    #[tokio::test]
+    async fn with_options_rejects_zero_keepalive() {
+        let err = RemoteL2Client::with_options(
+            Url::parse("ws://127.0.0.1:9").unwrap(),
+            RemoteL2ClientOptions {
+                http_sources: vec![Url::parse("https://rpc.example.com").unwrap()],
+                request_timeout: Duration::from_secs(1),
+                ws_keepalive: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, RemoteL2ClientError::InvalidSource(ref m) if m.contains("keepalive")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
