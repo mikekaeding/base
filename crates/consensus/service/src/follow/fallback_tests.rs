@@ -152,6 +152,73 @@ async fn fallback_ignores_bursts_of_1013_closes_on_the_push() {
     assert!(ws.connections() >= 3, "the push saw the close burst");
 }
 
+/// Push only (no reads): run `follow_heads` for `secs` and return how many WebSocket connections
+/// the server saw.
+async fn push_connections_for(client: RemoteL2Client, ws: &FakeWs, secs: u64) -> usize {
+    let cancel = CancellationToken::new();
+    let (head_tx, _head_rx) = watch::channel(0);
+    let task = tokio::spawn(client.follow_heads(head_tx, cancel.clone()));
+    tokio::time::sleep(Duration::from_secs(secs)).await;
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    ws.connections()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_reconnects_back_off_during_a_1013_storm() {
+    // every connection is closed with 1013 right after the subscription: without a backoff alloy
+    // reconnects at once after each close (hundreds of handshakes in a few seconds)
+    let chain = FakeChain::spawn(13_000, FAST_BLOCK);
+    let ws = FakeWs::spawn(Arc::clone(&chain), vec![], WsPlan::CloseAfterSubscribe).await;
+    let http = FakeHttp::spawn(Arc::clone(&chain), HttpMode::Healthy).await;
+    let client = RemoteL2Client::with_options(ws.url(), opts(vec![http.url()], 1000, 2000))
+        .await
+        .unwrap()
+        .with_push_backoff(
+            Duration::from_millis(100),
+            Duration::from_millis(400),
+            Duration::from_secs(2),
+        );
+    let n = push_connections_for(client, &ws, 3).await;
+    // delays 0, 0.1, 0.2, 0.4, 0.4, ... -> about 8-9 attempts in 3 s
+    assert!((3..=12).contains(&n), "{n} connections in 3 s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_storm_with_the_production_backoff_is_at_most_one_handshake_per_step() {
+    let chain = FakeChain::spawn(14_000, FAST_BLOCK);
+    let ws = FakeWs::spawn(Arc::clone(&chain), vec![], WsPlan::CloseAfterSubscribe).await;
+    let http = FakeHttp::spawn(Arc::clone(&chain), HttpMode::Healthy).await;
+    let client =
+        RemoteL2Client::with_options(ws.url(), opts(vec![http.url()], 1000, 2000)).await.unwrap();
+    let n = push_connections_for(client, &ws, 4).await;
+    // 1 s, 2 s, 4 s ...: attempts at about 0, 1, 3 s
+    assert!((2..=4).contains(&n), "{n} connections in 4 s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_healthy_push_reconnects_promptly_after_a_single_close() {
+    // one close after 2.5 s of normal heads: the push is back within ~1 s (no accumulated backoff)
+    let chain = FakeChain::spawn(15_000, FAST_BLOCK);
+    let ws = FakeWs::spawn(
+        Arc::clone(&chain),
+        vec![WsPlan::CloseAt(Duration::from_millis(2500))],
+        WsPlan::Normal,
+    )
+    .await;
+    let http = FakeHttp::spawn(Arc::clone(&chain), HttpMode::Healthy).await;
+    let client = RemoteL2Client::with_options(ws.url(), opts(vec![http.url()], 1000, 2000))
+        .await
+        .unwrap()
+        .with_push_backoff(
+            Duration::from_millis(100),
+            Duration::from_millis(400),
+            Duration::from_secs(2),
+        );
+    let n = push_connections_for(client, &ws, 4).await;
+    assert_eq!(n, 2, "one reconnect after the single close");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hung_primary_http_source_falls_back_within_the_request_timeout() {
     let chain = FakeChain::spawn(4000, FAST_BLOCK);

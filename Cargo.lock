@@ -4030,6 +4030,7 @@ dependencies = [
  "alloy-network 2.4.1",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-pubsub",
  "alloy-rpc-client",
  "alloy-rpc-types-engine",
  "alloy-rpc-types-eth 2.4.1",

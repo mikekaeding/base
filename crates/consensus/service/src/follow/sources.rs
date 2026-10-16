@@ -154,6 +154,11 @@ impl<P: Clone + Debug + Send + Sync> SourceSet<P> {
 
     /// Tracks a first source that keeps lagging: `served_by` answered at position `pos`;
     /// `bypassed` is the first source if it was skipped after the grace for this block.
+    ///
+    /// A demoted source gets the first cooldown step (5 s) each time: a lagging source still
+    /// answers its other reads successfully, and any success resets its failure count, so the
+    /// doubling applies to errors and timeouts, not to lag. While it keeps lagging it is demoted
+    /// again after two more blocks, so it costs at most the grace twice per 5 s.
     fn note_lag(&self, served_by: usize, pos: usize, bypassed: Option<usize>) {
         let mut strikes = self.lag_strikes.lock().unwrap_or_else(|e| e.into_inner());
         match bypassed {
