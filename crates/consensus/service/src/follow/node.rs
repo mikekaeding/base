@@ -8,12 +8,17 @@ use base_consensus_engine::{BaseEngineClient, EngineClient};
 use base_consensus_rpc::RpcBuilder;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 
 use crate::{
-    NodeActor, ShutdownSignal,
+    NetworkActor, NetworkBuilder, NodeActor, ShutdownSignal,
     follow::{
         engine::EngineApiFollowEngine,
         error::FollowError,
+        gossip::{
+            FollowP2pMode, GossipCacheEngineClient, GossipFirstClient, GossipPayloadCache,
+            log_network_exit,
+        },
         local::{FollowLocalClient, LocalL2Client},
         proof_gate::{ActiveProofGate, NoopProofGate, ProofGate},
         rpc::FollowRpcActor,
@@ -39,6 +44,23 @@ where
     insert_delay: Duration,
     stall_exit: Option<Duration>,
     rpc_builder: Option<RpcBuilder>,
+    p2p: Option<FollowP2pConfig>,
+}
+
+/// Optional P2P unsafe-block gossip for the follow node.
+#[derive(Debug)]
+pub struct FollowP2pConfig {
+    /// How gossip payloads are used. [`FollowP2pMode::Off`] is the same as no config.
+    pub mode: FollowP2pMode,
+    /// The libp2p network (discovery + gossip), built from the standard P2P flags.
+    pub network: std::sync::Mutex<Option<NetworkBuilder>>,
+}
+
+impl FollowP2pConfig {
+    /// Creates the config.
+    pub const fn new(mode: FollowP2pMode, network: NetworkBuilder) -> Self {
+        Self { mode, network: std::sync::Mutex::new(Some(network)) }
+    }
 }
 
 /// Runtime dependencies and options for a [`FollowNode`].
@@ -67,6 +89,8 @@ where
     pub insert_delay: Duration,
     /// Exit with an error when no block is imported for this long (`None`: never).
     pub stall_exit: Option<Duration>,
+    /// Optional P2P unsafe-block gossip (`None`: today's RPC-only follower).
+    pub p2p: Option<FollowP2pConfig>,
 }
 
 impl<E> FollowNode<E>
@@ -86,6 +110,7 @@ where
             proofs_max_blocks_ahead: config.proofs_max_blocks_ahead,
             insert_delay: config.insert_delay,
             stall_exit: config.stall_exit,
+            p2p: config.p2p,
         }
     }
 
@@ -147,9 +172,40 @@ where
     where
         Gate: ProofGate + 'static,
     {
+        let mut tasks = JoinSet::new();
+        let (head_sender, head_notifications) = tokio::sync::watch::channel(0);
+
+        let p2p_mode = self.p2p.as_ref().map_or(FollowP2pMode::Off, |p2p| p2p.mode);
+        let network = self
+            .p2p
+            .as_ref()
+            .filter(|_| p2p_mode.enabled())
+            .and_then(|p2p| p2p.network.lock().unwrap_or_else(|e| e.into_inner()).take());
+        let cache = Arc::new(GossipPayloadCache::default());
+        if let Some(network) = network {
+            // The network runs beside the follower, never inside its task set: a P2P failure
+            // only leaves the follower on its RPC sources.
+            let client =
+                GossipCacheEngineClient::new(Arc::clone(&cache), p2p_mode, Some(head_sender.clone()));
+            match NetworkActor::new(client, cancellation.child_token(), network).await {
+                Ok((inbound, actor)) => {
+                    info!(target: "follow::p2p", mode = %p2p_mode, "P2P gossip network started");
+                    tokio::spawn(async move {
+                        // Holding the inbound senders keeps the actor's signer channel open.
+                        let _inbound = inbound;
+                        log_network_exit(actor.start(()).await);
+                    });
+                }
+                Err(error) => {
+                    warn!(target: "follow::p2p", %error,
+                        "P2P gossip network failed to start; following RPC sources only");
+                }
+            }
+        }
+
         let runtime = FollowRuntime::new(
             Arc::clone(&local),
-            Arc::new(self.l2_source.clone()),
+            Arc::new(GossipFirstClient::new(self.l2_source.clone(), cache, p2p_mode)),
             engine,
             cancellation.clone(),
             latest,
@@ -158,8 +214,6 @@ where
         )
         .with_stall_exit(self.stall_exit);
 
-        let mut tasks = JoinSet::new();
-        let (head_sender, head_notifications) = tokio::sync::watch::channel(0);
         tasks.spawn(self.l2_source.clone().follow_heads(head_sender, cancellation.clone()));
         tasks.spawn(runtime.start(Some(head_notifications)));
         if let Some(rpc) = rpc {

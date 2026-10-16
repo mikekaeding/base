@@ -18,7 +18,8 @@ pub use service::{
 
 mod follow;
 pub use follow::{
-    FollowError, RemoteClient, RemoteL2Client, RemoteL2ClientError, RemoteL2ClientOptions,
+    FollowError, FollowP2pConfig, FollowP2pMode, GOSSIP_CACHE_HEIGHTS, GossipCacheEngineClient, GossipFirstClient,
+    GossipPayloadCache, RemoteClient, RemoteL2Client, RemoteL2ClientError, RemoteL2ClientOptions,
 };
 
 mod standalone;

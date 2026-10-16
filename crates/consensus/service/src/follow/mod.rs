@@ -6,12 +6,17 @@ pub use error::FollowError;
 
 mod local;
 mod node;
-pub use node::{FollowNode, FollowNodeConfig};
+pub use node::{FollowNode, FollowNodeConfig, FollowP2pConfig};
 
 #[cfg(test)]
 mod fake_rpc;
 #[cfg(test)]
 mod fallback_tests;
+mod gossip;
+pub use gossip::{
+    FollowP2pMode, GOSSIP_CACHE_HEIGHTS, GossipCacheEngineClient, GossipFirstClient,
+    GossipPayloadCache,
+};
 mod prefetcher;
 mod proof_gate;
 mod rpc;
