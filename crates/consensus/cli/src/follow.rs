@@ -763,6 +763,76 @@ mod tests {
         );
     }
 
+    /// Live: joins Base mainnet unsafe-block gossip with the follow node's P2P configuration (shadow
+    /// cache only, no engine) and expects validated blocks. Run with
+    /// `BASE_FOLLOW_P2P_LIVE=1 cargo test -p base-consensus-cli --lib live_mainnet_gossip -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "joins the Base mainnet P2P network"]
+    async fn live_mainnet_gossip_delivers_validated_blocks() {
+        use base_consensus_node::{
+            GossipCacheEngineClient, GossipPayloadCache, NetworkActor, NodeActor,
+        };
+        if std::env::var("BASE_FOLLOW_P2P_LIVE").is_err() {
+            return;
+        }
+        let port = std::env::var("BASE_FOLLOW_P2P_LIVE_PORT").unwrap_or_else(|_| "19222".into());
+        let secs: u64 = std::env::var("BASE_FOLLOW_P2P_LIVE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        let key = std::env::temp_dir().join(format!("follow-p2p-live-{port}.key"));
+        let config = Command::parse_from([
+            "test",
+            "--source-l2-rpc",
+            "https://base-rpc.publicnode.com",
+            "--l2-engine-rpc",
+            "http://localhost:8551",
+            "--l1-beacon",
+            "http://localhost:5052",
+            "--l1-eth-rpc",
+            "https://ethereum-rpc.publicnode.com",
+            "--follow.p2p",
+            "shadow",
+            "--p2p.listen.tcp",
+            &port,
+            "--p2p.listen.udp",
+            &port,
+            "--p2p.priv.path",
+            key.to_str().unwrap(),
+            "--p2p.no-bootstore",
+        ])
+        .args;
+        let args = ConsensusFollowNodeArgs::new(
+            ConsensusChainArgs { l2_chain_id: Chain::from(8453_u64) },
+            config,
+        );
+        let cfg = args.load_rollup_config().unwrap();
+        let network = args.p2p_network(&cfg).await.expect("p2p network config");
+        let cache = Arc::new(GossipPayloadCache::default());
+        let client = GossipCacheEngineClient::new(Arc::clone(&cache), FollowP2pMode::Shadow, None);
+        let cancel = CancellationToken::new();
+        let (inbound, actor) =
+            NetworkActor::new(client, cancel.clone(), network).await.expect("network starts");
+        let handle = tokio::spawn(async move {
+            let _inbound = inbound;
+            actor.start(()).await
+        });
+        let started = std::time::Instant::now();
+        let mut first = None;
+        while started.elapsed() < Duration::from_secs(secs) {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let highest = cache.highest();
+            if first.is_none() && highest.is_some() {
+                first = Some(started.elapsed());
+            }
+            println!("t={:>4}s highest gossip block {highest:?}", started.elapsed().as_secs());
+        }
+        cancel.cancel();
+        let _ = handle.await;
+        println!("first gossip block after {first:?}");
+        assert!(first.is_some(), "no validated gossip block within {secs} s");
+    }
+
     #[test]
     fn rpc_disabled_stays_optional() {
         let config = parse_config(&["--rpc.disabled"]);
