@@ -111,8 +111,8 @@ fn block_json(n: u64) -> Value {
 }
 
 /// JSON-RPC result for `method`/`params` against `chain` (`None` = unsupported method).
-fn rpc_result(chain: &FakeChain, method: &str, params: &Value) -> Option<Value> {
-    let head = chain.head();
+fn rpc_result(chain: &FakeChain, lag: u64, method: &str, params: &Value) -> Option<Value> {
+    let head = chain.head().saturating_sub(lag);
     match method {
         "eth_chainId" => Some(json!("0x2105")),
         "eth_blockNumber" => Some(json!(format!("{head:#x}"))),
@@ -133,11 +133,11 @@ fn rpc_result(chain: &FakeChain, method: &str, params: &Value) -> Option<Value> 
     }
 }
 
-fn rpc_response(chain: &FakeChain, req: &Value) -> Value {
+fn rpc_response(chain: &FakeChain, lag: u64, req: &Value) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or_default();
     let params = req.get("params").cloned().unwrap_or(Value::Null);
-    rpc_result(chain, method, &params).map_or_else(
+    rpc_result(chain, lag, method, &params).map_or_else(
         || json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not found"}}),
         |result| json!({"jsonrpc": "2.0", "id": id, "result": result}),
     )
@@ -159,6 +159,8 @@ pub(super) struct FakeHttp {
     pub(super) addr: SocketAddr,
     mode: Arc<Mutex<HttpMode>>,
     calls: Arc<AtomicUsize>,
+    payload_calls: Arc<AtomicUsize>,
+    lag: Arc<AtomicU64>,
 }
 
 impl FakeHttp {
@@ -168,6 +170,8 @@ impl FakeHttp {
             addr: listener.local_addr().unwrap(),
             mode: Arc::new(Mutex::new(mode)),
             calls: Arc::new(AtomicUsize::new(0)),
+            payload_calls: Arc::new(AtomicUsize::new(0)),
+            lag: Arc::new(AtomicU64::new(0)),
         };
         let srv = s.clone();
         tokio::spawn(async move {
@@ -185,6 +189,16 @@ impl FakeHttp {
 
     pub(super) fn set_mode(&self, mode: HttpMode) {
         *self.mode.lock().unwrap() = mode;
+    }
+
+    /// Serve the chain `blocks` behind its head (a lagging backend).
+    pub(super) fn set_lag(&self, blocks: u64) {
+        self.lag.store(blocks, Ordering::SeqCst);
+    }
+
+    /// `eth_getBlockByNumber` requests for a numbered block (payload fetches).
+    pub(super) fn payload_calls(&self) -> usize {
+        self.payload_calls.load(Ordering::SeqCst)
     }
 
     pub(super) fn calls(&self) -> usize {
@@ -220,6 +234,14 @@ impl FakeHttp {
             }
             let body: Vec<u8> = buf.drain(..header_end + len).skip(header_end).collect();
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if body.windows(20).any(|w| w == b"eth_getBlockByNumber")
+                && body.windows(3).any(|w| w == b"\"0x")
+                && !body.windows(8).any(|w| w == b"\"latest\"")
+                && !body.windows(6).any(|w| w == b"\"safe\"")
+                && !body.windows(11).any(|w| w == b"\"finalized\"")
+            {
+                self.payload_calls.fetch_add(1, Ordering::SeqCst);
+            }
             let mode = *self.mode.lock().unwrap();
             let (status, payload) = match mode {
                 HttpMode::Hang => {
@@ -230,9 +252,13 @@ impl FakeHttp {
                 HttpMode::Healthy => {
                     let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                     let resp = if let Value::Array(reqs) = &req {
-                        Value::Array(reqs.iter().map(|r| rpc_response(&chain, r)).collect())
+                        Value::Array(
+                            reqs.iter()
+                                .map(|r| rpc_response(&chain, self.lag.load(Ordering::SeqCst), r))
+                                .collect(),
+                        )
                     } else {
-                        rpc_response(&chain, &req)
+                        rpc_response(&chain, self.lag.load(Ordering::SeqCst), &req)
                     };
                     ("200 OK", resp.to_string())
                 }
@@ -355,7 +381,7 @@ async fn serve_ws(stream: TcpStream, chain: Arc<FakeChain>, plan: WsPlan) {
                 } else if method == "eth_unsubscribe" {
                     json!({"jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null), "result": true})
                 } else {
-                    rpc_response(&chain, &req)
+                    rpc_response(&chain, 0, &req)
                 };
                 if ws.send(Message::Text(resp.to_string().into())).await.is_err() { return; }
                 if method == "eth_subscribe" && plan == WsPlan::CloseAfterSubscribe {

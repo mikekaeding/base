@@ -223,6 +223,58 @@ async fn all_sources_down_does_not_busy_loop_and_recovers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_primary_one_block_behind_still_serves_within_the_grace() {
+    // the usual announced-but-not-served race: the primary lags ~1 block (250 ms here, below the
+    // 400 ms grace); payloads keep coming from the primary, the secondary is not asked for them
+    let chain = FakeChain::spawn(11_000, FAST_BLOCK);
+    let ws = FakeWs::spawn(Arc::clone(&chain), vec![], WsPlan::Normal).await;
+    let primary = FakeHttp::spawn(Arc::clone(&chain), HttpMode::Healthy).await;
+    let secondary = FakeHttp::spawn(Arc::clone(&chain), HttpMode::Healthy).await;
+    primary.set_lag(1);
+    let client = RemoteL2Client::with_options(
+        ws.url(),
+        opts(vec![primary.url(), secondary.url()], 1000, 2000),
+    )
+    .await
+    .unwrap();
+    let run = follow_for(client, Arc::clone(&chain), Duration::from_secs(4)).await;
+    run.assert_complete();
+    assert!(
+        secondary.payload_calls() <= 1,
+        "secondary asked for {} payloads",
+        secondary.payload_calls()
+    );
+    assert!(run.max_delay() < Duration::from_millis(700), "worst {:?}", run.worst());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_primary_far_behind_falls_through_after_the_grace() {
+    // the primary lags 4 blocks (1 s): after the 400 ms grace the source that is ahead serves
+    let chain = FakeChain::spawn(12_000, FAST_BLOCK);
+    let ws = FakeWs::spawn(Arc::clone(&chain), vec![], WsPlan::Normal).await;
+    let primary = FakeHttp::spawn(Arc::clone(&chain), HttpMode::Healthy).await;
+    let secondary = FakeHttp::spawn(Arc::clone(&chain), HttpMode::Healthy).await;
+    primary.set_lag(4);
+    let client = RemoteL2Client::with_options(
+        ws.url(),
+        opts(vec![primary.url(), secondary.url()], 1000, 2000),
+    )
+    .await
+    .unwrap();
+    let run = follow_for(client, Arc::clone(&chain), Duration::from_secs(4)).await;
+    run.assert_complete();
+    assert!(
+        secondary.payload_calls() >= 5,
+        "secondary served {} payloads",
+        secondary.payload_calls()
+    );
+    assert!(run.max_delay() < Duration::from_millis(900), "worst {:?}", run.worst());
+    // the grace is paid for at most two blocks, then the lagging primary is moved back
+    let slow = run.delays.iter().filter(|d| d.1 > Duration::from_millis(350)).count();
+    assert!(slow <= 3, "{slow} blocks paid the grace: {:?}", run.delays);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_only_fallback_without_push_polls() {
     let chain = FakeChain::spawn(7000, FAST_BLOCK);
     let http = FakeHttp::spawn(Arc::clone(&chain), HttpMode::Healthy).await;
@@ -350,19 +402,27 @@ async fn replay_oct15_1408_28_closes_then_one_silent_socket() {
     assert!(fb.max_delay() < Duration::from_millis(1500), "fallback worst {:?}", fb.worst());
 }
 
-/// Live smoke test against public Base endpoints (real blocks, real TLS): fallback reads over
-/// HTTPS with the wss newHeads push, for 40 s. Needs network; set `FOLLOW_LIVE_SMOKE=1`.
+/// Live measurement against real Base endpoints (real blocks, real TLS): fallback reads over HTTPS
+/// with the wss newHeads push. Needs network; set `FOLLOW_LIVE_SMOKE=1`. Optional:
+/// `FOLLOW_LIVE_SECS` (default 40), `FOLLOW_LIVE_PUSH` (default wss publicnode),
+/// `FOLLOW_LIVE_SOURCES` (comma list; default publicnode, mainnet.base.org) and `FOLLOW_LIVE_OUT`
+/// (JSONL path: one `{"n", "ts", "ready"}` line per block, `ready` = wall time the payload was in
+/// hand), used for the read-only side-by-side run next to the live node on trader-va.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "network: FOLLOW_LIVE_SMOKE=1 cargo test ... live_public -- --ignored --nocapture"]
 async fn live_public_endpoints_smoke() {
     if std::env::var("FOLLOW_LIVE_SMOKE").as_deref() != Ok("1") {
         return;
     }
-    let push = url::Url::parse("wss://base-rpc.publicnode.com").unwrap();
-    let sources = vec![
-        url::Url::parse("https://base-rpc.publicnode.com").unwrap(),
-        url::Url::parse("https://mainnet.base.org").unwrap(),
-    ];
+    let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_owned());
+    let secs: u64 = env("FOLLOW_LIVE_SECS", "40").parse().unwrap();
+    let push = url::Url::parse(&env("FOLLOW_LIVE_PUSH", "wss://base-rpc.publicnode.com")).unwrap();
+    let sources: Vec<url::Url> =
+        env("FOLLOW_LIVE_SOURCES", "https://base-rpc.publicnode.com,https://mainnet.base.org")
+            .split(',')
+            .map(|u| url::Url::parse(u.trim()).unwrap())
+            .collect();
+    let mut out = std::env::var("FOLLOW_LIVE_OUT").ok().map(|p| std::fs::File::create(p).unwrap());
     let client = RemoteL2Client::with_options(push, opts(sources, 1000, 2000)).await.unwrap();
     let head = client.get_block_number(alloy_eips::BlockNumberOrTag::Latest).await.unwrap();
     let cancel = CancellationToken::new();
@@ -371,7 +431,7 @@ async fn live_public_endpoints_smoke() {
     let push_task = tokio::spawn(client.clone().follow_heads(head_tx, cancel.clone()));
     let prefetcher = PayloadPrefetcher::new(Arc::new(client), cancel.clone(), blocks_tx);
     let fetch = tokio::spawn(prefetcher.run(head, Some(head_rx)));
-    let end = Instant::now() + Duration::from_secs(40);
+    let end = Instant::now() + Duration::from_secs(secs);
     let mut lags = Vec::new();
     loop {
         tokio::select! {
@@ -379,8 +439,16 @@ async fn live_public_endpoints_smoke() {
             p = blocks_rx.recv() => {
                 let Some(p) = p else { break };
                 let ts = p.execution_payload.timestamp();
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
-                lags.push((p.execution_payload.block_number(), now - ts as f64));
+                let n = p.execution_payload.block_number();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64();
+                if let Some(f) = out.as_mut() {
+                    use std::io::Write;
+                    writeln!(f, "{{\"n\":{n},\"ts\":{ts},\"ready\":{now:.6}}}").unwrap();
+                }
+                lags.push((n, now - ts as f64));
             }
         }
     }
@@ -389,14 +457,16 @@ async fn live_public_endpoints_smoke() {
     let _ = tokio::time::timeout(Duration::from_secs(2), push_task).await;
     let mut l: Vec<f64> = lags.iter().map(|x| x.1).collect();
     l.sort_by(f64::total_cmp);
+    let q = |p: f64| l[((l.len() - 1) as f64 * p) as usize];
     println!(
-        "LIVE: {} blocks from {head}; payload-in-hand after block timestamp p50 {:.3} s, p90 {:.3} s, max {:.3} s",
+        "LIVE: {} blocks from {head}; payload in hand after the block timestamp p50 {:.3} s, p90 {:.3} s, p99 {:.3} s, max {:.3} s",
         l.len(),
-        l[l.len() / 2],
-        l[l.len() * 9 / 10],
+        q(0.5),
+        q(0.9),
+        q(0.99),
         l[l.len() - 1]
     );
-    assert!(l.len() >= 15, "about 20 blocks in 40 s");
+    assert!(l.len() as u64 >= (secs / 2).saturating_sub(3), "about one block per 2 s");
     let numbers: Vec<u64> = lags.iter().map(|x| x.0).collect();
     assert_eq!(numbers, (head + 1..=head + numbers.len() as u64).collect::<Vec<_>>());
 }
