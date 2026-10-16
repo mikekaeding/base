@@ -29,7 +29,15 @@ base_metrics::define_metrics! {
     #[describe("Follow payloads that did not use gossip, by reason")]
     #[label(
         name = "reason",
-        default = ["missing", "no_parent", "parent_mismatch", "ambiguous", "retry", "hash_mismatch"]
+        default = [
+            "missing",
+            "no_parent",
+            "parent_mismatch",
+            "ambiguous",
+            "retry",
+            "hash_mismatch",
+            "rpc_parent_mismatch"
+        ]
     )]
     follow_p2p_fallback_total: counter,
     #[describe("Wall-clock duration of a single derivation pipeline step() call")]

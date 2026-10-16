@@ -47,19 +47,44 @@ where
     p2p: Option<FollowP2pConfig>,
 }
 
+/// Upper bound on starting the libp2p network. Past it the follower runs on RPC only, so a
+/// listener that never reports its address cannot hold back the follower or its stall watchdog.
+pub const P2P_START_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A background lookup of the current unsafe-block signer (e.g. from L1 `SystemConfig`).
+pub type SignerLookup =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<alloy_primitives::Address>> + Send>>;
+
 /// Optional P2P unsafe-block gossip for the follow node.
-#[derive(Debug)]
 pub struct FollowP2pConfig {
     /// How gossip payloads are used. [`FollowP2pMode::Off`] is the same as no config.
     pub mode: FollowP2pMode,
     /// The libp2p network (discovery + gossip), built from the standard P2P flags.
     pub network: std::sync::Mutex<Option<NetworkBuilder>>,
+    /// Resolves the current signer after the network started; a different address replaces
+    /// the one the network was built with.
+    pub signer_lookup: std::sync::Mutex<Option<SignerLookup>>,
+}
+
+impl Debug for FollowP2pConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FollowP2pConfig").field("mode", &self.mode).finish_non_exhaustive()
+    }
 }
 
 impl FollowP2pConfig {
     /// Creates the config.
     pub const fn new(mode: FollowP2pMode, network: NetworkBuilder) -> Self {
-        Self { mode, network: std::sync::Mutex::new(Some(network)) }
+        Self {
+            mode,
+            network: std::sync::Mutex::new(Some(network)),
+            signer_lookup: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Adds a background signer lookup.
+    pub fn with_signer_lookup(self, lookup: SignerLookup) -> Self {
+        Self { signer_lookup: std::sync::Mutex::new(Some(lookup)), ..self }
     }
 }
 
@@ -187,18 +212,41 @@ where
             // only leaves the follower on its RPC sources.
             let client =
                 GossipCacheEngineClient::new(Arc::clone(&cache), p2p_mode, Some(head_sender.clone()));
-            match NetworkActor::new(client, cancellation.child_token(), network).await {
-                Ok((inbound, actor)) => {
+            let signer_lookup = self
+                .p2p
+                .as_ref()
+                .and_then(|p2p| p2p.signer_lookup.lock().unwrap_or_else(|e| e.into_inner()).take());
+            let started = tokio::time::timeout(
+                P2P_START_TIMEOUT,
+                NetworkActor::new(client, cancellation.child_token(), network),
+            )
+            .await;
+            match started {
+                Ok(Ok((inbound, actor))) => {
                     info!(target: "follow::p2p", mode = %p2p_mode, "P2P gossip network started");
+                    if let Some(lookup) = signer_lookup {
+                        let signer_tx = inbound.signer.clone();
+                        tokio::spawn(async move {
+                            if let Some(signer) = lookup.await
+                                && signer_tx.send(signer).await.is_err()
+                            {
+                                warn!(target: "follow::p2p", "P2P network gone before the signer update");
+                            }
+                        });
+                    }
                     tokio::spawn(async move {
                         // Holding the inbound senders keeps the actor's signer channel open.
                         let _inbound = inbound;
                         log_network_exit(actor.start(()).await);
                     });
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     warn!(target: "follow::p2p", %error,
                         "P2P gossip network failed to start; following RPC sources only");
+                }
+                Err(_) => {
+                    warn!(target: "follow::p2p", timeout_secs = P2P_START_TIMEOUT.as_secs(),
+                        "P2P gossip network did not start in time; following RPC sources only");
                 }
             }
         }
