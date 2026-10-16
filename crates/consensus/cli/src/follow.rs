@@ -9,7 +9,7 @@ use base_common_network::Base;
 use base_common_chains::ChainConfig;
 use base_consensus_node::{
     EngineConfig, FollowNode, FollowNodeConfig, FollowP2pConfig, FollowP2pMode, L1Config,
-    NetworkBuilder, NodeOperatingMode, RemoteL2Client, RemoteL2ClientOptions,
+    NetworkBuilder, NodeOperatingMode, RemoteL2Client, RemoteL2ClientOptions, SignerLookup,
 };
 use base_consensus_providers::{L1RpcProvider, OnlineBeaconClient};
 use base_consensus_rpc::RpcBuilder;
@@ -25,9 +25,8 @@ use crate::{
     metrics::CliMetrics,
 };
 
-/// Upper bound on resolving the unsafe-block signer from L1 before falling back to the built-in
-/// signer, so a slow L1 endpoint never delays the follower's start.
-const P2P_SIGNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on the background lookup of the unsafe-block signer in L1 `SystemConfig`.
+const P2P_SIGNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Overrides supplied by callers that embed a follow node alongside an execution node.
 #[derive(Clone, Debug, Default)]
@@ -485,9 +484,13 @@ impl ConsensusFollowNodeArgs {
             return None;
         }
         match self.p2p_network(cfg).await {
-            Ok(network) => {
+            Ok((network, lookup)) => {
                 info!(target: "rollup_node", %mode, "Follow node will join P2P unsafe-block gossip");
-                Some(FollowP2pConfig::new(mode, network))
+                let p2p = FollowP2pConfig::new(mode, network);
+                Some(match lookup {
+                    Some(lookup) => p2p.with_signer_lookup(lookup),
+                    None => p2p,
+                })
             }
             Err(error) => {
                 warn!(target: "rollup_node", %mode, %error,
@@ -497,40 +500,62 @@ impl ConsensusFollowNodeArgs {
         }
     }
 
-    async fn p2p_network(&self, cfg: &RollupConfig) -> eyre::Result<NetworkBuilder> {
+    /// Builds the network with the built-in unsafe-block signer, so start-up never waits on L1,
+    /// and returns a background lookup of the current signer in L1 `SystemConfig` (bounded by
+    /// [`P2P_SIGNER_LOOKUP_TIMEOUT`]). Chains without a built-in signer resolve it from L1 first.
+    async fn p2p_network(
+        &self,
+        cfg: &RollupConfig,
+    ) -> eyre::Result<(NetworkBuilder, Option<SignerLookup>)> {
         let p2p = P2PArgs::from(self.config.p2p_flags.clone());
         p2p.check_ports()?;
         let chain_id = cfg.l2_chain_id.id();
         let genesis_signer =
             ChainConfig::by_chain_id(chain_id).and_then(|chain| chain.unsafe_block_signer);
         let timeout = self.config.l1_rpc_args.l1_rpc_timeout;
-        let from_l1 = tokio::time::timeout(
-            P2P_SIGNER_LOOKUP_TIMEOUT,
-            p2p.clone().config(
-                cfg,
-                chain_id,
-                Some(self.config.l1_rpc_args.l1_eth_rpc.clone()),
-                timeout,
-                genesis_signer,
-            ),
-        )
-        .await;
-        let network = match from_l1 {
-            Ok(Ok(network)) => network,
-            Ok(Err(error)) => {
-                warn!(target: "rollup_node", %error,
-                    "Unsafe block signer lookup on L1 failed; using the built-in signer");
-                p2p.config(cfg, chain_id, None, timeout, genesis_signer).await?
-            }
-            Err(_) => {
-                warn!(target: "rollup_node",
-                    "Unsafe block signer lookup on L1 timed out; using the built-in signer");
-                p2p.config(cfg, chain_id, None, timeout, genesis_signer).await?
-            }
+        let l1 = self.config.l1_rpc_args.l1_eth_rpc.clone();
+        let Some(builtin) = genesis_signer else {
+            let network = tokio::time::timeout(
+                P2P_SIGNER_LOOKUP_TIMEOUT,
+                p2p.config(cfg, chain_id, Some(l1), timeout, None),
+            )
+            .await
+            .map_err(|_| eyre::eyre!("unsafe block signer lookup on L1 timed out"))??;
+            return Ok((NetworkBuilder::from(network), None));
         };
+        let network = p2p.clone().config(cfg, chain_id, None, timeout, Some(builtin)).await?;
         info!(target: "rollup_node", signer = %network.unsafe_block_signer,
             peer_id = %network.keypair.public().to_peer_id(), "P2P network configured");
-        Ok(NetworkBuilder::from(network))
+        let rollup = cfg.clone();
+        let lookup: SignerLookup = Box::pin(async move {
+            let found = tokio::time::timeout(
+                P2P_SIGNER_LOOKUP_TIMEOUT,
+                p2p.unsafe_block_signer(chain_id, &rollup, Some(l1), timeout, Some(builtin)),
+            )
+            .await;
+            match found {
+                Ok(Ok(signer)) if signer != builtin => {
+                    warn!(target: "rollup_node", %signer, %builtin,
+                        "L1 SystemConfig names a different unsafe block signer; using it for gossip");
+                    Some(signer)
+                }
+                Ok(Ok(_)) => {
+                    info!(target: "rollup_node", "L1 SystemConfig confirms the built-in unsafe block signer");
+                    None
+                }
+                Ok(Err(error)) => {
+                    warn!(target: "rollup_node", %error,
+                        "Unsafe block signer lookup on L1 failed; keeping the built-in signer");
+                    None
+                }
+                Err(_) => {
+                    warn!(target: "rollup_node",
+                        "Unsafe block signer lookup on L1 timed out; keeping the built-in signer");
+                    None
+                }
+            }
+        });
+        Ok((NetworkBuilder::from(network), Some(lookup)))
     }
 
     /// Starts a follow node with default external endpoint configuration.
@@ -807,7 +832,8 @@ mod tests {
             config,
         );
         let cfg = args.load_rollup_config().unwrap();
-        let network = args.p2p_network(&cfg).await.expect("p2p network config");
+        let (network, lookup) = args.p2p_network(&cfg).await.expect("p2p network config");
+        assert!(lookup.expect("mainnet has a built-in signer").await.is_none(), "L1 signer equals the built-in one");
         let cache = Arc::new(GossipPayloadCache::default());
         let client = GossipCacheEngineClient::new(Arc::clone(&cache), FollowP2pMode::Shadow, None);
         let cancel = CancellationToken::new();

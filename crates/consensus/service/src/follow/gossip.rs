@@ -299,6 +299,21 @@ impl<R: RemoteClient> RemoteClient for GossipFirstClient<R> {
         let payload = self.inner.get_payload_by_number(number).await?;
         let rpc_ready = Instant::now();
         let hash = payload.execution_payload.block_hash();
+        if self.mode == FollowP2pMode::Primary {
+            // An RPC block that does not extend the block served just before it means the chain
+            // moved under us (an unsafe reorg); flag it, most of all after a gossip block.
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((last_number, last_hash)) = state.last
+                && last_number.saturating_add(1) == number
+                && payload.execution_payload.parent_hash() != last_hash
+            {
+                let after_gossip = state.last_gossip == Some(last_number);
+                drop(state);
+                Metrics::follow_p2p_fallback_total("rpc_parent_mismatch").increment(1);
+                warn!(target: "follow::p2p", block = number, after_gossip,
+                    "RPC payload does not extend the previously served block");
+            }
+        }
         Metrics::follow_p2p_payload_source_total("rpc").increment(1);
         if self.mode.enabled() {
             // How much earlier gossip had this exact block (positive: gossip first).
@@ -308,7 +323,7 @@ impl<R: RemoteClient> RemoteClient for GossipFirstClient<R> {
                     let lead_ms = rpc_ready.saturating_duration_since(c.received).as_secs_f64()
                         * 1000.0;
                     Metrics::follow_p2p_lead_seconds().record(lead_ms / 1000.0);
-                    info!(target: "follow::p2p", block = number, lead_ms = lead_ms.round() as i64,
+                    debug!(target: "follow::p2p", block = number, lead_ms = lead_ms.round() as i64,
                         "Gossip had block before RPC fetch completed");
                 }
                 None if candidates.is_empty() => {

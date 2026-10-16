@@ -6,7 +6,7 @@ pub use error::FollowError;
 
 mod local;
 mod node;
-pub use node::{FollowNode, FollowNodeConfig, FollowP2pConfig};
+pub use node::{FollowNode, FollowNodeConfig, FollowP2pConfig, P2P_START_TIMEOUT, SignerLookup};
 
 #[cfg(test)]
 mod fake_rpc;
