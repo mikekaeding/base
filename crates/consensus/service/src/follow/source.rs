@@ -3,6 +3,7 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 use alloy_consensus::Block;
 use alloy_eips::BlockNumberOrTag;
 use alloy_provider::{Provider, RootProvider};
+use alloy_pubsub::PubSubConnect;
 use alloy_rpc_client::ClientBuilder;
 use alloy_transport_ws::WsConnect;
 use async_trait::async_trait;
@@ -14,7 +15,7 @@ use futures::StreamExt;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::follow::sources::{SourcePolicy, SourceSet};
@@ -22,10 +23,83 @@ use crate::follow::sources::{SourcePolicy, SourceSet};
 /// A push connection that delivered no head for this long is rebuilt (Base makes a block every
 /// 2 s). Only used with `--follow.http-sources`.
 const PUSH_IDLE_RECONNECT: Duration = Duration::from_secs(10);
-/// Pause between push reconnect attempts. Only used with `--follow.http-sources`.
-const PUSH_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// First pause between push connection attempts; doubles per attempt up to [`PUSH_BACKOFF_MAX`].
+const PUSH_BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Longest pause between push connection attempts.
+const PUSH_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// A push connection that lasted this long resets the backoff.
+const PUSH_HEALTHY_AFTER: Duration = Duration::from_secs(30);
 /// alloy reconnect attempts inside one push connection before it is rebuilt from scratch.
 const PUSH_MAX_RETRIES: u32 = 3;
+
+/// Spacing of push (WebSocket) connection attempts, shared by alloy's own reconnects and the
+/// rebuild loop: the first attempt after a healthy period is immediate, then 1 s, 2 s, 4 s, ...
+/// up to 30 s while attempts keep coming within 30 s of each other. During a storm of 1013
+/// closes this is at most one TLS handshake per backoff step instead of one per close.
+#[derive(Debug)]
+struct PushBackoff {
+    base: Duration,
+    max: Duration,
+    healthy_after: Duration,
+    /// (start of the previous attempt, delay to use for the next one)
+    state: std::sync::Mutex<(Option<std::time::Instant>, Duration)>,
+}
+
+impl PushBackoff {
+    fn new(base: Duration, max: Duration, healthy_after: Duration) -> Self {
+        Self { base, max, healthy_after, state: std::sync::Mutex::new((None, base)) }
+    }
+
+    /// Delay to wait before an attempt starting at `now`; records the attempt.
+    fn next_delay(&self, now: std::time::Instant) -> Duration {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let delay = match s.0 {
+            Some(prev) if now.saturating_duration_since(prev) < self.healthy_after => s.1,
+            _ => Duration::ZERO,
+        };
+        let next = if delay.is_zero() { self.base } else { delay.saturating_mul(2).min(self.max) };
+        *s = (Some(now + delay), next);
+        delay
+    }
+}
+
+/// WebSocket connector whose reconnects (alloy calls `try_reconnect` after every close) wait for
+/// the shared [`PushBackoff`].
+#[derive(Debug, Clone)]
+struct BackoffWsConnect {
+    inner: WsConnect,
+    backoff: Arc<PushBackoff>,
+}
+
+impl PubSubConnect for BackoffWsConnect {
+    fn is_local(&self) -> bool {
+        self.inner.is_local()
+    }
+
+    fn connect(
+        &self,
+    ) -> impl std::future::Future<
+        Output = alloy_transport::TransportResult<alloy_pubsub::ConnectionHandle>,
+    > + Send {
+        self.inner.connect()
+    }
+
+    fn try_reconnect(
+        &self,
+    ) -> impl std::future::Future<
+        Output = alloy_transport::TransportResult<alloy_pubsub::ConnectionHandle>,
+    > + Send {
+        let (inner, backoff) = (self.inner.clone(), Arc::clone(&self.backoff));
+        async move {
+            let delay = backoff.next_delay(std::time::Instant::now());
+            if !delay.is_zero() {
+                debug!(target: "follow", delay_ms = delay.as_millis() as u64, "Push reconnect backing off");
+                tokio::time::sleep(delay).await;
+            }
+            inner.connect().await
+        }
+    }
+}
 
 /// Error type for [`RemoteL2Client`] operations.
 #[derive(Debug, Error)]
@@ -113,6 +187,7 @@ enum Mode {
 struct PushSource {
     url: Url,
     keepalive: Duration,
+    backoff: Arc<PushBackoff>,
 }
 
 /// Client that follows an HTTP or WebSocket L2 execution layer source and
@@ -167,8 +242,15 @@ impl RemoteL2Client {
         }
         let reads =
             Arc::new(SourceSet::new(sources, SourcePolicy::with_timeout(options.request_timeout)));
-        let push = matches!(url.scheme(), "ws" | "wss")
-            .then(|| PushSource { url: url.clone(), keepalive: options.ws_keepalive });
+        let push = matches!(url.scheme(), "ws" | "wss").then(|| PushSource {
+            url: url.clone(),
+            keepalive: options.ws_keepalive,
+            backoff: Arc::new(PushBackoff::new(
+                PUSH_BACKOFF_BASE,
+                PUSH_BACKOFF_MAX,
+                PUSH_HEALTHY_AFTER,
+            )),
+        });
         info!(target: "follow", reads = ?reads.labels(), push = ?push.as_ref().map(|p| url_label(&p.url)),
             timeout_ms = options.request_timeout.as_millis() as u64,
             keepalive_ms = options.ws_keepalive.as_millis() as u64,
@@ -179,6 +261,20 @@ impl RemoteL2Client {
     /// Whether this client reads through fallback sources.
     pub const fn is_fallback(&self) -> bool {
         matches!(self.mode, Mode::Fallback { .. })
+    }
+
+    /// Test-only: a shorter push backoff.
+    #[cfg(test)]
+    pub(super) fn with_push_backoff(
+        mut self,
+        base: Duration,
+        max: Duration,
+        healthy_after: Duration,
+    ) -> Self {
+        if let Mode::Fallback { push: Some(push), .. } = &mut self.mode {
+            push.backoff = Arc::new(PushBackoff::new(base, max, healthy_after));
+        }
+        self
     }
 
     /// Publishes coalesced height hints; payload identity and execution remain independently checked.
@@ -243,8 +339,10 @@ impl RemoteL2Client {
     }
 
     /// Fallback-mode push: its own WebSocket with a short keepalive, rebuilt from scratch when it
-    /// fails, closes, or delivers no head for [`PUSH_IDLE_RECONNECT`]. Reads never use it, so a
-    /// dead push only removes the early wake-up; 200 ms HTTP polling continues.
+    /// fails, closes, or delivers no head for [`PUSH_IDLE_RECONNECT`]. Every connection attempt
+    /// (alloy's internal reconnects and these rebuilds) waits for the shared [`PushBackoff`].
+    /// Reads never use the push, so a dead push only removes the early wake-up; 200 ms HTTP
+    /// polling continues.
     async fn follow_heads_push(
         push: PushSource,
         sender: watch::Sender<u64>,
@@ -252,27 +350,31 @@ impl RemoteL2Client {
     ) -> Result<(), crate::follow::error::FollowError> {
         let label = url_label(&push.url);
         loop {
-            let ws = WsConnect::new(push.url.as_str())
-                .with_keepalive_interval(push.keepalive)
-                .with_max_retries(PUSH_MAX_RETRIES);
+            let delay = push.backoff.next_delay(std::time::Instant::now());
+            if !delay.is_zero() {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            let ws = BackoffWsConnect {
+                inner: WsConnect::new(push.url.as_str())
+                    .with_keepalive_interval(push.keepalive)
+                    .with_max_retries(PUSH_MAX_RETRIES),
+                backoff: Arc::clone(&push.backoff),
+            };
             let connected = tokio::select! {
                 _ = cancellation.cancelled() => return Ok(()),
-                c = tokio::time::timeout(PUSH_IDLE_RECONNECT, ClientBuilder::default().ws(ws)) => c,
+                c = tokio::time::timeout(PUSH_IDLE_RECONNECT, ClientBuilder::default().pubsub(ws)) => c,
             };
             let provider = match connected {
                 Ok(Ok(client)) => RootProvider::<Base>::new(client),
                 Ok(Err(error)) => {
                     warn!(target: "follow", push = %label, %error, "Push connect failed; polling continues");
-                    if Self::pause(&cancellation).await {
-                        return Ok(());
-                    }
                     continue;
                 }
                 Err(_) => {
                     warn!(target: "follow", push = %label, "Push connect timed out; polling continues");
-                    if Self::pause(&cancellation).await {
-                        return Ok(());
-                    }
                     continue;
                 }
             };
@@ -316,17 +418,6 @@ impl RemoteL2Client {
                 }
             }
             drop(provider);
-            if Self::pause(&cancellation).await {
-                return Ok(());
-            }
-        }
-    }
-
-    /// Sleeps [`PUSH_RECONNECT_DELAY`]; returns true when cancelled.
-    async fn pause(cancellation: &CancellationToken) -> bool {
-        tokio::select! {
-            _ = cancellation.cancelled() => true,
-            _ = tokio::time::sleep(PUSH_RECONNECT_DELAY) => false,
         }
     }
 }
@@ -443,6 +534,27 @@ impl RemoteClient for RemoteL2Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_backoff_doubles_to_the_cap_and_resets_after_a_healthy_period() {
+        let b = PushBackoff::new(
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        );
+        let t0 = std::time::Instant::now();
+        let mut t = t0;
+        let mut got = Vec::new();
+        for _ in 0..8 {
+            let d = b.next_delay(t);
+            got.push(d.as_secs());
+            t += d + Duration::from_millis(100); // the attempt fails right away
+        }
+        assert_eq!(got, vec![0, 1, 2, 4, 8, 16, 30, 30]);
+        // a connection that stayed up for 30 s resets it: the next attempt is immediate
+        assert_eq!(b.next_delay(t + Duration::from_secs(31)), Duration::ZERO);
+        assert_eq!(b.next_delay(t + Duration::from_secs(31)), Duration::from_secs(1));
+    }
 
     #[test]
     fn url_label_never_includes_path_or_query() {
