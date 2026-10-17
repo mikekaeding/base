@@ -292,6 +292,9 @@ pub struct PeerSelector {
     cooldown: HashMap<PeerId, Instant>,
     /// When the store was last written.
     stored_at: Option<Instant>,
+    /// Accepted and rejected blocks since the last selection run.
+    accepted_since: u64,
+    rejected_since: u64,
 }
 
 impl PeerSelector {
@@ -306,6 +309,8 @@ impl PeerSelector {
             stored_protected: HashSet::new(),
             cooldown: HashMap::new(),
             stored_at: None,
+            accepted_since: 0,
+            rejected_since: 0,
         }
     }
 
@@ -350,6 +355,7 @@ impl PeerSelector {
         now: Instant,
     ) {
         self.seq += 1;
+        self.accepted_since += 1;
         let (seq, hl) = (self.seq, self.config.half_life_blocks);
         for peer in connected {
             if *peer == source {
@@ -369,6 +375,7 @@ impl PeerSelector {
 
     /// Records an invalid block from `peer`.
     pub fn on_invalid(&mut self, peer: PeerId, now: Instant) {
+        self.rejected_since += 1;
         let p = self.entry(peer, now);
         p.invalid = p.decayed_invalid(now) + 1.0;
         p.invalid_at = now;
@@ -494,17 +501,28 @@ impl PeerSelector {
         let connected_set: HashSet<PeerId> = connected.iter().copied().collect();
         let mut pruned: HashSet<PeerId> = HashSet::new();
 
-        // Invalid senders first, at most `max_prunes` per run. When a third or more of the peers
-        // sent invalid blocks the cause is most likely ours (clock, signer): prune none of them.
+        // Invalid senders first, at most `max_prunes` per run. Invalid blocks are charged to the
+        // first deliverer, so a local cause (clock, signer) shows up as many rejected blocks on our
+        // best peers: prune none when rejects were 20 % or more of the blocks since the last run
+        // (or nothing was accepted), when a third or more of the peers sent invalid blocks, and
+        // never a peer that still scores above the average-peer prior (a good deliverer).
+        let (accepted, rejected) = (self.accepted_since, self.rejected_since);
+        self.accepted_since = 0;
+        self.rejected_since = 0;
+        let local_cause = rejected > 0 && (accepted == 0 || rejected * 5 >= accepted + rejected);
+        let prior = self.prior();
         let invalid: Vec<PeerId> = connected
             .iter()
             .copied()
             .filter(|p| !self.is_protected(p))
             .filter(|p| self.peers.get(p).is_some_and(|s| s.decayed_invalid(now) >= INVALID_LIMIT))
             .collect();
-        if !invalid.is_empty() && invalid.len() * 3 >= connected.len() {
-            actions.skipped_invalid = invalid.len();
+        let (good, invalid): (Vec<PeerId>, Vec<PeerId>) =
+            invalid.into_iter().partition(|p| self.score(p, now) > prior);
+        if local_cause || (!invalid.is_empty() && invalid.len() * 3 >= connected.len()) {
+            actions.skipped_invalid = invalid.len() + good.len();
         } else {
+            actions.skipped_invalid = good.len();
             for peer in invalid.into_iter().take(self.config.max_prunes) {
                 actions.prune.push((peer, PruneReason::Invalid));
                 pruned.insert(peer);
@@ -932,6 +950,9 @@ mod tests {
         let mut all = vec![bad, st_id];
         all.extend(&good);
         connect_all(&mut s, &all, t0);
+        for _ in 0..60 {
+            s.on_block(good[0], &all, |_| true, t0);
+        }
         for _ in 0..3 {
             s.on_invalid(bad, t0);
             s.on_invalid(st_id, t0);
@@ -953,6 +974,40 @@ mod tests {
         let mut back = good.clone();
         back.push(bad);
         assert!(s.select(&back, t1).prune.is_empty());
+    }
+
+    #[test]
+    fn invalids_on_the_best_peer_or_at_a_high_rate_are_ours() {
+        let t0 = Instant::now();
+        let mut s = PeerSelector::new(PeerSelectConfig { explore: 9, ..cfg() });
+        let peers: Vec<PeerId> = (0..12).map(|_| PeerId::random()).collect();
+        connect_all(&mut s, &peers, t0);
+        for _ in 0..100 {
+            s.on_block(peers[0], &peers, |_| true, t0);
+        }
+        // The best deliverer sends 3 invalid blocks (as with our clock off): kept.
+        for _ in 0..3 {
+            s.on_invalid(peers[0], t0);
+        }
+        let a = s.select(&peers, t0);
+        assert!(a.prune.is_empty(), "{a:?}");
+        assert_eq!(a.skipped_invalid, 1);
+        // A poor peer with invalids, but rejects are >= 20 % of the blocks since the last run.
+        for _ in 0..3 {
+            s.on_invalid(peers[5], t0);
+        }
+        for _ in 0..5 {
+            s.on_block(peers[0], &peers, |_| true, t0);
+        }
+        let a = s.select(&peers, t0);
+        assert!(a.prune.is_empty(), "{a:?}");
+        // Same poor peer, now at a low reject rate: pruned.
+        for _ in 0..50 {
+            s.on_block(peers[0], &peers, |_| true, t0);
+        }
+        s.on_invalid(peers[5], t0);
+        let a = s.select(&peers, t0);
+        assert_eq!(a.prune, vec![(peers[5], PruneReason::Invalid)]);
     }
 
     #[test]
