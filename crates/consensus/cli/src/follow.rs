@@ -7,11 +7,11 @@ use base_cli_utils::{LogConfig, RuntimeManager};
 use base_common_chains::ChainConfig;
 use base_common_genesis::RollupConfig;
 use base_common_network::Base;
+use base_consensus_gossip::PeerSelectConfig;
 use base_consensus_node::{
     EngineConfig, FollowNode, FollowNodeConfig, FollowP2pConfig, FollowP2pMode, L1Config,
     NetworkBuilder, NodeOperatingMode, RemoteL2Client, RemoteL2ClientOptions, SignerLookup,
 };
-use base_consensus_gossip::PeerSelectConfig;
 use base_consensus_providers::{L1RpcProvider, OnlineBeaconClient};
 use base_consensus_rpc::RpcBuilder;
 use clap::Args;
@@ -900,7 +900,10 @@ mod tests {
         assert_eq!((c.keep, c.explore, c.target()), (6, 3, 9));
         assert_eq!(c.probation, Duration::from_secs(300));
         assert_eq!(c.interval, Duration::from_secs(60));
-        assert_eq!(c.store.as_deref(), Some(std::path::Path::new("/consensus-data/p2p-best-peers.txt")));
+        assert_eq!(
+            c.store.as_deref(),
+            Some(std::path::Path::new("/consensus-data/p2p-best-peers.txt"))
+        );
         assert_eq!(c.static_peers.len(), 1);
         // Invalid settings are an error, never a silent default.
         let bad = parse_config(&["--p2p.select", "--p2p.select.keep", "1"]);

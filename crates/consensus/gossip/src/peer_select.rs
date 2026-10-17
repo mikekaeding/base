@@ -370,8 +370,11 @@ impl PeerSelector {
         if p.outbound && p.addr.is_some() {
             return;
         }
-        if let Some(addr) =
-            listen_addrs.iter().find(|a| is_public_tcp(a)).cloned().and_then(|a| with_peer_id(a, peer))
+        if let Some(addr) = listen_addrs
+            .iter()
+            .find(|a| is_public_tcp(a))
+            .cloned()
+            .and_then(|a| with_peer_id(a, peer))
         {
             p.addr = Some(addr);
         }
@@ -391,7 +394,13 @@ impl PeerSelector {
     }
 
     /// Whether a new outbound dial is allowed with `connected` peers and `pending` dials.
-    pub fn allow_dial(&self, peer: &PeerId, connected: usize, pending: usize, now: Instant) -> bool {
+    pub fn allow_dial(
+        &self,
+        peer: &PeerId,
+        connected: usize,
+        pending: usize,
+        now: Instant,
+    ) -> bool {
         if self.static_ids.contains(peer) {
             return true;
         }
@@ -481,9 +490,11 @@ impl PeerSelector {
             probation.sort_by_key(|p| {
                 std::cmp::Reverse(self.peers.get(p).and_then(|s| s.connected_since))
             });
-            for peer in probation.iter().filter(|p| !pruned.contains(p)).take(over) {
-                actions.prune.push((*peer, PruneReason::Excess));
-                pruned.insert(*peer);
+            let excess: Vec<PeerId> =
+                probation.iter().filter(|p| !pruned.contains(p)).take(over).copied().collect();
+            for peer in excess {
+                actions.prune.push((peer, PruneReason::Excess));
+                pruned.insert(peer);
             }
         }
 
@@ -544,7 +555,11 @@ impl PeerSelector {
     }
 
     /// Writes the best peers to the store when it is due. Returns how many were written.
-    pub fn maybe_store(&mut self, connected: &[PeerId], now: Instant) -> std::io::Result<Option<usize>> {
+    pub fn maybe_store(
+        &mut self,
+        connected: &[PeerId],
+        now: Instant,
+    ) -> std::io::Result<Option<usize>> {
         let Some(path) = self.config.store.clone() else { return Ok(None) };
         if self.stored_at.is_some_and(|t| now.saturating_duration_since(t) < STORE_EVERY) {
             return Ok(None);
@@ -559,13 +574,18 @@ impl PeerSelector {
     }
 
     /// A one-line summary of the connected peers for logs: `(peer, score, wins, eligible, rtt_ms)`.
-    pub fn summary(&self, connected: &[PeerId], now: Instant) -> Vec<(PeerId, f64, u64, f64, Option<u128>)> {
+    pub fn summary(
+        &self,
+        connected: &[PeerId],
+        now: Instant,
+    ) -> Vec<(PeerId, f64, u64, f64, Option<u128>)> {
         let mut v: Vec<_> = connected
             .iter()
             .map(|id| {
                 let p = self.peers.get(id);
                 let f = p.map_or(1.0, |p| {
-                    0.5f64.powf(self.seq.saturating_sub(p.seq) as f64 / self.config.half_life_blocks)
+                    0.5f64
+                        .powf(self.seq.saturating_sub(p.seq) as f64 / self.config.half_life_blocks)
                 });
                 (
                     *id,
@@ -598,7 +618,10 @@ pub fn write_store(path: &Path, best: &[(Multiaddr, f64, u64)]) -> std::io::Resu
     let tmp = path.with_extension("tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
-        writeln!(f, "# best gossip peers by first-delivery score: multiaddr score lifetime_first_deliveries")?;
+        writeln!(
+            f,
+            "# best gossip peers by first-delivery score: multiaddr score lifetime_first_deliveries"
+        )?;
         for (addr, score, wins) in best {
             writeln!(f, "{addr} {score:.4} {wins}")?;
         }
@@ -639,11 +662,18 @@ fn is_public_tcp(addr: &Multiaddr) -> bool {
     }
     tcp && ip.is_some_and(|ip| match ip {
         IpAddr::V4(a) => {
-            !(a.is_private() || a.is_loopback() || a.is_link_local() || a.is_unspecified()
-                || a.is_broadcast() || a.is_documentation() || a.octets()[0] == 100 && a.octets()[1] & 0xC0 == 64)
+            !(a.is_private()
+                || a.is_loopback()
+                || a.is_link_local()
+                || a.is_unspecified()
+                || a.is_broadcast()
+                || a.is_documentation()
+                || a.octets()[0] == 100 && a.octets()[1] & 0xC0 == 64)
         }
         IpAddr::V6(a) => {
-            !(a.is_loopback() || a.is_unspecified() || (a.segments()[0] & 0xfe00) == 0xfc00
+            !(a.is_loopback()
+                || a.is_unspecified()
+                || (a.segments()[0] & 0xfe00) == 0xfc00
                 || (a.segments()[0] & 0xffc0) == 0xfe80)
         }
     })
@@ -775,7 +805,8 @@ mod tests {
     #[test]
     fn invalid_senders_are_pruned_but_static_peers_never() {
         let t0 = Instant::now();
-        let st: Multiaddr = format!("/ip4/1.2.3.4/tcp/9222/p2p/{}", PeerId::random()).parse().unwrap();
+        let st: Multiaddr =
+            format!("/ip4/1.2.3.4/tcp/9222/p2p/{}", PeerId::random()).parse().unwrap();
         let st_id = peer_id_of(&st).unwrap();
         let mut s = PeerSelector::new(PeerSelectConfig { static_peers: vec![st.clone()], ..cfg() });
         let bad = PeerId::random();
@@ -808,7 +839,11 @@ mod tests {
         // 2 protected + 3 established = 5 > keep 3: prune 2, never 0 or 1, and not the winner.
         let pruned: Vec<PeerId> = a.prune.iter().map(|(p, _)| *p).collect();
         assert_eq!(pruned.len(), 2);
-        assert!(!pruned.contains(&peers[0]) && !pruned.contains(&peers[1]) && !pruned.contains(&peers[4]));
+        assert!(
+            !pruned.contains(&peers[0])
+                && !pruned.contains(&peers[1])
+                && !pruned.contains(&peers[4])
+        );
         // A stored peer loses protection once it disconnects.
         s.on_disconnected(peers[0], false, t0 + Duration::from_secs(800));
         assert!(!s.is_protected(&peers[0]));
@@ -866,16 +901,32 @@ mod tests {
         s.on_block(none, &[inb, outb, none], |_| true, t0);
         let best = s.best(&[inb, outb, none], 8, t0);
         assert_eq!(best.len(), 2, "no dialable address for the third: {best:?}");
-        assert_eq!(best.iter().filter(|b| b.0.to_string().starts_with("/ip4/9.9.9.9/tcp/9003/p2p/")).count(), 1);
-        assert_eq!(best.iter().filter(|b| b.0.to_string().starts_with("/ip4/5.6.7.8/tcp/9222/p2p/")).count(), 1);
+        assert_eq!(
+            best.iter()
+                .filter(|b| b.0.to_string().starts_with("/ip4/9.9.9.9/tcp/9003/p2p/"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            best.iter()
+                .filter(|b| b.0.to_string().starts_with("/ip4/5.6.7.8/tcp/9222/p2p/"))
+                .count(),
+            1
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("best-peers.txt");
         let mut s2 = PeerSelector::new(PeerSelectConfig { store: Some(path.clone()), ..cfg() });
         assert_eq!(s2.maybe_store(&[], t0).unwrap(), None, "nothing to store");
         write_store(&path, &best).unwrap();
-        std::fs::write(&path, format!("{}\nnot-a-multiaddr\n/ip4/1.1.1.1/tcp/1\n", std::fs::read_to_string(&path).unwrap()))
-            .unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{}\nnot-a-multiaddr\n/ip4/1.1.1.1/tcp/1\n",
+                std::fs::read_to_string(&path).unwrap()
+            ),
+        )
+        .unwrap();
         let read = read_store(&path);
         assert_eq!(read, best.iter().map(|b| b.0.clone()).collect::<Vec<_>>());
         assert!(read_store(&dir.path().join("missing")).is_empty());
@@ -907,5 +958,171 @@ mod tests {
         assert!(s.stats(&p).is_some());
         s.select(&[], t0 + FORGET_AFTER + Duration::from_secs(1));
         assert!(s.stats(&p).is_none());
+    }
+
+    /// Replays recorded per-peer deliveries from trader-va (`peerstats.py export`: socket-level
+    /// first copies, observed duplicate offsets and our forwarded bytes per block) through the
+    /// selector, and compares what a node that applied its prunes would have seen with what the
+    /// node with 30 peers saw. Prints one JSON line per `keep:explore` setting. Run with
+    /// `BASE_P2P_SELECT_REPLAY=events.txt [BASE_P2P_SELECT_REPLAY_KE=8:4,5:3]
+    /// cargo test -p base-consensus-gossip --lib replay_recorded -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs a recorded replay file (BASE_P2P_SELECT_REPLAY)"]
+    fn replay_recorded() {
+        let Ok(path) = std::env::var("BASE_P2P_SELECT_REPLAY") else { return };
+        let text = std::fs::read_to_string(&path).expect("replay file");
+        let settings = std::env::var("BASE_P2P_SELECT_REPLAY_KE").unwrap_or_else(|_| "8:4".into());
+        for ke in settings.split(',') {
+            let (k, e) = ke.split_once(':').expect("keep:explore");
+            let config = PeerSelectConfig {
+                keep: k.parse().unwrap(),
+                explore: e.parse().unwrap(),
+                ..PeerSelectConfig::default()
+            };
+            println!("{}", replay(&text, config));
+        }
+    }
+
+    /// Censored blocks (no kept peer's copy was observed before our IDONTWANT stopped it) are
+    /// assumed to arrive this much after the actual first copy.
+    const CENSORED_MS: f64 = 100.0;
+
+    fn replay(text: &str, config: PeerSelectConfig) -> String {
+        let t0 = Instant::now();
+        let mut ids: HashMap<String, PeerId> = HashMap::new();
+        let mut id = |s: &str| *ids.entry(s.to_string()).or_insert_with(PeerId::random);
+        let mut s = PeerSelector::new(config.clone());
+        let mut real: Vec<PeerId> = Vec::new(); // connected in the recording, in connect order
+        let mut admitted: Vec<PeerId> = Vec::new(); // connected in the replayed node
+        let mut next_tick = config.interval;
+        let (mut blocks, mut kept_first, mut censored, mut prunes) = (0u64, 0u64, 0u64, 0u64);
+        let (mut extra, mut lead_real, mut lead_sel): (Vec<f64>, Vec<f64>, Vec<f64>) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let (mut out_all, mut out_kept, mut admitted_sum) = (0u64, 0u64, 0u64);
+        let admit =
+            |s: &PeerSelector, real: &[PeerId], admitted: &mut Vec<PeerId>, now: Instant| {
+                for p in real {
+                    if !admitted.contains(p) && s.allow_dial(p, admitted.len(), 0, now) {
+                        admitted.push(*p);
+                    }
+                }
+            };
+        for line in text.lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let now = t0 + Duration::from_millis(f[1].parse().unwrap());
+            while t0 + next_tick <= now {
+                let at = t0 + next_tick;
+                let a = s.select(&admitted, at);
+                for (p, _) in &a.prune {
+                    admitted.retain(|x| x != p);
+                    s.on_disconnected(*p, true, at);
+                    prunes += 1;
+                }
+                admit(&s, &real, &mut admitted, at);
+                for p in &admitted {
+                    if s.stats(p).is_none_or(|st| st.connected_since.is_none()) {
+                        s.on_connected(*p, None, at);
+                    }
+                }
+                next_tick += config.interval;
+            }
+            match f[0] {
+                "C" => {
+                    let p = id(f[2]);
+                    if !real.contains(&p) {
+                        real.push(p);
+                    }
+                    if !admitted.contains(&p) && s.allow_dial(&p, admitted.len(), 0, now) {
+                        admitted.push(p);
+                        s.on_connected(p, None, now);
+                    }
+                }
+                "D" => {
+                    let p = id(f[2]);
+                    real.retain(|x| *x != p);
+                    if admitted.contains(&p) {
+                        admitted.retain(|x| *x != p);
+                        s.on_disconnected(p, false, now);
+                    }
+                }
+                "B" => {
+                    blocks += 1;
+                    admitted_sum += admitted.len() as u64;
+                    let first = id(f[2]);
+                    let mesh: HashSet<PeerId> = f[3].split(',').map(&mut id).collect();
+                    let dups: Vec<(PeerId, f64)> = if f[4] == "-" {
+                        Vec::new()
+                    } else {
+                        f[4].split(',')
+                            .map(|kv| {
+                                let (k, v) = kv.rsplit_once('=').unwrap();
+                                (id(k), v.parse().unwrap())
+                            })
+                            .collect()
+                    };
+                    if f[5] != "-" {
+                        for kv in f[5].split(',') {
+                            let (k, v) = kv.rsplit_once('=').unwrap();
+                            let nb: u64 = v.parse().unwrap();
+                            out_all += nb;
+                            if admitted.contains(&id(k)) {
+                                out_kept += nb;
+                            }
+                        }
+                    }
+                    let lead: Option<f64> = f[6].parse().ok();
+                    let (src, off) = if admitted.contains(&first) {
+                        kept_first += 1;
+                        (Some(first), 0.0)
+                    } else if let Some((p, ms)) = dups
+                        .iter()
+                        .filter(|(p, _)| admitted.contains(p))
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                    {
+                        (Some(*p), *ms)
+                    } else {
+                        censored += 1;
+                        (None, CENSORED_MS)
+                    };
+                    extra.push(off);
+                    if let Some(l) = lead {
+                        lead_real.push(l);
+                        lead_sel.push(l - off);
+                    }
+                    if let Some(src) = src {
+                        s.on_block(src, &admitted, |p| mesh.contains(p), now);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let q = |v: &mut Vec<f64>, p: f64| {
+            if v.is_empty() {
+                return f64::NAN;
+            }
+            v.sort_by(f64::total_cmp);
+            v[((v.len() - 1) as f64 * p).round() as usize]
+        };
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+        format!(
+            "{{\"keep\":{},\"explore\":{},\"blocks\":{},\"first_from_kept_pct\":{:.2},\"censored\":{},\
+             \"extra_ms_mean\":{:.2},\"extra_ms_p99\":{:.1},\"lead_ms_p50_real\":{:.1},\"lead_ms_p50_selected\":{:.1},\
+             \"lead_ms_mean_real\":{:.1},\"lead_ms_mean_selected\":{:.1},\"peers_mean\":{:.1},\"prunes\":{},\
+             \"egress_kept_pct\":{:.1}}}",
+            config.keep,
+            config.explore,
+            blocks,
+            100.0 * kept_first as f64 / blocks.max(1) as f64,
+            censored,
+            mean(&extra),
+            q(&mut extra, 0.99),
+            q(&mut lead_real.clone(), 0.5),
+            q(&mut lead_sel.clone(), 0.5),
+            mean(&lead_real),
+            mean(&lead_sel),
+            admitted_sum as f64 / blocks.max(1) as f64,
+            prunes,
+            100.0 * out_kept as f64 / out_all.max(1) as f64,
+        )
     }
 }

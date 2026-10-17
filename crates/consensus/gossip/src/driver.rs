@@ -629,7 +629,10 @@ where
             .map(|(id, score, wins, eligible, rtt)| {
                 let id = id.to_string();
                 let short = &id[id.len().saturating_sub(8)..];
-                format!("{short}:{score:.3}/{wins}w/{eligible:.0}e/{}ms", rtt.map_or(-1, |r| r as i64))
+                format!(
+                    "{short}:{score:.3}/{wins}w/{eligible:.0}e/{}ms",
+                    rtt.map_or(-1, |r| r as i64)
+                )
             })
             .collect();
         info!(
@@ -671,7 +674,8 @@ where
                         self.swarm.close_connection(connection_id);
                         return None;
                     }
-                    let dialed = (!endpoint.is_listener()).then(|| endpoint.get_remote_address().clone());
+                    let dialed =
+                        (!endpoint.is_listener()).then(|| endpoint.get_remote_address().clone());
                     select.on_connected(peer_id, dialed, now);
                 }
                 debug!(target: "gossip", peer_id = %peer_id, peer_count, "Connection established");
