@@ -34,7 +34,8 @@ use async_trait::async_trait;
 use base_common_rpc_types_engine::BaseExecutionPayloadEnvelope;
 use base_protocol::{BlockInfo, L2BlockInfo};
 use tokio::sync::{Notify, watch};
-use tracing::{debug, info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 use crate::{
     EngineClientResult, Metrics, NetworkEngineClient,
@@ -230,8 +231,23 @@ const SERVED_RING: usize = 64;
 /// Deepest unsafe reorg the follower repairs by itself (blocks replaced).
 const MAX_REORG_REPAIR_DEPTH: usize = 16;
 
+/// Most served blocks at the tip (gossip, or the local chain seeded at startup) that the RPC
+/// sources have not confirmed yet. At the cap the next payload comes from RPC, so a fork that
+/// gossip keeps extending stays well inside [`MAX_REORG_REPAIR_DEPTH`].
+const MAX_UNCONFIRMED_RUN: usize = 8;
+
 /// Upper bound on reading the local chain at startup.
 const LOCAL_SEED_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Delay before the first RPC confirmation of a newly served block.
+const CONFIRM_DELAY: Duration = Duration::from_millis(100);
+
+/// First and longest wait between confirmation reads while the RPC sources lack the block.
+const CONFIRM_NOT_FOUND_BACKOFF: (Duration, Duration) =
+    (Duration::from_millis(50), Duration::from_millis(200));
+
+/// Wait after a failed confirmation read.
+const CONFIRM_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Where a served (or seeded) block came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +275,8 @@ struct Served {
     number: u64,
     hash: B256,
     provenance: Provenance,
+    /// The RPC sources have this block (an RPC block, or one whose hash RPC returned).
+    confirmed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -271,6 +289,10 @@ struct ServeState {
     no_gossip_through: Option<u64>,
     /// An RPC payload did not extend the served chain and its repair has not completed.
     repair_pending: bool,
+    /// The RPC sources returned a different block at this served height.
+    rpc_disagrees: Option<u64>,
+    /// The block whose repair last failed as too deep (reported once at ERROR).
+    too_deep_reported: Option<u64>,
 }
 
 impl ServeState {
@@ -279,9 +301,13 @@ impl ServeState {
     }
 
     fn hash_at(&self, number: u64) -> Option<B256> {
+        self.served_at(number).map(|s| s.hash)
+    }
+
+    fn served_at(&self, number: u64) -> Option<&Served> {
         let first = self.served.front()?.number;
         let index = usize::try_from(number.checked_sub(first)?).ok()?;
-        self.served.get(index).map(|s| s.hash)
+        self.served.get(index)
     }
 
     fn record(&mut self, number: u64, hash: B256, provenance: Provenance) {
@@ -291,7 +317,8 @@ impl ServeState {
         if self.served.back().is_some_and(|s| s.number.saturating_add(1) != number) {
             self.served.clear();
         }
-        self.served.push_back(Served { number, hash, provenance });
+        let confirmed = provenance == Provenance::Rpc;
+        self.served.push_back(Served { number, hash, provenance, confirmed });
         while self.served.len() > SERVED_RING {
             self.served.pop_front();
         }
@@ -299,12 +326,40 @@ impl ServeState {
             self.last_gossip = Some(number);
         }
     }
+
+    /// Marks every served block up to `number` as on the RPC chain (block hashes commit to
+    /// their ancestors, and the remembered blocks are consecutive and linked).
+    fn confirm_through(&mut self, number: u64) {
+        for s in self.served.iter_mut().filter(|s| s.number <= number) {
+            s.confirmed = true;
+        }
+    }
+
+    fn unconfirmed_run(&self) -> usize {
+        self.served.iter().rev().take_while(|s| !s.confirmed).count()
+    }
 }
 
 /// Result of racing the RPC fetch of a height against its gossip copy.
 enum Fetched {
     Gossip(Candidate),
-    Rpc(Result<BaseExecutionPayloadEnvelope, RemoteL2ClientError>),
+    /// The RPC answer and why gossip was not used.
+    Rpc(Result<BaseExecutionPayloadEnvelope, RemoteL2ClientError>, &'static str),
+}
+
+/// Outcome of one RPC confirmation read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confirm {
+    /// Nothing to confirm (or a repair is due first).
+    Idle,
+    /// A block was confirmed (or the served chain changed meanwhile); look again at once.
+    Progress,
+    /// The RPC sources have a different block at a served height.
+    Disagrees,
+    /// The RPC sources do not have the block yet.
+    NotYet,
+    /// The read failed.
+    Failed,
 }
 
 /// A [`RemoteClient`] that answers payload requests from validated gossip first.
@@ -313,6 +368,9 @@ enum Fetched {
 /// block served just before it (the sequencer signed two blocks at one height and gossip carried
 /// the one that was dropped) is not returned until the engine's unsafe chain has been replaced
 /// with the RPC chain from the common ancestor; see [`FollowEngine::replace_unsafe_chain`].
+/// [`Self::run_confirmations`] checks each gossip block against the RPC sources in the
+/// background; a disagreement, or [`MAX_UNCONFIRMED_RUN`] unconfirmed blocks, sends the next
+/// fetch to RPC.
 #[derive(Debug)]
 pub struct GossipFirstClient<R> {
     inner: R,
@@ -320,12 +378,21 @@ pub struct GossipFirstClient<R> {
     mode: FollowP2pMode,
     state: Mutex<ServeState>,
     repair: Option<Arc<dyn FollowEngine>>,
+    /// Wakes [`Self::run_confirmations`] when there is a new block to confirm.
+    confirm_wake: Notify,
 }
 
 impl<R> GossipFirstClient<R> {
     /// Wraps `inner` (the RPC sources).
     pub fn new(inner: R, cache: Arc<GossipPayloadCache>, mode: FollowP2pMode) -> Self {
-        Self { inner, cache, mode, state: Mutex::new(ServeState::default()), repair: None }
+        Self {
+            inner,
+            cache,
+            mode,
+            state: Mutex::new(ServeState::default()),
+            repair: None,
+            confirm_wake: Notify::new(),
+        }
     }
 
     /// Repairs the engine's unsafe chain through `engine` when the RPC chain drops a served block
@@ -344,12 +411,18 @@ impl<R> GossipFirstClient<R> {
         if state.repair_pending || state.no_gossip_through.is_some_and(|h| number <= h) {
             return Err("reorg");
         }
+        if state.rpc_disagrees.is_some() {
+            return Err("rpc_disagrees");
+        }
         if state.last_gossip == Some(number) {
             return Err("retry");
         }
         let Some(last) = state.last() else {
             return Err("no_parent");
         };
+        if state.unconfirmed_run() >= MAX_UNCONFIRMED_RUN {
+            return Err("unconfirmed_run");
+        }
         drop(state);
         let candidates = self.cache.candidates(number);
         if candidates.is_empty() {
@@ -376,6 +449,7 @@ impl<R> GossipFirstClient<R> {
         debug!(target: "follow::p2p", block = number, hash = %candidate.hash, raced,
             "Serving payload from gossip");
         self.lock_state().record(number, candidate.hash, Provenance::Gossip);
+        self.confirm_wake.notify_one();
         candidate.payload
     }
 
@@ -393,40 +467,51 @@ impl<R: RemoteClient> GossipFirstClient<R> {
     ///
     /// The local head can be a gossip block the RPC chain dropped (served just before a
     /// restart). Seeding lets the first RPC payload be checked against it and repaired like any
-    /// served block. Reads `head` and up to [`MAX_REORG_REPAIR_DEPTH`] ancestors that link to it;
-    /// if the local node fails to answer, seeds only `head` and its parent hash (enough for a
-    /// depth-1 repair). Never fails and is bounded in time.
-    pub(super) async fn seed_local_chain(&self, local: &dyn FollowLocalClient, head: L2BlockInfo) {
+    /// served block; seeded blocks count as unconfirmed. Reads `head` and up to
+    /// [`MAX_REORG_REPAIR_DEPTH`] ancestors that link to it; if the local node fails to answer,
+    /// seeds only `head` and its parent hash (enough for a depth-1 repair). Never fails, is
+    /// bounded in time and stops on `cancellation`.
+    pub(super) async fn seed_local_chain(
+        &self,
+        local: &dyn FollowLocalClient,
+        head: L2BlockInfo,
+        cancellation: &CancellationToken,
+    ) {
         if self.mode != FollowP2pMode::Primary {
             return;
         }
         let head = head.block_info;
-        let chain = match tokio::time::timeout(
+        let read = tokio::time::timeout(
             LOCAL_SEED_TIMEOUT,
             Self::local_ancestors(local, head.number, head.parent_hash),
-        )
-        .await
-        {
-            Ok(Ok(ancestors)) => ancestors,
-            Ok(Err(error)) => {
-                warn!(target: "follow::p2p", block = head.number, %error,
-                    "Reading local blocks to seed the served chain failed; seeding the start block only");
-                vec![(head.number.saturating_sub(1), head.parent_hash)]
-            }
-            Err(_) => {
-                warn!(target: "follow::p2p", block = head.number,
-                    timeout_ms = LOCAL_SEED_TIMEOUT.as_millis() as u64,
-                    "Reading local blocks to seed the served chain timed out; seeding the start block only");
-                vec![(head.number.saturating_sub(1), head.parent_hash)]
-            }
+        );
+        let chain = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            read = read => match read {
+                Ok(Ok(ancestors)) => ancestors,
+                Ok(Err(error)) => {
+                    warn!(target: "follow::p2p", block = head.number, %error,
+                        "Reading local blocks to seed the served chain failed; seeding the start block only");
+                    vec![(head.number.saturating_sub(1), head.parent_hash)]
+                }
+                Err(_) => {
+                    warn!(target: "follow::p2p", block = head.number,
+                        timeout_ms = LOCAL_SEED_TIMEOUT.as_millis() as u64,
+                        "Reading local blocks to seed the served chain timed out; seeding the start block only");
+                    vec![(head.number.saturating_sub(1), head.parent_hash)]
+                }
+            },
         };
-        let mut state = self.lock_state();
-        for (n, h) in chain {
-            state.record(n, h, Provenance::Local);
-        }
-        state.record(head.number, head.hash, Provenance::Local);
-        let from = state.served.front().map_or(head.number, |s| s.number);
-        drop(state);
+        let from = {
+            let mut state = self.lock_state();
+            for (n, h) in chain {
+                state.record(n, h, Provenance::Local);
+            }
+            state.record(head.number, head.hash, Provenance::Local);
+            state.served.front().map_or(head.number, |s| s.number)
+        };
+        self.confirm_wake.notify_one();
         info!(target: "follow::p2p", from, to = head.number, hash = %head.hash,
             "Seeded the served chain from local blocks");
     }
@@ -452,6 +537,82 @@ impl<R: RemoteClient> GossipFirstClient<R> {
         Ok(chain)
     }
 
+    /// Confirms served blocks against the RPC sources until `cancellation`, only needed in
+    /// [`FollowP2pMode::Primary`].
+    ///
+    /// One read at a time (the oldest unconfirmed block; a match confirms everything below it
+    /// too), header only, starting [`CONFIRM_DELAY`] after a block is served, so the RPC load
+    /// stays at or below one block read per gossip block plus short "not found" retries.
+    pub(super) async fn run_confirmations(
+        self: Arc<Self>,
+        cancellation: CancellationToken,
+    ) -> Result<(), FollowError> {
+        let mut not_found_wait = Duration::ZERO;
+        loop {
+            let outcome = self.confirm_next().await;
+            not_found_wait = if outcome == Confirm::NotYet {
+                (not_found_wait * 2).clamp(CONFIRM_NOT_FOUND_BACKOFF.0, CONFIRM_NOT_FOUND_BACKOFF.1)
+            } else {
+                Duration::ZERO
+            };
+            let wait = match outcome {
+                Confirm::Idle => {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return Ok(()),
+                        _ = self.confirm_wake.notified() => {}
+                    }
+                    CONFIRM_DELAY
+                }
+                Confirm::Progress | Confirm::Disagrees => Duration::ZERO,
+                Confirm::NotYet => not_found_wait,
+                Confirm::Failed => CONFIRM_FAILURE_BACKOFF,
+            };
+            tokio::select! {
+                _ = cancellation.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+    }
+
+    /// Reads the oldest unconfirmed served block from the RPC sources once.
+    async fn confirm_next(&self) -> Confirm {
+        let target = {
+            let state = self.lock_state();
+            if state.repair_pending || state.rpc_disagrees.is_some() {
+                None
+            } else {
+                state.served.iter().find(|s| !s.confirmed).map(|s| (s.number, s.hash))
+            }
+        };
+        let Some((number, hash)) = target else {
+            return Confirm::Idle;
+        };
+        let result = self.inner.get_block_info(BlockNumberOrTag::Number(number)).await;
+        let rpc_hash = match result {
+            Ok(info) => info.hash,
+            Err(RemoteL2ClientError::BlockNotFound(_)) => return Confirm::NotYet,
+            Err(error) => {
+                debug!(target: "follow::p2p", block = number, %error, "Confirmation read failed");
+                return Confirm::Failed;
+            }
+        };
+        {
+            let mut state = self.lock_state();
+            if state.hash_at(number) != Some(hash) {
+                // Replaced meanwhile (a repair or a newer RPC block); look again.
+                return Confirm::Progress;
+            }
+            if rpc_hash == hash {
+                state.confirm_through(number);
+                return Confirm::Progress;
+            }
+            state.rpc_disagrees = Some(number);
+        }
+        warn!(target: "follow::p2p", block = number, served_hash = %hash, %rpc_hash,
+            "RPC sources have a different block than the one served; reading from RPC until repaired");
+        Confirm::Disagrees
+    }
+
     /// Fetches `number` from the RPC sources, but takes its gossip copy instead when one that
     /// passes [`Self::pick_gossip`] arrives before the RPC answer.
     async fn rpc_or_gossip(&self, number: u64) -> Fetched {
@@ -464,11 +625,11 @@ impl<R: RemoteClient> GossipFirstClient<R> {
             match self.pick_gossip(number) {
                 Ok(candidate) => return Fetched::Gossip(candidate),
                 Err("missing") => {}
-                Err(_) => return Fetched::Rpc(rpc.await),
+                Err(reason) => return Fetched::Rpc(rpc.await, reason),
             }
             tokio::select! {
                 biased;
-                result = &mut rpc => return Fetched::Rpc(result),
+                result = &mut rpc => return Fetched::Rpc(result, "missing"),
                 _ = &mut arrival => {}
             }
         }
@@ -480,8 +641,10 @@ impl<R: RemoteClient> GossipFirstClient<R> {
     /// Walks the RPC chain back from `number - 1` to the first block whose parent is the block
     /// served at that height (the common ancestor), at most [`MAX_REORG_REPAIR_DEPTH`] blocks and
     /// never past the served blocks still remembered, checking that each RPC block is the parent
-    /// of the one after it. Any failure leaves the served state as it was, so the next request
-    /// for `number` retries; RPC errors are returned unchanged for the prefetcher's backoff.
+    /// of the one after it. When only RPC blocks would be replaced (the RPC chain itself moved),
+    /// their hashes must read the same a second time. Any failure leaves the served state as it
+    /// was, so the next request for `number` retries; RPC errors are returned unchanged for the
+    /// prefetcher's backoff.
     async fn repair_served_chain(
         &self,
         engine: &dyn FollowEngine,
@@ -496,14 +659,7 @@ impl<R: RemoteClient> GossipFirstClient<R> {
             let Some(served_parent) =
                 served_parent.filter(|_| chain.len() < MAX_REORG_REPAIR_DEPTH)
             else {
-                return Err(Self::repair_failed(
-                    number,
-                    "too_deep",
-                    format!(
-                        "no common ancestor within {} blocks (searched down to block {height})",
-                        chain.len()
-                    ),
-                ));
+                return Err(self.too_deep(number, chain.len(), height));
             };
             let payload = match self.inner.get_payload_by_number(height).await {
                 Ok(payload) => payload,
@@ -541,13 +697,54 @@ impl<R: RemoteClient> GossipFirstClient<R> {
             .collect();
         let from = canonical[0].0;
         let depth = canonical.len();
+
+        let rpc_only = self
+            .lock_state()
+            .served
+            .iter()
+            .filter(|s| s.number >= from)
+            .all(|s| s.provenance == Provenance::Rpc);
+        if rpc_only {
+            for &(n, h) in &canonical {
+                let again = self.inner.get_block_info(BlockNumberOrTag::Number(n)).await;
+                match again {
+                    Ok(info) if info.hash == h => {}
+                    Ok(info) => {
+                        return Err(Self::repair_failed(
+                            number,
+                            "rpc_unstable",
+                            format!("RPC block {n} read as {h}, then as {}", info.hash),
+                        ));
+                    }
+                    Err(e) => {
+                        Metrics::follow_p2p_reorg_repair_failed_total("rpc_error").increment(1);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         match engine.replace_unsafe_chain(chain).await {
             Ok(ChainReplace::Applied) => {}
             Ok(ChainReplace::EngineBehind { unsafe_head }) => {
+                // Normal while the insert loop drains the queue; retried shortly.
+                Metrics::follow_p2p_reorg_repair_failed_total("engine_behind").increment(1);
+                debug!(target: "follow::p2p", block = number, unsafe_head, from,
+                    "Unsafe chain repair waits for the engine to reach the common ancestor");
+                return Err(RemoteL2ClientError::EngineBehind { block: number, unsafe_head });
+            }
+            Ok(ChainReplace::BelowSafe { safe_head }) => {
                 return Err(Self::repair_failed(
                     number,
-                    "engine_behind",
-                    format!("engine unsafe head {unsafe_head} is below block {}", from - 1),
+                    "below_safe",
+                    format!("block {from} is at or below the safe head {safe_head}"),
+                ));
+            }
+            Ok(ChainReplace::TimedOut) => {
+                return Err(Self::repair_failed(
+                    number,
+                    "engine_timeout",
+                    "engine replacement timed out".to_owned(),
                 ));
             }
             Ok(ChainReplace::Unexpected { number: head, hash }) => {
@@ -570,8 +767,11 @@ impl<R: RemoteClient> GossipFirstClient<R> {
         for &(n, h) in &canonical {
             state.record(n, h, Provenance::Rpc);
         }
+        state.confirm_through(number);
         state.no_gossip_through = Some(number.saturating_sub(1));
         state.repair_pending = false;
+        state.rpc_disagrees = None;
+        state.too_deep_reported = None;
         drop(state);
         Metrics::follow_p2p_reorg_repaired_total().increment(1);
         warn!(target: "follow::p2p", block = number, from, to = number.saturating_sub(1), depth,
@@ -580,6 +780,23 @@ impl<R: RemoteClient> GossipFirstClient<R> {
             canonical_hash = %next.execution_payload.parent_hash(),
             "Repaired unsafe chain: replaced served blocks the RPC sources did not keep");
         Ok(())
+    }
+
+    /// A repair that found no common ancestor: reported at ERROR once per block.
+    fn too_deep(&self, number: u64, searched: usize, lowest: u64) -> RemoteL2ClientError {
+        Metrics::follow_p2p_reorg_repair_failed_total("too_deep").increment(1);
+        let first = {
+            let mut state = self.lock_state();
+            state.too_deep_reported.replace(number) != Some(number)
+        };
+        if first {
+            error!(target: "follow::p2p", block = number, searched, lowest,
+                max_depth = MAX_REORG_REPAIR_DEPTH,
+                "No common ancestor with the RPC chain within the repair depth; manual unwind needed");
+        } else {
+            debug!(target: "follow::p2p", block = number, "Unsafe chain repair still too deep");
+        }
+        RemoteL2ClientError::ReorgTooDeep { block: number, searched }
     }
 }
 
@@ -601,26 +818,25 @@ impl<R: RemoteClient> RemoteClient for GossipFirstClient<R> {
         number: u64,
     ) -> Result<BaseExecutionPayloadEnvelope, RemoteL2ClientError> {
         let fetched = if self.mode == FollowP2pMode::Primary {
-            match self.pick_gossip(number) {
+            let (result, reason) = match self.pick_gossip(number) {
                 Ok(candidate) => return Ok(self.serve_gossip(number, candidate, false)),
                 Err("missing") => match self.rpc_or_gossip(number).await {
                     Fetched::Gossip(candidate) => {
                         return Ok(self.serve_gossip(number, candidate, true));
                     }
-                    Fetched::Rpc(result) => {
-                        Metrics::follow_p2p_fallback_total("missing").increment(1);
-                        result
-                    }
+                    Fetched::Rpc(result, reason) => (result, reason),
                 },
-                Err(reason) => {
-                    Metrics::follow_p2p_fallback_total(reason).increment(1);
-                    if reason != "no_parent" {
-                        warn!(target: "follow::p2p", block = number, reason,
-                            "Gossip payload not used; reading from RPC sources");
-                    }
-                    self.inner.get_payload_by_number(number).await
-                }
+                Err(reason) => (self.inner.get_payload_by_number(number).await, reason),
+            };
+            Metrics::follow_p2p_fallback_total(reason).increment(1);
+            if matches!(reason, "parent_mismatch" | "ambiguous" | "retry") {
+                warn!(target: "follow::p2p", block = number, reason,
+                    "Gossip payload not used; reading from RPC sources");
+            } else {
+                debug!(target: "follow::p2p", block = number, reason,
+                    "Gossip payload not used; reading from RPC sources");
             }
+            result
         } else {
             self.inner.get_payload_by_number(number).await
         };
@@ -635,12 +851,16 @@ impl<R: RemoteClient> RemoteClient for GossipFirstClient<R> {
             let parent_hash = payload.execution_payload.parent_hash();
             let (tip, first_report) = {
                 let mut state = self.lock_state();
-                let tip = state.last().filter(|tip| {
-                    tip.number.saturating_add(1) == number && tip.hash != parent_hash
-                });
+                let tip = state.last().filter(|tip| tip.number.saturating_add(1) == number);
+                let mismatch = tip.filter(|tip| tip.hash != parent_hash);
+                if tip.is_some() && mismatch.is_none() {
+                    // RPC extends the served chain: everything served so far is on it.
+                    state.confirm_through(number);
+                    state.rpc_disagrees = None;
+                }
                 let first_report = !state.repair_pending;
-                state.repair_pending = tip.is_some() && self.repair.is_some();
-                (tip, first_report)
+                state.repair_pending = mismatch.is_some() && self.repair.is_some();
+                (mismatch, first_report)
             };
             if let Some(tip) = tip {
                 if first_report {
@@ -714,6 +934,8 @@ mod tests {
     use crate::follow::{
         engine::{EngineApiFollowEngine, MockFollowEngine},
         local::MockFollowLocalClient,
+        proof_gate::NoopProofGate,
+        runtime::FollowRuntime,
         source::MockRemoteClient,
     };
 
@@ -760,8 +982,13 @@ mod tests {
     #[derive(Clone, Default)]
     struct Rpc {
         chain: Arc<Mutex<HashMap<u64, BaseExecutionPayloadEnvelope>>>,
+        /// Payload reads.
         calls: Arc<Mutex<Vec<u64>>>,
+        /// Header (block info) reads.
+        info_calls: Arc<Mutex<Vec<u64>>>,
         fail_once: Arc<Mutex<HashSet<u64>>>,
+        /// Header hashes that differ from the payload chain (a flapping source).
+        info_override: Arc<Mutex<HashMap<u64, B256>>>,
     }
 
     impl Rpc {
@@ -782,9 +1009,36 @@ mod tests {
             self.calls.lock().unwrap().clone()
         }
 
+        fn info_calls(&self) -> Vec<u64> {
+            self.info_calls.lock().unwrap().clone()
+        }
+
         fn client(&self) -> MockRemoteClient {
-            let rpc = self.clone();
             let mut source = MockRemoteClient::new();
+            let rpc = self.clone();
+            source.expect_get_block_number().returning(move |_| {
+                Ok(rpc.chain.lock().unwrap().keys().max().copied().unwrap_or_default())
+            });
+            let rpc = self.clone();
+            source.expect_get_block_info().returning(move |tag| {
+                let BlockNumberOrTag::Number(n) = tag else {
+                    return Err(RemoteL2ClientError::BlockNotFound(format!("{tag:?}")));
+                };
+                rpc.info_calls.lock().unwrap().push(n);
+                let chain = rpc.chain.lock().unwrap();
+                let block = chain
+                    .get(&n)
+                    .ok_or_else(|| RemoteL2ClientError::BlockNotFound(n.to_string()))?;
+                let p = &block.execution_payload;
+                let hash = rpc.info_override.lock().unwrap().get(&n).copied();
+                Ok(BlockInfo {
+                    hash: hash.unwrap_or_else(|| p.block_hash()),
+                    number: n,
+                    parent_hash: p.parent_hash(),
+                    timestamp: p.timestamp(),
+                })
+            });
+            let rpc = self.clone();
             source.expect_get_payload_by_number().returning(move |n| {
                 rpc.calls.lock().unwrap().push(n);
                 if rpc.fail_once.lock().unwrap().remove(&n) {
@@ -1184,7 +1438,7 @@ mod tests {
         t.cache.insert(t.fork[0].clone(), Instant::now());
         let fork3 = t.source.get_payload_by_number(3).await.unwrap();
         let err = t.source.get_payload_by_number(4).await.unwrap_err();
-        assert!(matches!(err, RemoteL2ClientError::ReorgRepair { block: 4, .. }), "{err:?}");
+        assert!(matches!(err, RemoteL2ClientError::EngineBehind { block: 4, .. }), "{err:?}");
         assert!(t.client.last_new_payload_v2().await.is_none(), "nothing sent ahead of the EL");
 
         // The insert loop drains the queue (1, 2, 3'), then the retry repairs.
@@ -1196,40 +1450,191 @@ mod tests {
         assert_eq!(head_hash(&t.engine).await, t.hash(3));
     }
 
-    async fn serve_fake_fork(
+    /// Restarts on a local fork of `depth` blocks (2..=depth+1 on chain 1, forking off block 1
+    /// of RPC chain 7) and fetches the next RPC block.
+    async fn restart_on_fake_fork(
         depth: u64,
-    ) -> (Result<BaseExecutionPayloadEnvelope, RemoteL2ClientError>, Vec<Vec<u64>>, Vec<u64>) {
-        // RPC: chain 7. Gossip: 2..=depth+1 on chain 1, forking off RPC block 1.
+    ) -> (GossipFirstClient<MockRemoteClient>, Rpc, Arc<Mutex<Vec<Vec<u64>>>>) {
         let rpc = Rpc::with(fake_chain(1..=depth + 2, 7));
-        let cache = Arc::new(GossipPayloadCache::default());
         let replaced = Arc::new(Mutex::new(Vec::new()));
-        let source = primary(&rpc, &cache)
+        let source = primary(&rpc, &Arc::new(GossipPayloadCache::default()))
             .with_repair_engine(Arc::new(recording_engine(Arc::clone(&replaced))));
-        source.get_payload_by_number(1).await.unwrap();
-        for n in 2..=depth + 1 {
-            cache.insert(payload(n, 1, if n == 2 { 7 } else { 1 }), Instant::now());
-            assert_eq!(served_hash(&source.get_payload_by_number(n).await.unwrap()), hash(n, 1));
-        }
-        let result = source.get_payload_by_number(depth + 2).await;
-        let replaced = replaced.lock().unwrap().clone();
-        (result, replaced, rpc.calls())
+        let mut local: Vec<_> = vec![payload(1, 7, 7), payload(2, 1, 7)];
+        local.extend((3..=depth + 1).map(|n| payload(n, 1, 1)));
+        let head = info_of(local.last().unwrap());
+        let local = local_chain(local.iter().map(info_of).collect());
+        source.seed_local_chain(&local, head, &CancellationToken::new()).await;
+        (source, rpc, replaced)
     }
 
     #[tokio::test]
     async fn repair_is_bounded_in_depth() {
         let depth = MAX_REORG_REPAIR_DEPTH as u64;
-        let (result, replaced, _) = serve_fake_fork(depth).await;
-        assert_eq!(served_hash(&result.unwrap()), hash(depth + 2, 7));
-        assert_eq!(replaced, vec![(2..=depth + 1).collect::<Vec<_>>()]);
+        let (source, _, replaced) = restart_on_fake_fork(depth).await;
+        let p = source.get_payload_by_number(depth + 2).await.unwrap();
+        assert_eq!(served_hash(&p), hash(depth + 2, 7));
+        assert_eq!(*replaced.lock().unwrap(), vec![(2..=depth + 1).collect::<Vec<_>>()]);
 
-        let (result, replaced, calls) = serve_fake_fork(depth + 1).await;
-        assert!(
-            matches!(result, Err(RemoteL2ClientError::ReorgRepair { block, .. }) if block == depth + 3)
-        );
-        assert!(replaced.is_empty(), "nothing is inserted without a common ancestor");
-        assert_eq!(calls.len(), 1 + 1 + MAX_REORG_REPAIR_DEPTH, "1, the new block, the walk");
+        let (source, rpc, replaced) = restart_on_fake_fork(depth + 1).await;
+        for _ in 0..2 {
+            // Distinct error on every retry (the ERROR log is once per block).
+            let err = source.get_payload_by_number(depth + 3).await.unwrap_err();
+            assert!(
+                matches!(err, RemoteL2ClientError::ReorgTooDeep { block, searched }
+                    if block == depth + 3 && searched == MAX_REORG_REPAIR_DEPTH),
+                "{err:?}"
+            );
+        }
+        assert!(replaced.lock().unwrap().is_empty(), "nothing is inserted without an ancestor");
+        assert_eq!(rpc.calls().len(), 2 * (1 + MAX_REORG_REPAIR_DEPTH), "new block plus the walk");
     }
 
+    #[tokio::test]
+    async fn gossip_fork_stops_being_served_after_the_unconfirmed_cap() {
+        let rpc = Rpc::with(fake_chain(1..=12, 7));
+        let cache = Arc::new(GossipPayloadCache::default());
+        let replaced = Arc::new(Mutex::new(Vec::new()));
+        let source = primary(&rpc, &cache)
+            .with_repair_engine(Arc::new(recording_engine(Arc::clone(&replaced))));
+        source.get_payload_by_number(1).await.unwrap();
+        // A second sequencer keeps extending its fork on gossip; nothing confirms it.
+        for n in 2..=12 {
+            cache.insert(payload(n, 1, if n == 2 { 7 } else { 1 }), Instant::now());
+        }
+        let cap = MAX_UNCONFIRMED_RUN as u64;
+        for n in 2..=cap + 1 {
+            assert_eq!(served_hash(&source.get_payload_by_number(n).await.unwrap()), hash(n, 1));
+        }
+        // At the cap the next block comes from RPC, which shows the fork and repairs it.
+        let p = source.get_payload_by_number(cap + 2).await.unwrap();
+        assert_eq!(served_hash(&p), hash(cap + 2, 7));
+        assert_eq!(*replaced.lock().unwrap(), vec![(2..=cap + 1).collect::<Vec<_>>()]);
+        // No gossip at repaired heights; the fork's next block does not extend the RPC chain.
+        assert_eq!(
+            served_hash(&source.get_payload_by_number(cap + 3).await.unwrap()),
+            hash(cap + 3, 7)
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_confirmation_mismatch_sends_the_next_fetch_to_rpc_and_repairs() {
+        let rpc = Rpc::with(fake_chain(1..=4, 7));
+        let cache = Arc::new(GossipPayloadCache::default());
+        let replaced = Arc::new(Mutex::new(Vec::new()));
+        let source = primary(&rpc, &cache)
+            .with_repair_engine(Arc::new(recording_engine(Arc::clone(&replaced))));
+        source.get_payload_by_number(1).await.unwrap();
+        cache.insert(payload(2, 1, 7), Instant::now());
+        assert_eq!(served_hash(&source.get_payload_by_number(2).await.unwrap()), hash(2, 1));
+        assert_eq!(source.confirm_next().await, Confirm::Disagrees);
+        assert_eq!(source.confirm_next().await, Confirm::Idle, "one read per disagreement");
+
+        // The fork goes on, but the next block is read from RPC and repairs 2' -> 2.
+        cache.insert(payload(3, 1, 1), Instant::now());
+        let p3 = source.get_payload_by_number(3).await.unwrap();
+        assert_eq!(served_hash(&p3), hash(3, 7));
+        assert_eq!(*replaced.lock().unwrap(), vec![vec![2]]);
+        assert_eq!(rpc.calls(), vec![1, 3, 2]);
+        assert_eq!(rpc.info_calls(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn confirmed_gossip_keeps_flowing_past_the_cap() {
+        let rpc = Rpc::with(fake_chain(1..=30, 7));
+        let cache = Arc::new(GossipPayloadCache::default());
+        let source = primary(&rpc, &cache).with_repair_engine(Arc::new(MockFollowEngine::new()));
+        source.get_payload_by_number(1).await.unwrap();
+        for n in 2..=30 {
+            cache.insert(payload(n, 7, 7), Instant::now());
+            assert_eq!(served_hash(&source.get_payload_by_number(n).await.unwrap()), hash(n, 7));
+            assert_eq!(source.confirm_next().await, Confirm::Progress);
+        }
+        assert_eq!(source.confirm_next().await, Confirm::Idle);
+        assert_eq!(rpc.calls(), vec![1], "every block after 1 came from gossip");
+        assert_eq!(rpc.info_calls(), (2..=30).collect::<Vec<_>>(), "one header read per block");
+    }
+
+    #[tokio::test]
+    async fn confirmation_waits_for_blocks_the_rpc_sources_lack() {
+        let rpc = Rpc::with(fake_chain(1..=1, 7));
+        let cache = Arc::new(GossipPayloadCache::default());
+        let source = primary(&rpc, &cache);
+        source.get_payload_by_number(1).await.unwrap();
+        cache.insert(payload(2, 7, 7), Instant::now());
+        source.get_payload_by_number(2).await.unwrap();
+        assert_eq!(source.confirm_next().await, Confirm::NotYet);
+        rpc.set(fake_chain(2..=2, 7));
+        assert_eq!(source.confirm_next().await, Confirm::Progress);
+    }
+
+    #[tokio::test]
+    async fn rpc_only_reorg_needs_a_second_read_that_agrees() {
+        let rpc = Rpc::with(fake_chain(1..=3, 7));
+        let cache = Arc::new(GossipPayloadCache::default());
+        let replaced = Arc::new(Mutex::new(Vec::new()));
+        let source = primary(&rpc, &cache)
+            .with_repair_engine(Arc::new(recording_engine(Arc::clone(&replaced))));
+        for n in 1..=3 {
+            source.get_payload_by_number(n).await.unwrap();
+        }
+        // The RPC chain itself moves at 3 (no gossip involved); one header read flaps.
+        rpc.set([payload(3, 8, 7), payload(4, 7, 8)]);
+        rpc.info_override.lock().unwrap().insert(3, hash(3, 9));
+        let err = source.get_payload_by_number(4).await.unwrap_err();
+        assert!(matches!(err, RemoteL2ClientError::ReorgRepair { block: 4, .. }), "{err:?}");
+        assert!(replaced.lock().unwrap().is_empty());
+
+        rpc.info_override.lock().unwrap().clear();
+        assert_eq!(served_hash(&source.get_payload_by_number(4).await.unwrap()), hash(4, 7));
+        assert_eq!(*replaced.lock().unwrap(), vec![vec![3]]);
+    }
+
+    #[tokio::test]
+    async fn primary_repair_end_to_end_through_prefetcher_and_insert_loop() {
+        let canonical = sealed_chain(GENESIS, 1, 8, 0);
+        let fork3 = sealed(3, canonical[1].execution_payload.block_hash(), 9);
+        let rpc = Rpc::with(canonical.clone());
+        let cache = Arc::new(GossipPayloadCache::default());
+        cache.insert(fork3.clone(), Instant::now());
+        let (engine, client) = real_engine();
+        let source = Arc::new(
+            primary(&rpc, &cache).with_repair_engine(Arc::clone(&engine) as Arc<dyn FollowEngine>),
+        );
+        let mut local = MockFollowLocalClient::new();
+        local.expect_block_info().returning(|_| Ok(None));
+        let cancellation = CancellationToken::new();
+        let runtime = FollowRuntime::new(
+            Arc::new(local),
+            Arc::clone(&source),
+            Arc::clone(&engine) as Arc<dyn FollowEngine>,
+            cancellation.clone(),
+            genesis(),
+            NoopProofGate,
+            Duration::ZERO,
+        );
+        let run = tokio::spawn(runtime.start(None));
+
+        let tip = canonical[7].execution_payload.block_hash();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while head_hash(&engine).await != tip && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cancellation.cancel();
+        run.await.unwrap().unwrap();
+        assert_eq!(head_hash(&engine).await, tip, "the follower reached canonical 8");
+        let calls = rpc.calls();
+        // 3' came from gossip; 4 from RPC triggered the repair of 3 (retried while the engine
+        // had not reached block 2 yet).
+        let middle = &calls[2..calls.len() - 4];
+        assert_eq!(&calls[..2], &[1, 2], "{calls:?}");
+        assert_eq!(&calls[calls.len() - 4..], &[5, 6, 7, 8], "{calls:?}");
+        assert!(!middle.is_empty() && middle.chunks(2).all(|c| c == [4, 3]), "{calls:?}");
+        // Every forkchoice head is on a chain the EL can serve: 3' at most, then canonical.
+        let heads = forkchoice_heads(&client).await;
+        let canonical_hashes: Vec<_> =
+            canonical.iter().map(|p| p.execution_payload.block_hash()).collect();
+        assert!(heads.iter().all(|h| canonical_hashes.contains(h) || *h == fork3.execution_payload.block_hash()));
+    }
     #[tokio::test]
     async fn repair_never_walks_past_the_served_blocks() {
         let rpc = Rpc::with(fake_chain(1..=3, 7));
@@ -1243,7 +1648,7 @@ mod tests {
         // The RPC chain now differs from block 1 on, which was the first block served.
         rpc.set(fake_chain(1..=3, 8));
         let err = source.get_payload_by_number(3).await.unwrap_err();
-        assert!(matches!(err, RemoteL2ClientError::ReorgRepair { block: 3, .. }), "{err:?}");
+        assert!(matches!(err, RemoteL2ClientError::ReorgTooDeep { block: 3, .. }), "{err:?}");
         assert!(replaced.lock().unwrap().is_empty());
     }
 
@@ -1411,7 +1816,7 @@ mod tests {
             info_of(&canonical[1]),
             info_of(&fork3),
         ]);
-        source.seed_local_chain(&local, info_of(&fork3)).await;
+        source.seed_local_chain(&local, info_of(&fork3), &CancellationToken::new()).await;
 
         let p4 = source.get_payload_by_number(4).await.unwrap();
         assert_eq!(served_hash(&p4), canonical[3].execution_payload.block_hash());
@@ -1437,7 +1842,7 @@ mod tests {
             .expect_block_info()
             .times(1)
             .returning(|tag| Err(FollowError::LocalBlockUnavailable(tag)));
-        source.seed_local_chain(&local, info_of(&fork3)).await;
+        source.seed_local_chain(&local, info_of(&fork3), &CancellationToken::new()).await;
 
         // The start block and its parent hash still allow a depth-1 repair.
         let p4 = source.get_payload_by_number(4).await.unwrap();
@@ -1454,13 +1859,57 @@ mod tests {
         // No expectations: any engine call panics.
         let source = primary(&rpc, &cache).with_repair_engine(Arc::new(MockFollowEngine::new()));
         let local = local_chain(canonical[..3].iter().map(info_of).collect());
-        source.seed_local_chain(&local, info_of(&canonical[2])).await;
+        source.seed_local_chain(&local, info_of(&canonical[2]), &CancellationToken::new()).await;
         let p4 = source.get_payload_by_number(4).await.unwrap();
         assert_eq!(served_hash(&p4), canonical[3].execution_payload.block_hash());
         assert_eq!(rpc.calls(), vec![4]);
 
         // Shadow never reads the local chain (no expectations: a call panics).
         let shadow = GossipFirstClient::new(rpc.client(), cache, FollowP2pMode::Shadow);
-        shadow.seed_local_chain(&MockFollowLocalClient::new(), info_of(&canonical[2])).await;
+        shadow
+            .seed_local_chain(
+                &MockFollowLocalClient::new(),
+                info_of(&canonical[2]),
+                &CancellationToken::new(),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn confirmation_task_confirms_served_gossip_and_stops_on_cancellation() {
+        let rpc = Rpc::with(fake_chain(1..=3, 7));
+        let cache = Arc::new(GossipPayloadCache::default());
+        let source = Arc::new(primary(&rpc, &cache));
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(Arc::clone(&source).run_confirmations(cancellation.clone()));
+        source.get_payload_by_number(1).await.unwrap();
+        for n in 2..=3 {
+            cache.insert(payload(n, 7, 7), Instant::now());
+            source.get_payload_by_number(n).await.unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while source.lock_state().unconfirmed_run() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(source.lock_state().unconfirmed_run(), 0);
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn seeding_stops_on_cancellation() {
+        let rpc = Rpc::with(fake_chain(1..=2, 7));
+        let source = primary(&rpc, &Arc::new(GossipPayloadCache::default()));
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        // No expectations: a local read panics.
+        source
+            .seed_local_chain(
+                &MockFollowLocalClient::new(),
+                info_of(&payload(1, 7, 7)),
+                &cancellation,
+            )
+            .await;
+        assert!(source.lock_state().last().is_none());
     }
 }

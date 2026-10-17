@@ -37,7 +37,9 @@ base_metrics::define_metrics! {
             "retry",
             "hash_mismatch",
             "rpc_parent_mismatch",
-            "reorg"
+            "reorg",
+            "rpc_disagrees",
+            "unconfirmed_run"
         ]
     )]
     follow_p2p_fallback_total: counter,
@@ -52,7 +54,10 @@ base_metrics::define_metrics! {
             "discontinuous",
             "engine_behind",
             "engine_unexpected",
-            "engine_error"
+            "engine_error",
+            "engine_timeout",
+            "below_safe",
+            "rpc_unstable"
         ]
     )]
     follow_p2p_reorg_repair_failed_total: counter,

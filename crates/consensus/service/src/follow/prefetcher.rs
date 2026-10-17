@@ -101,7 +101,13 @@ where
                 }
                 Err(e) => {
                     consecutive_payload_failures += 1;
-                    let unavailable = matches!(e, RemoteL2ClientError::BlockNotFound(_));
+                    // A repair waiting for the insert loop is as transient as a block that is
+                    // not on the source yet.
+                    let unavailable = matches!(
+                        e,
+                        RemoteL2ClientError::BlockNotFound(_)
+                            | RemoteL2ClientError::EngineBehind { .. }
+                    );
                     let backoff = if unavailable {
                         // An announced block may briefly be absent on another source backend.
                         // Retry that race promptly, then return to the ordinary polling bound.
