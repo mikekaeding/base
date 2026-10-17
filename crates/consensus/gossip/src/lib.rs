@@ -52,6 +52,12 @@ pub use event::Event;
 mod handler;
 pub use handler::{BlockHandler, Handler};
 
+mod static_peers;
+pub use static_peers::{
+    STATIC_PEER_INITIAL_BACKOFF, STATIC_PEER_MAX_BACKOFF, STATIC_PEER_STABLE_CONNECTION,
+    StaticPeerParseError, StaticPeers, chain_bootnode_static_peers, parse_static_peer,
+};
+
 mod driver;
 pub use driver::{GossipDriver, GossipDriverConfig};
 

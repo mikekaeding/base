@@ -45,6 +45,8 @@ pub struct GossipDriverBuilder {
     max_identify_peerstore_peers: NonZeroUsize,
     /// Topic scoring. Disabled by default.
     topic_scoring: bool,
+    /// Static peers to keep connected. Empty by default.
+    static_peers: Vec<Multiaddr>,
 }
 
 impl GossipDriverBuilder {
@@ -70,7 +72,14 @@ impl GossipDriverBuilder {
             max_identify_peerstore_peers: DEFAULT_MAX_IDENTIFY_PEERSTORE_PEERS,
             rollup_config,
             topic_scoring: false,
+            static_peers: Vec::new(),
         }
+    }
+
+    /// Sets the static peers to keep connected (multiaddrs ending in `/p2p/<peer-id>`).
+    pub fn with_static_peers(mut self, static_peers: Vec<Multiaddr>) -> Self {
+        self.static_peers = static_peers;
+        self
     }
 
     /// Sets the configuration for the connection gater.
@@ -273,6 +282,7 @@ impl GossipDriverBuilder {
                     max_identify_peerstore_peers,
                     peer_monitoring: self.peer_monitoring,
                     connection_limits_config,
+                    static_peers: self.static_peers,
                 },
             ),
             signer_tx,
@@ -283,8 +293,10 @@ impl GossipDriverBuilder {
 #[cfg(test)]
 mod tests {
     use alloy_chains::Chain;
+    use libp2p::PeerId;
 
     use super::*;
+    use crate::ConnectionGate;
 
     fn test_builder() -> GossipDriverBuilder {
         let rollup_config = RollupConfig {
@@ -312,6 +324,32 @@ mod tests {
         let configured = driver.peer_monitoring.expect("peer_monitoring should be wired through");
         assert_eq!(configured.ban_threshold, -100.0);
         assert_eq!(configured.ban_duration, Duration::from_secs(60 * 60));
+    }
+
+    #[tokio::test]
+    async fn build_without_static_peers_leaves_default_path() {
+        let (driver, _signer_tx) = test_builder().build().unwrap();
+        assert!(driver.static_peers.is_none());
+        assert!(driver.connection_gate.protected_peers.is_empty());
+        assert_eq!(driver.static_peers_next_due(), None);
+    }
+
+    #[tokio::test]
+    async fn build_protects_static_peers_and_bypasses_connection_limits() {
+        let static_peer = PeerId::random();
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/1/p2p/{static_peer}").parse().unwrap();
+
+        let (driver, _signer_tx) =
+            test_builder().with_static_peers(vec![addr.clone()]).build().unwrap();
+
+        let static_peers = driver.static_peers.as_ref().expect("static peers configured");
+        assert_eq!(static_peers.len(), 1);
+        assert!(driver.is_static_peer(&static_peer));
+        assert!(driver.connection_gate.protected_peers.contains(&static_peer));
+        assert!(!driver.connection_gate.can_disconnect(&addr));
+        assert!(driver.swarm.behaviour().connection_limits.is_bypassed(&static_peer));
+        assert!(!driver.swarm.behaviour().connection_limits.is_bypassed(&PeerId::random()));
+        assert!(driver.static_peers_next_due().is_some(), "dialed at start");
     }
 
     #[tokio::test]

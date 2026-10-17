@@ -700,6 +700,52 @@ mod tests {
     }
 
     #[test]
+    fn test_protected_peer_bypasses_dial_threshold_and_disconnect() {
+        let mut gater = ConnectionGater::new(GaterConfig {
+            peer_redialing: None,
+            dial_period: Duration::from_secs(60 * 60),
+            ..GaterConfig::default()
+        });
+        let protected =
+            Multiaddr::from_str(&format!("/ip4/127.0.0.1/tcp/1/p2p/{}", PeerId::random())).unwrap();
+        let unprotected =
+            Multiaddr::from_str(&format!("/ip4/127.0.0.1/tcp/2/p2p/{}", PeerId::random())).unwrap();
+        gater.protect_peer(ConnectionGater::peer_id_from_addr(&protected).unwrap());
+
+        for addr in [&protected, &unprotected] {
+            assert!(gater.can_connect_outbound(addr).is_ok());
+            gater.dialing(addr);
+            gater.dialed(addr);
+            gater.remove_dial(&ConnectionGater::peer_id_from_addr(addr).unwrap());
+        }
+
+        // Redialing is disabled, so only the protected peer may be dialed again.
+        assert!(matches!(
+            gater.can_connect_outbound(&unprotected),
+            Err(ConnectionError::ThresholdReached { .. })
+        ));
+        for _ in 0..10 {
+            assert!(gater.can_connect_outbound(&protected).is_ok());
+            gater.dialed(&protected);
+        }
+        assert!(!gater.can_disconnect(&protected));
+        assert!(gater.can_disconnect(&unprotected));
+
+        // Protection does not override blocking or concurrent-dial checks.
+        gater.dialing(&protected);
+        assert!(matches!(
+            gater.can_connect_outbound(&protected),
+            Err(ConnectionError::AlreadyDialing { .. })
+        ));
+        gater.remove_dial(&ConnectionGater::peer_id_from_addr(&protected).unwrap());
+        gater.block_peer(&ConnectionGater::peer_id_from_addr(&protected).unwrap());
+        assert!(matches!(
+            gater.can_connect_outbound(&protected),
+            Err(ConnectionError::PeerBlocked { .. })
+        ));
+    }
+
+    #[test]
     fn test_peer_redialing_zero_allows_unlimited_redials() {
         let mut gater = ConnectionGater::new(GaterConfig {
             peer_redialing: Some(0),

@@ -16,6 +16,7 @@ use discv5::Enr;
 use futures::{AsyncWriteExt, stream::StreamExt};
 use libp2p::{
     Multiaddr, PeerId, Swarm, TransportError,
+    core::ConnectedPoint,
     gossipsub::{IdentTopic, MessageId},
     swarm::{
         SwarmEvent,
@@ -29,7 +30,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     Behaviour, BlockHandler, ConnectionGate, ConnectionGater, ConnectionLimitsConfig, Event,
-    GossipDriverBuilder, Handler, Metrics, PublishError,
+    GossipDriverBuilder, Handler, Metrics, PublishError, StaticPeers,
 };
 
 /// Configuration applied when constructing a [`GossipDriver`].
@@ -41,6 +42,8 @@ pub struct GossipDriverConfig {
     pub peer_monitoring: Option<PeerMonitoring>,
     /// The configured libp2p connection limits enforced by the swarm.
     pub connection_limits_config: ConnectionLimitsConfig,
+    /// Static peers to keep connected. Empty disables the feature.
+    pub static_peers: Vec<Multiaddr>,
 }
 
 /// A driver for a [`Swarm`] instance.
@@ -80,6 +83,9 @@ pub struct GossipDriver<G: ConnectionGate> {
     pub connection_limits_config: ConnectionLimitsConfig,
     /// Tracks ping times for peers.
     pub ping: Arc<Mutex<HashMap<PeerId, Duration>>>,
+    /// Static peers kept connected with a bounded redial backoff. `None` when none are
+    /// configured, which leaves every connection path unchanged.
+    pub static_peers: Option<StaticPeers>,
 }
 
 impl<G> GossipDriver<G>
@@ -98,14 +104,26 @@ where
 
     /// Creates a new [`GossipDriver`] instance.
     pub fn new(
-        swarm: Swarm<Behaviour>,
+        mut swarm: Swarm<Behaviour>,
         addr: Multiaddr,
         handler: BlockHandler,
         sync_handler: libp2p_stream::Control,
         sync_protocol: IncomingStreams,
-        gate: G,
+        mut gate: G,
         config: GossipDriverConfig,
     ) -> Self {
+        let static_peers = (!config.static_peers.is_empty()).then(|| {
+            let static_peers = StaticPeers::new(config.static_peers);
+            for peer_id in static_peers.peer_ids() {
+                // No dial thresholds or redial limits, and not disconnectable via the gate.
+                gate.protect_peer(*peer_id);
+                // Never refused by our own connection limits; bypassed connections are also not
+                // counted against them.
+                swarm.behaviour_mut().connection_limits.bypass_peer_id(peer_id);
+            }
+            info!(target: "gossip", count = static_peers.len(), "Configured static peers");
+            static_peers
+        });
         Self {
             swarm,
             addr,
@@ -118,6 +136,67 @@ where
             connection_gate: gate,
             connection_limits_config: config.connection_limits_config,
             ping: Arc::new(Mutex::new(Default::default())),
+            static_peers,
+        }
+    }
+
+    /// Returns true if `peer_id` is a configured static peer.
+    pub fn is_static_peer(&self, peer_id: &PeerId) -> bool {
+        self.static_peers.as_ref().is_some_and(|peers| peers.contains(peer_id))
+    }
+
+    /// Returns when the next static peer dial is due, if any static peer is disconnected.
+    pub fn static_peers_next_due(&self) -> Option<tokio::time::Instant> {
+        self.static_peers.as_ref().and_then(StaticPeers::next_due)
+    }
+
+    /// Dials every disconnected static peer whose redial backoff has elapsed.
+    pub fn dial_due_static_peers(&mut self) {
+        let Some(static_peers) = self.static_peers.as_mut() else {
+            return;
+        };
+        for addr in static_peers.take_due(tokio::time::Instant::now()) {
+            debug!(target: "gossip", %addr, "Dialing static peer");
+            self.dial_multiaddr(addr);
+        }
+    }
+
+    fn on_static_peer_connected(&mut self, peer_id: PeerId, endpoint: &ConnectedPoint) {
+        let Some(static_peers) = self.static_peers.as_mut() else {
+            return;
+        };
+        if static_peers.on_connected(&peer_id, tokio::time::Instant::now()) {
+            info!(
+                target: "gossip",
+                peer_id = %peer_id,
+                remote = %endpoint.get_remote_address(),
+                inbound = endpoint.is_listener(),
+                connected = static_peers.connected(),
+                configured = static_peers.len(),
+                "Static peer connected"
+            );
+        }
+    }
+
+    fn on_static_peer_disconnected(
+        &mut self,
+        peer_id: PeerId,
+        cause: Option<&libp2p::swarm::ConnectionError>,
+    ) {
+        let Some(static_peers) = self.static_peers.as_mut() else {
+            return;
+        };
+        if let Some(redial_in) = static_peers.on_disconnected(&peer_id, tokio::time::Instant::now())
+        {
+            info!(
+                target: "gossip",
+                peer_id = %peer_id,
+                cause = ?cause,
+                redial_in_secs = redial_in.as_secs(),
+                connected = static_peers.connected(),
+                configured = static_peers.len(),
+                "Static peer disconnected"
+            );
         }
     }
 
@@ -292,6 +371,15 @@ where
             Metrics::dial_peer_error("invalid_enr").increment(1.0);
             return;
         };
+        if self.static_peers.is_some()
+            && ConnectionGater::peer_id_from_addr(&multiaddr)
+                .is_some_and(|peer_id| self.is_static_peer(&peer_id))
+        {
+            // Static peers bypass the gate's redial limits, so leave their dials to the static
+            // peer backoff instead of redialing on every discovery hit.
+            trace!(target: "gossip", %multiaddr, "Discovered static peer; dialed by its own schedule");
+            return;
+        }
         self.dial_multiaddr(multiaddr);
     }
 
@@ -486,7 +574,13 @@ where
             SwarmEvent::Behaviour(behavior_event) => {
                 return self.handle_gossip_event(behavior_event);
             }
-            SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established,
+                ..
+            } => {
                 self.connection_gate.remove_dial(&peer_id);
 
                 if endpoint.is_listener() {
@@ -505,12 +599,29 @@ where
                 Metrics::gossip_peer_count().set(peer_count as f64);
 
                 self.peer_connection_start.insert(peer_id, Instant::now());
+
+                if num_established.get() == 1 {
+                    self.on_static_peer_connected(peer_id, &endpoint);
+                }
             }
             SwarmEvent::OutgoingConnectionError { peer_id: _peer_id, error, .. } => {
                 debug!(target: "gossip", error = ?error, "Outgoing connection error");
                 // Remove the peer from current_dials so it can be dialed again
                 if let Some(peer_id) = _peer_id {
                     self.connection_gate.remove_dial(&peer_id);
+                    if let Some(static_peers) = self.static_peers.as_ref()
+                        && let Some(next_dial) = static_peers.next_dial(&peer_id)
+                    {
+                        debug!(
+                            target: "gossip",
+                            peer_id = %peer_id,
+                            error = %error,
+                            redial_in_secs = next_dial
+                                .saturating_duration_since(tokio::time::Instant::now())
+                                .as_secs(),
+                            "Static peer dial failed"
+                        );
+                    }
                 }
                 Metrics::gossipsub_connection("outgoing_error").increment(1.0);
             }
@@ -520,7 +631,7 @@ where
                 debug!(target: "gossip", error = ?error, "Incoming connection error");
                 Metrics::gossipsub_connection("incoming_error").increment(1.0);
             }
-            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. } => {
                 let peer_count = self.swarm.connected_peers().count();
                 debug!(target: "gossip", ?peer_id, ?cause, peer_count, "Connection closed");
                 Metrics::gossipsub_connection("closed").increment(1.0);
@@ -545,6 +656,10 @@ where
                 // If the connection was initiated by us, remove the peer from the current dials
                 // set so that we can dial it again.
                 self.connection_gate.remove_dial(&peer_id);
+
+                if num_established == 0 {
+                    self.on_static_peer_disconnected(peer_id, cause.as_ref());
+                }
             }
             SwarmEvent::NewListenAddr { listener_id, address } => {
                 debug!(target: "gossip", reporter_id = ?listener_id, new_address = ?address, "New listen address");
@@ -583,6 +698,12 @@ mod tests {
     use super::*;
 
     fn test_driver() -> GossipDriver<ConnectionGater> {
+        test_driver_with_static_peers(Vec::new())
+    }
+
+    fn test_driver_with_static_peers(
+        static_peers: Vec<Multiaddr>,
+    ) -> GossipDriver<ConnectionGater> {
         let rollup_config = RollupConfig {
             l2_chain_id: Chain::base_mainnet(),
             block_time: 2,
@@ -595,10 +716,86 @@ mod tests {
             "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
             Keypair::generate_secp256k1(),
         )
+        .with_static_peers(static_peers)
         .build()
         .unwrap();
 
         driver
+    }
+
+    /// Drives both swarms until `done(dialer)` holds or 5 s pass.
+    async fn drive_until(
+        dialer: &mut GossipDriver<ConnectionGater>,
+        listener: &mut GossipDriver<ConnectionGater>,
+        done: impl Fn(&GossipDriver<ConnectionGater>) -> bool,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !done(dialer) && tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                Some(event) = dialer.next() => { dialer.handle_event(event); }
+                Some(event) = listener.next() => { listener.handle_event(event); }
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn static_peer_is_dialed_at_start_and_redial_scheduled_on_disconnect() {
+        let mut listener = test_driver();
+        let listener_peer_id = *listener.local_peer_id();
+        let mut listener_addr = listener.start().await.unwrap();
+        listener_addr.push(libp2p::multiaddr::Protocol::P2p(listener_peer_id));
+
+        let mut dialer = test_driver_with_static_peers(vec![listener_addr]);
+        let dialer_peer_id = *dialer.local_peer_id();
+        let started = tokio::time::Instant::now();
+        assert!(dialer.static_peers_next_due().is_some_and(|due| due <= started));
+
+        dialer.dial_due_static_peers();
+        assert!(dialer.connection_gate.current_dials.contains_key(&listener_peer_id));
+        drive_until(&mut dialer, &mut listener, |d| {
+            d.static_peers.as_ref().unwrap().connected() == 1
+        })
+        .await;
+        assert_eq!(dialer.static_peers.as_ref().unwrap().connected(), 1);
+        assert_eq!(dialer.static_peers_next_due(), None, "connected static peers are not redialed");
+
+        // The remote drops us: a redial is scheduled after the grown backoff (10 s after the
+        // first dial), not immediately.
+        let _ = listener.swarm.disconnect_peer_id(dialer_peer_id);
+        drive_until(&mut dialer, &mut listener, |d| {
+            d.static_peers.as_ref().unwrap().connected() == 0
+        })
+        .await;
+        assert_eq!(dialer.static_peers.as_ref().unwrap().connected(), 0);
+        let due = dialer.static_peers_next_due().expect("redial scheduled");
+        let now = tokio::time::Instant::now();
+        assert!(due > now + Duration::from_secs(5) && due <= now + Duration::from_secs(10));
+        dialer.dial_due_static_peers();
+        assert!(
+            !dialer.connection_gate.current_dials.contains_key(&listener_peer_id),
+            "not redialed before the backoff elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_does_not_dial_static_peers() {
+        use base_consensus_peers::BaseEnr;
+        let key = discv5::enr::CombinedKey::generate_secp256k1();
+        let mut enr =
+            Enr::builder().ip4(std::net::Ipv4Addr::LOCALHOST).tcp4(1).build(&key).unwrap();
+        let opstack = alloy_rlp::encode(BaseEnr::from_chain_id(8453));
+        enr.insert_raw_rlp(BaseEnr::OPSTACK_ENR_KEY, opstack.into(), &key).unwrap();
+        let addr = PeerUtils::enr_to_multiaddr(&enr).unwrap();
+        let peer_id = ConnectionGater::peer_id_from_addr(&addr).unwrap();
+
+        let mut plain = test_driver();
+        plain.dial(enr.clone());
+        assert!(plain.connection_gate.current_dials.contains_key(&peer_id));
+
+        let mut with_static = test_driver_with_static_peers(vec![addr]);
+        with_static.dial(enr);
+        assert!(!with_static.connection_gate.current_dials.contains_key(&peer_id));
     }
 
     #[tokio::test]

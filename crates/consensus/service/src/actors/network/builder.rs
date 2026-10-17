@@ -55,6 +55,7 @@ impl From<NetworkConfig> for NetworkBuilder {
         .with_gater_config(config.gater_config)
         .with_connection_limits_config(config.connection_limits_config)
         .with_max_identify_peerstore_peers(config.max_identify_peerstore_peers)
+        .with_static_peers(config.static_peers)
     }
 }
 
@@ -104,6 +105,11 @@ impl NetworkBuilder {
     /// Sets the maximum number of peers to retain identify metadata for.
     pub fn with_max_identify_peerstore_peers(self, max_peers: NonZeroUsize) -> Self {
         Self { gossip: self.gossip.with_max_identify_peerstore_peers(max_peers), ..self }
+    }
+
+    /// Sets the static peers to keep connected.
+    pub fn with_static_peers(self, static_peers: Vec<Multiaddr>) -> Self {
+        Self { gossip: self.gossip.with_static_peers(static_peers), ..self }
     }
 
     /// Sets the signer for the [`NetworkBuilder`].

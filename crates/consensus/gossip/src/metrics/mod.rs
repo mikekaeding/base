@@ -85,6 +85,13 @@ base_metrics::define_metrics! {
     )]
     rpc_calls: gauge,
 
+    #[describe("Whether each configured static peer is connected (1) or not (0)")]
+    #[label(name = "peer")]
+    static_peer_connected: gauge,
+
+    #[describe("Number of configured static peers that are connected")]
+    static_peers_connected: gauge,
+
     #[describe("Number of peers banned by the gossip stack")]
     banned_peers: gauge,
 

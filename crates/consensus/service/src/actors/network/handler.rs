@@ -60,7 +60,8 @@ impl NetworkHandler {
                 // Record the peer score in the metrics.
                 Metrics::peer_scores().record(score);
 
-                if score < ban_peers.ban_threshold {
+                // Operator-configured static peers are never banned or disconnected for score.
+                if score < ban_peers.ban_threshold && !self.gossip.is_static_peer(peer_id) {
                     return Some(*peer_id);
                 }
 
@@ -112,6 +113,14 @@ impl NetworkHandler {
     }
 }
 
+/// Sleeps until `due`, or forever if there is none.
+async fn sleep_until_due(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(due) => tokio::time::sleep_until(due).await,
+        None => std::future::pending().await,
+    }
+}
+
 #[async_trait]
 impl GossipTransport for NetworkHandler {
     type Error = NetworkActorError;
@@ -148,6 +157,8 @@ impl GossipTransport for NetworkHandler {
     async fn next_unsafe_block(&mut self) -> Option<NetworkPayloadEnvelope> {
         loop {
             let has_peer_monitoring = self.gossip.peer_monitoring.as_ref().is_some();
+            // `None` unless static peers are configured and one is disconnected.
+            let static_peer_dial_due = self.gossip.static_peers_next_due();
             select! {
                 event = self.gossip.next() => {
                     let event = event?;
@@ -167,6 +178,9 @@ impl GossipTransport for NetworkHandler {
                 }
                 _ = self.pending_dial_pruner.tick() => {
                     self.gossip.clear_expired_pending_connections();
+                }
+                _ = sleep_until_due(static_peer_dial_due), if static_peer_dial_due.is_some() => {
+                    self.gossip.dial_due_static_peers();
                 }
             }
         }

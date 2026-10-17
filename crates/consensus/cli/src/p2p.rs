@@ -250,6 +250,23 @@ pub struct P2PNetworkArgs {
     )]
     pub bootnodes_file: Option<PathBuf>,
 
+    /// Static peers to dial at start-up and keep connected: comma-separated libp2p multiaddrs
+    /// ending in `/p2p/<peer-id>` and/or ENRs (`enr:-...`).
+    ///
+    /// Static peers are protected from dial thresholds, redial limits, score bans, and the
+    /// libp2p connection limits (so they may exceed `--p2p.peers.hi`), and are redialed after a
+    /// disconnect with a backoff of 5 s doubling to 5 min.
+    #[arg(long = "p2p.static-peers", value_delimiter = ',', env = "BASE_NODE_P2P_STATIC_PEERS")]
+    pub static_peers: Vec<String>,
+
+    /// Also keep the chain's built-in consensus bootnodes connected as static peers.
+    #[arg(
+        long = "p2p.static-bootnodes",
+        default_value = "false",
+        env = "BASE_NODE_P2P_STATIC_BOOTNODES"
+    )]
+    pub static_bootnodes: bool,
+
     /// Optionally enable topic scoring.
     ///
     /// Topic scoring is a mechanism to score peers based on their behavior in the gossip network.
@@ -714,6 +731,8 @@ impl P2PArgs {
             .collect::<Result<Vec<BootNode>>>()?
             .into();
 
+        let static_peers = self.static_peer_addrs(l2_chain_id)?;
+
         let bootstore =
             if self.disable_bootstore {
                 None
@@ -749,6 +768,7 @@ impl P2PArgs {
             },
             max_identify_peerstore_peers: self.identify_peerstore_size,
             bootnodes,
+            static_peers,
             rollup_config: config.clone(),
             gossip_signer: self.signer.config(l2_chain_id)?,
         })
@@ -779,6 +799,38 @@ impl P2PArgs {
         };
 
         base_consensus_peers::SecretKeyLoader::load(key_path).map_err(|e| eyre::eyre!(e))
+    }
+
+    /// Returns the configured static peers as dialable multiaddrs, de-duplicated by peer id:
+    /// `--p2p.static-peers` first, then the chain's consensus bootnodes if
+    /// `--p2p.static-bootnodes` is set.
+    pub fn static_peer_addrs(&self, l2_chain_id: u64) -> Result<Vec<libp2p::Multiaddr>> {
+        let mut addrs = self
+            .static_peers
+            .iter()
+            .map(|raw| raw.trim())
+            .filter(|raw| !raw.is_empty())
+            .map(|raw| {
+                base_consensus_gossip::parse_static_peer(raw)
+                    .map_err(|e| eyre::eyre!("Failed to parse static peer: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if self.static_bootnodes {
+            let bootnodes = base_consensus_gossip::chain_bootnode_static_peers(l2_chain_id);
+            if bootnodes.is_empty() {
+                warn!(target: "p2p::flags", l2_chain_id, "--p2p.static-bootnodes: chain has no built-in consensus bootnodes");
+            }
+            addrs.extend(bootnodes);
+        }
+        let mut seen = std::collections::HashSet::new();
+        addrs.retain(|addr| {
+            base_consensus_gossip::ConnectionGater::peer_id_from_addr(addr)
+                .is_some_and(|peer_id| seen.insert(peer_id))
+        });
+        if !addrs.is_empty() {
+            info!(target: "p2p::flags", count = addrs.len(), peers = ?addrs.iter().map(ToString::to_string).collect::<Vec<_>>(), "Configured static peers");
+        }
+        Ok(addrs)
     }
 
     fn bootnode_strings(&self) -> Result<Vec<String>> {
@@ -1290,6 +1342,93 @@ mod tests {
 
         assert_eq!(enr.tcp4(), Some(expected_tcp));
         assert_eq!(enr.udp4(), Some(expected_udp));
+    }
+
+    const MAINNET_BOOTNODE_ADDRS: [&str; 5] = [
+        "/ip4/3.231.138.188/tcp/9222/p2p/16Uiu2HAm4wN4epAyuj82ix2QC1Uc2vQd833szwvsNpLqhubPz8xa",
+        "/ip4/184.72.129.189/tcp/9222/p2p/16Uiu2HAm3qwgs4Bvfx1GJ5qnY4LjPbYCc394kvdjpxuJBsP3SQnW",
+        "/ip4/3.220.145.177/tcp/9222/p2p/16Uiu2HAm31LCBALXkJfNGmK1tVkgzQDw9QQoNcFznzBBCYUPUhAD",
+        "/ip4/3.231.11.52/tcp/9222/p2p/16Uiu2HAkvLBTPqfA9HHXgnLUQiEJg7EKPb7gu7qMXfJFS79Goy3b",
+        "/ip4/54.198.153.150/tcp/9222/p2p/16Uiu2HAkwSnpTCP4f1ttHa2hKgiwZaa8TFJYWHtNNhYbqKwaYMRu",
+    ];
+
+    fn static_peer_strings(args: &MockCommand, chain_id: u64) -> Vec<String> {
+        args.p2p.static_peer_addrs(chain_id).unwrap().iter().map(ToString::to_string).collect()
+    }
+
+    #[tokio::test]
+    async fn test_p2p_config_static_peers_default_off() {
+        let args = MockCommand::parse_from(["test"]);
+        assert!(args.p2p.static_peers.is_empty());
+        assert!(!args.p2p.static_bootnodes);
+
+        let config = args
+            .p2p
+            .config(&RollupConfig::default(), 8453, None, L1_RPC_TIMEOUT, Some(Address::ZERO))
+            .await
+            .unwrap();
+        assert!(config.static_peers.is_empty());
+    }
+
+    #[test]
+    fn test_p2p_static_peers_parse_multiaddrs_and_enrs() {
+        let enr = base_common_chains::ChainConfig::mainnet().bootnodes.consensus[0];
+        let multiaddr =
+            "/ip4/192.0.2.7/tcp/9222/p2p/16Uiu2HAkvLBTPqfA9HHXgnLUQiEJg7EKPb7gu7qMXfJFS79Goy3b";
+        let list = format!("{multiaddr}, {enr}");
+        let args = MockCommand::parse_from(["test", "--p2p.static-peers", &list]);
+        assert_eq!(args.p2p.static_peers.len(), 2);
+        assert_eq!(static_peer_strings(&args, 8453), [multiaddr, MAINNET_BOOTNODE_ADDRS[0]]);
+    }
+
+    #[test]
+    fn test_p2p_static_bootnodes_expand_base_mainnet() {
+        let args = MockCommand::parse_from(["test", "--p2p.static-bootnodes"]);
+        assert!(args.p2p.static_bootnodes);
+        assert_eq!(static_peer_strings(&args, 8453), MAINNET_BOOTNODE_ADDRS);
+        assert!(static_peer_strings(&args, 0).is_empty(), "unknown chains have no bootnodes");
+    }
+
+    #[test]
+    fn test_p2p_static_peers_dedupe_by_peer_id() {
+        // The explicit address wins over the bootnode with the same peer id.
+        let explicit =
+            "/ip4/192.0.2.9/tcp/9333/p2p/16Uiu2HAm4wN4epAyuj82ix2QC1Uc2vQd833szwvsNpLqhubPz8xa";
+        let args = MockCommand::parse_from([
+            "test",
+            "--p2p.static-peers",
+            explicit,
+            "--p2p.static-bootnodes",
+        ]);
+        let got = static_peer_strings(&args, 8453);
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[0], explicit);
+        assert_eq!(got[1..], MAINNET_BOOTNODE_ADDRS[1..]);
+    }
+
+    #[tokio::test]
+    async fn test_p2p_config_rejects_invalid_static_peer() {
+        let args =
+            MockCommand::parse_from(["test", "--p2p.static-peers", "/ip4/192.0.2.7/tcp/9222"]);
+        let err = args
+            .p2p
+            .config(&RollupConfig::default(), 8453, None, L1_RPC_TIMEOUT, Some(Address::ZERO))
+            .await
+            .expect_err("static peer without a peer id should fail config")
+            .to_string();
+        assert!(err.contains("Failed to parse static peer"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_p2p_config_wires_static_bootnodes() {
+        let args = MockCommand::parse_from(["test", "--p2p.static-bootnodes"]);
+        let config = args
+            .p2p
+            .config(&RollupConfig::default(), 8453, None, L1_RPC_TIMEOUT, Some(Address::ZERO))
+            .await
+            .unwrap();
+        let got: Vec<String> = config.static_peers.iter().map(ToString::to_string).collect();
+        assert_eq!(got, MAINNET_BOOTNODE_ADDRS);
     }
 
     #[tokio::test]

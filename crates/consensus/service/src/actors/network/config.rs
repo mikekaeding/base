@@ -49,6 +49,9 @@ pub struct NetworkConfig {
     pub max_identify_peerstore_peers: NonZeroUsize,
     /// An optional list of bootnode ENRs to start the node with.
     pub bootnodes: BootNodes,
+    /// Static peers (multiaddrs ending in `/p2p/<peer-id>`) to keep connected. Empty disables
+    /// the feature.
+    pub static_peers: Vec<Multiaddr>,
     /// The [`RollupConfig`].
     pub rollup_config: RollupConfig,
     /// A signer for gossip payloads.
@@ -94,6 +97,7 @@ impl NetworkConfig {
             enr_update: true,
             keypair: Keypair::generate_secp256k1(),
             bootnodes: Default::default(),
+            static_peers: Default::default(),
             bootstore: Default::default(),
             gater_config: Default::default(),
             connection_limits_config: Default::default(),

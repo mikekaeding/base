@@ -859,6 +859,119 @@ mod tests {
         assert!(first.is_some(), "no validated gossip block within {secs} s");
     }
 
+    /// Live: keeps the Base mainnet consensus bootnodes as static peers (`--p2p.static-bootnodes`)
+    /// and reports whether they accept us and stay connected. Run with
+    /// `BASE_FOLLOW_P2P_LIVE=1 cargo test -p base-consensus-cli --lib live_mainnet_static_bootnodes -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "joins the Base mainnet P2P network"]
+    async fn live_mainnet_static_bootnodes_stay_connected() {
+        use base_consensus_node::GossipTransport;
+        if std::env::var("BASE_FOLLOW_P2P_LIVE").is_err() {
+            return;
+        }
+        let port = std::env::var("BASE_FOLLOW_P2P_LIVE_PORT").unwrap_or_else(|_| "19224".into());
+        let secs: u64 = std::env::var("BASE_FOLLOW_P2P_LIVE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        let key = std::env::temp_dir().join(format!("follow-p2p-static-live-{port}.key"));
+        let config = Command::parse_from([
+            "test",
+            "--source-l2-rpc",
+            "https://base-rpc.publicnode.com",
+            "--l2-engine-rpc",
+            "http://localhost:8551",
+            "--l1-beacon",
+            "http://localhost:5052",
+            "--l1-eth-rpc",
+            "https://ethereum-rpc.publicnode.com",
+            "--follow.p2p",
+            "shadow",
+            "--p2p.listen.tcp",
+            &port,
+            "--p2p.listen.udp",
+            &port,
+            "--p2p.priv.path",
+            key.to_str().unwrap(),
+            "--p2p.no-bootstore",
+            "--p2p.static-bootnodes",
+        ])
+        .args;
+        let args = ConsensusFollowNodeArgs::new(
+            ConsensusChainArgs { l2_chain_id: Chain::from(8453_u64) },
+            config,
+        );
+        let cfg = args.load_rollup_config().unwrap();
+        let (network, _lookup) = args.p2p_network(&cfg).await.expect("p2p network config");
+        let mut handler =
+            network.build().expect("network builds").start().await.expect("network starts");
+        let static_ids: Vec<libp2p::PeerId> = handler
+            .gossip
+            .static_peers
+            .as_ref()
+            .expect("static bootnodes")
+            .peer_ids()
+            .copied()
+            .collect();
+        assert_eq!(static_ids.len(), 5);
+
+        let started = tokio::time::Instant::now();
+        let end = started + Duration::from_secs(secs);
+        let mut blocks = 0_u64;
+        let mut ever_connected = std::collections::HashSet::new();
+        let mut connected_samples = 0_u64;
+        let mut samples = 0_u64;
+        let mut next_report = started + Duration::from_secs(10);
+        while tokio::time::Instant::now() < end {
+            if let Ok(Some(_)) =
+                tokio::time::timeout_at(next_report.min(end), handler.next_unsafe_block()).await
+            {
+                blocks += 1;
+            }
+            if tokio::time::Instant::now() < next_report {
+                continue;
+            }
+            next_report += Duration::from_secs(10);
+            let statics = handler.gossip.static_peers.as_ref().unwrap();
+            let mesh: std::collections::HashSet<_> =
+                handler.gossip.swarm.behaviour().gossipsub.all_mesh_peers().copied().collect();
+            let pings = handler.gossip.ping.lock().await.clone();
+            let line = static_ids
+                .iter()
+                .map(|id| {
+                    let short = id.to_string();
+                    let short = &short[short.len() - 6..];
+                    if statics.is_connected(id) {
+                        ever_connected.insert(*id);
+                        let rtt = pings.get(id).map(|d| format!("{:.0}ms", d.as_secs_f64() * 1e3));
+                        format!(
+                            "{short}:up{}{}",
+                            if mesh.contains(id) { "+mesh" } else { "" },
+                            rtt.map(|r| format!("/{r}")).unwrap_or_default()
+                        )
+                    } else {
+                        format!("{short}:down")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            samples += 1;
+            connected_samples += statics.connected() as u64;
+            println!(
+                "t={:>4}s static {}/5 peers {} blocks {blocks} | {line}",
+                started.elapsed().as_secs(),
+                statics.connected(),
+                handler.gossip.connected_peers(),
+            );
+        }
+        println!(
+            "static bootnodes ever connected {}/5, mean connected {:.2}, validated gossip blocks {blocks}",
+            ever_connected.len(),
+            connected_samples as f64 / samples.max(1) as f64
+        );
+        assert!(!ever_connected.is_empty(), "no static bootnode accepted us within {secs} s");
+    }
+
     #[test]
     fn rpc_disabled_stays_optional() {
         let config = parse_config(&["--rpc.disabled"]);
