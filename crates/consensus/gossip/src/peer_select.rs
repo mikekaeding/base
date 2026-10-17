@@ -7,10 +7,12 @@
 //! Later copies are dropped by message id inside gossipsub and, with gossipsub v1.2, mostly never
 //! sent at all: our IDONTWANT reaches the other mesh peers first. So the observable per-peer
 //! delivery signal is "did this peer deliver the block first?". For every accepted block each peer
-//! that could have delivered it (in our mesh for that topic, or the source itself) gets one
-//! *eligible* observation, and the source gets one *win*. The delivery score is the EWMA (by block
+//! connected peer gets an *eligible* observation (weight 1 in our mesh for that topic,
+//! [`NON_MESH_WEIGHT`] outside it), and the source gets one *win*. The delivery score is the EWMA (by block
 //! count, `half_life_blocks`) of wins over eligible blocks, shrunk towards an average-peer prior
 //! for peers with few observations, and divided by `1 + recent self-disconnects` (reliability).
+//! The prior, and the probation, shrink with the ping round trip ([`rtt_weight`]): on trader-va
+//! every peer that delivered first was within 20 ms, none 50 ms or more away ever did.
 //! A peer that is in the mesh for a long time and never delivers first is both useless for speed
 //! and our most expensive peer: we forward every block to it.
 //!
@@ -100,7 +102,7 @@ impl Default for PeerSelectConfig {
         Self {
             keep: 8,
             explore: 4,
-            probation: Duration::from_secs(10 * 60),
+            probation: Duration::from_secs(5 * 60),
             interval: Duration::from_secs(60),
             max_prunes: 2,
             cooldown: Duration::from_secs(60 * 60),

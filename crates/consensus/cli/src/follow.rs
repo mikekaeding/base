@@ -42,11 +42,12 @@ pub struct PeerSelectArgs {
     /// Extra slots for new peers on probation.
     #[arg(long = "p2p.select.explore", env = "BASE_NODE_P2P_SELECT_EXPLORE", default_value_t = 4)]
     pub explore: usize,
-    /// Probation of a new peer, in seconds (never pruned for its score meanwhile).
+    /// Probation of a new near peer, in seconds (never pruned for its score meanwhile); far peers
+    /// get a shorter one, down to 60 s.
     #[arg(
         long = "p2p.select.probation-secs",
         env = "BASE_NODE_P2P_SELECT_PROBATION_SECS",
-        default_value_t = 600
+        default_value_t = 300
     )]
     pub probation_secs: u64,
     /// Seconds between selection runs.
