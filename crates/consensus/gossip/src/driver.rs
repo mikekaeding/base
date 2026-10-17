@@ -87,6 +87,9 @@ pub struct GossipDriver<G: ConnectionGate> {
     pub peer_select: Option<PeerSelector>,
     /// Peers this driver disconnected for peer selection and that have not closed yet.
     pub select_pruned: HashSet<PeerId>,
+    /// Peers this driver blocked in the connection gate for a selection cooldown (only these are
+    /// unblocked when it ends; a block set by an operator stays).
+    pub select_blocked: HashSet<PeerId>,
 }
 
 impl<G> GossipDriver<G>
@@ -127,6 +130,7 @@ where
             ping: Arc::new(Mutex::new(Default::default())),
             peer_select: config.peer_select.map(PeerSelector::new),
             select_pruned: HashSet::new(),
+            select_blocked: HashSet::new(),
         }
     }
 
@@ -591,11 +595,18 @@ where
             }
         };
         for peer in &actions.unblock {
-            self.connection_gate.unblock_peer(peer);
+            if self.select_blocked.remove(peer) {
+                self.connection_gate.unblock_peer(peer);
+            }
         }
+        let already_blocked: HashSet<PeerId> =
+            self.connection_gate.list_blocked_peers().into_iter().collect();
         for ((peer, reason), (_, score)) in actions.prune.iter().zip(scores) {
             Metrics::peer_select_actions(reason.as_str()).increment(1);
-            self.connection_gate.block_peer(peer);
+            if !already_blocked.contains(peer) {
+                self.connection_gate.block_peer(peer);
+                self.select_blocked.insert(*peer);
+            }
             if self.swarm.disconnect_peer_id(*peer).is_ok() {
                 self.select_pruned.insert(*peer);
             }
@@ -622,6 +633,7 @@ where
             connected = connected.len(),
             pruned = actions.prune.len(),
             unblocked = actions.unblock.len(),
+            skipped_invalid = actions.skipped_invalid,
             stored = ?stored,
             top = %top.join(" "),
             "Peer selection"
@@ -802,6 +814,76 @@ mod tests {
         }
 
         accept_task.abort();
+    }
+
+    fn driver_with_selection(select: Option<PeerSelectConfig>) -> GossipDriver<ConnectionGater> {
+        let rollup_config = RollupConfig {
+            l2_chain_id: Chain::base_mainnet(),
+            block_time: 2,
+            ..Default::default()
+        };
+        let (driver, _signer) = GossipDriver::<ConnectionGater>::builder(
+            rollup_config,
+            Address::repeat_byte(0x11),
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            Keypair::generate_secp256k1(),
+        )
+        .with_peer_select(select)
+        .build()
+        .unwrap();
+        driver
+    }
+
+    /// Three peers dial one listener. With selection (keep 2, explore 0) the listener keeps two
+    /// and closes the third inbound connection; without it (today's behaviour) all three stay.
+    async fn inbound_kept(select: Option<PeerSelectConfig>) -> usize {
+        let mut listener = driver_with_selection(select);
+        let listener_id = *listener.local_peer_id();
+        let mut addr = listener.start().await.unwrap();
+        addr.push(libp2p::multiaddr::Protocol::P2p(listener_id));
+        let mut dialers: Vec<_> = (0..3).map(|_| test_driver()).collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut dialed = 0;
+        while tokio::time::Instant::now() < deadline {
+            // Dial one at a time, so the listener sees them in turn.
+            if dialed < dialers.len() && listener.connected_peers() == dialed {
+                dialers[dialed].dial_multiaddr(addr.clone());
+                dialed += 1;
+            }
+            let [d0, d1, d2] = &mut dialers[..] else { unreachable!() };
+            tokio::select! {
+                Some(e) = listener.next() => { listener.handle_event(e); }
+                Some(e) = d0.next() => { d0.handle_event(e); }
+                Some(e) = d1.next() => { d1.handle_event(e); }
+                Some(e) = d2.next() => { d2.handle_event(e); }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        listener.connected_peers()
+    }
+
+    #[tokio::test]
+    async fn selection_closes_inbound_beyond_target_and_off_keeps_all() {
+        let select = PeerSelectConfig { keep: 2, explore: 0, ..PeerSelectConfig::default() };
+        assert_eq!(inbound_kept(Some(select)).await, 2);
+        assert_eq!(inbound_kept(None).await, 3);
+    }
+
+    #[tokio::test]
+    async fn selection_run_keeps_operator_blocks_and_running_cooldowns() {
+        let mut driver = driver_with_selection(Some(PeerSelectConfig {
+            keep: 2,
+            explore: 1,
+            ..PeerSelectConfig::default()
+        }));
+        let (ours, operator) = (PeerId::random(), PeerId::random());
+        driver.connection_gate.block_peer(&operator);
+        // Pretend both were pruned: only the one the selector blocked itself is tracked.
+        driver.select_blocked.insert(ours);
+        driver.connection_gate.block_peer(&ours);
+        driver.run_peer_selection();
+        assert!(driver.connection_gate.list_blocked_peers().contains(&operator));
+        assert!(driver.connection_gate.list_blocked_peers().contains(&ours), "cooldown not over");
     }
 
     #[test]

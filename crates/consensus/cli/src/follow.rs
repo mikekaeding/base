@@ -97,13 +97,22 @@ pub struct PeerSelectArgs {
 }
 
 impl Default for PeerSelectArgs {
+    /// The clap defaults, built by hand so they never depend on the environment.
     fn default() -> Self {
-        #[derive(clap::Parser)]
-        struct Wrap {
-            #[command(flatten)]
-            args: PeerSelectArgs,
+        Self {
+            enabled: false,
+            keep: 8,
+            explore: 4,
+            probation_secs: 300,
+            interval_secs: 60,
+            max_prunes: 2,
+            cooldown_secs: 3600,
+            half_life_blocks: 900.0,
+            store: None,
+            store_peers: 8,
+            protect_stored: false,
+            static_peers: Vec::new(),
         }
-        <Wrap as clap::Parser>::parse_from::<[_; 0], &str>([]).args
     }
 }
 

@@ -55,8 +55,17 @@ const FORGET_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 /// Upper bound on the stats table.
 const MAX_TRACKED: usize = 1024;
 
-/// Invalid blocks after which a peer is pruned.
-const INVALID_LIMIT: u32 = 3;
+/// Invalid blocks (decayed) after which a peer is pruned.
+const INVALID_LIMIT: f64 = 3.0;
+
+/// Half-life of the invalid-block count.
+const INVALID_HALF_LIFE: Duration = Duration::from_secs(60 * 60);
+
+/// Cooldown of a peer pruned only because the connection cap was exceeded (never evaluated).
+const EXCESS_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// Upper bound on every configured duration (keeps `Instant` arithmetic far from overflow).
+const MAX_DURATION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Half-life of the self-disconnect count used for reliability.
 const DISCONNECT_HALF_LIFE: Duration = Duration::from_secs(60 * 60);
@@ -126,8 +135,25 @@ impl PeerSelectConfig {
         if self.keep < 2 {
             return Err(format!("peer selection keep must be at least 2, got {}", self.keep));
         }
-        if self.interval.is_zero() {
-            return Err("peer selection interval must be positive".into());
+        if self.interval < Duration::from_secs(1) {
+            return Err("peer selection interval must be at least 1 s".into());
+        }
+        for (name, d) in [
+            ("interval", self.interval),
+            ("probation", self.probation),
+            ("cooldown", self.cooldown),
+        ] {
+            if d > MAX_DURATION {
+                return Err(format!("peer selection {name} must be at most 7 days, got {d:?}"));
+            }
+        }
+        let protected =
+            self.static_peers.len() + if self.protect_stored { self.store_peers } else { 0 };
+        if protected >= self.keep {
+            return Err(format!(
+                "peer selection: {protected} static/protected stored peers leave no room in keep {}",
+                self.keep
+            ));
         }
         if !(self.half_life_blocks.is_finite() && self.half_life_blocks >= 1.0) {
             return Err(format!(
@@ -175,6 +201,9 @@ pub struct SelectActions {
     pub unblock: Vec<PeerId>,
     /// Addresses to dial (static peers that are not connected).
     pub dial: Vec<Multiaddr>,
+    /// Invalid-block prunes skipped because too many peers sent invalid blocks at once (the cause
+    /// is then most likely on our side: clock, signer).
+    pub skipped_invalid: usize,
 }
 
 /// Per-peer delivery statistics.
@@ -192,8 +221,10 @@ pub struct PeerDelivery {
     seq: u64,
     /// Lifetime first deliveries (not decayed; for logs).
     pub total_wins: u64,
-    /// Invalid blocks received from this peer.
-    pub invalid: u32,
+    /// Decayed count of invalid blocks received from this peer.
+    pub invalid: f64,
+    /// When `invalid` was last decayed.
+    invalid_at: Instant,
     /// Decayed count of connections the remote ended early.
     pub disconnects: f64,
     /// When `disconnects` was last decayed.
@@ -215,7 +246,8 @@ impl PeerDelivery {
             eligible: 0.0,
             seq,
             total_wins: 0,
-            invalid: 0,
+            invalid: 0.0,
+            invalid_at: now,
             disconnects: 0.0,
             disconnects_at: now,
             rtt: None,
@@ -231,6 +263,11 @@ impl PeerDelivery {
             self.eligible *= f;
             self.seq = seq;
         }
+    }
+
+    fn decayed_invalid(&self, now: Instant) -> f64 {
+        let age = now.saturating_duration_since(self.invalid_at).as_secs_f64();
+        self.invalid * 0.5f64.powf(age / INVALID_HALF_LIFE.as_secs_f64())
     }
 
     fn decayed_disconnects(&self, now: Instant) -> f64 {
@@ -333,7 +370,8 @@ impl PeerSelector {
     /// Records an invalid block from `peer`.
     pub fn on_invalid(&mut self, peer: PeerId, now: Instant) {
         let p = self.entry(peer, now);
-        p.invalid = p.invalid.saturating_add(1);
+        p.invalid = p.decayed_invalid(now) + 1.0;
+        p.invalid_at = now;
     }
 
     /// Records a new connection. `addr` is the dialed address for outbound connections.
@@ -446,18 +484,30 @@ impl PeerSelector {
                 true
             }
         });
+        // A peer whose cooldown ended starts over on invalid blocks.
+        for peer in &actions.unblock {
+            if let Some(p) = self.peers.get_mut(peer) {
+                p.invalid = 0.0;
+            }
+        }
 
         let connected_set: HashSet<PeerId> = connected.iter().copied().collect();
         let mut pruned: HashSet<PeerId> = HashSet::new();
 
-        // Invalid senders first.
-        for peer in connected {
-            if self.is_protected(peer) {
-                continue;
-            }
-            if self.peers.get(peer).is_some_and(|p| p.invalid >= INVALID_LIMIT) {
-                actions.prune.push((*peer, PruneReason::Invalid));
-                pruned.insert(*peer);
+        // Invalid senders first, at most `max_prunes` per run. When a third or more of the peers
+        // sent invalid blocks the cause is most likely ours (clock, signer): prune none of them.
+        let invalid: Vec<PeerId> = connected
+            .iter()
+            .copied()
+            .filter(|p| !self.is_protected(p))
+            .filter(|p| self.peers.get(p).is_some_and(|s| s.decayed_invalid(now) >= INVALID_LIMIT))
+            .collect();
+        if !invalid.is_empty() && invalid.len() * 3 >= connected.len() {
+            actions.skipped_invalid = invalid.len();
+        } else {
+            for peer in invalid.into_iter().take(self.config.max_prunes) {
+                actions.prune.push((peer, PruneReason::Invalid));
+                pruned.insert(peer);
             }
         }
 
@@ -517,8 +567,12 @@ impl PeerSelector {
             }
         }
 
-        for (peer, _) in &actions.prune {
-            self.cooldown.insert(*peer, now + self.config.cooldown);
+        for (peer, reason) in &actions.prune {
+            let cooldown = match reason {
+                PruneReason::Excess => self.config.cooldown.min(EXCESS_COOLDOWN),
+                _ => self.config.cooldown,
+            };
+            self.cooldown.insert(*peer, now + cooldown);
         }
 
         // Static peers that are not connected.
@@ -580,7 +634,13 @@ impl PeerSelector {
         now: Instant,
     ) -> std::io::Result<Option<usize>> {
         let Some(path) = self.config.store.clone() else { return Ok(None) };
-        if self.stored_at.is_some_and(|t| now.saturating_duration_since(t) < STORE_EVERY) {
+        // The first write waits a full period, so stored peers that reconnect slowly after a
+        // restart are not dropped from the store at once.
+        let Some(at) = self.stored_at else {
+            self.stored_at = Some(now);
+            return Ok(None);
+        };
+        if now.saturating_duration_since(at) < STORE_EVERY {
             return Ok(None);
         }
         let best = self.best(connected, self.config.store_peers, now);
@@ -653,7 +713,7 @@ pub fn read_store(path: &Path) -> Vec<Multiaddr> {
 /// Writes the store atomically (temporary file + rename).
 pub fn write_store(path: &Path, best: &[(Multiaddr, f64, u64)]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    {
+    let written = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         writeln!(
             f,
@@ -663,8 +723,12 @@ pub fn write_store(path: &Path, best: &[(Multiaddr, f64, u64)]) -> std::io::Resu
             writeln!(f, "{addr} {score:.4} {wins}")?;
         }
         f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path)
+    written
 }
 
 /// The `/p2p/<peer id>` of a multiaddr.
@@ -742,6 +806,19 @@ mod tests {
     #[test]
     fn config_validation() {
         assert!(cfg().validate().is_ok());
+        assert!(PeerSelectConfig { interval: Duration::ZERO, ..cfg() }.validate().is_err());
+        assert!(
+            PeerSelectConfig { cooldown: Duration::from_secs(u64::MAX / 4), ..cfg() }
+                .validate()
+                .is_err()
+        );
+        // Protected stored peers must leave room for scored ones.
+        assert!(
+            PeerSelectConfig { protect_stored: true, store_peers: 3, ..cfg() }.validate().is_err()
+        );
+        assert!(
+            PeerSelectConfig { protect_stored: true, store_peers: 2, ..cfg() }.validate().is_ok()
+        );
         assert!(PeerSelectConfig { keep: 1, ..cfg() }.validate().is_err());
         assert!(PeerSelectConfig { half_life_blocks: 0.0, ..cfg() }.validate().is_err());
         let no_id: Multiaddr = "/ip4/1.2.3.4/tcp/9222".parse().unwrap();
@@ -838,6 +915,9 @@ mod tests {
         let pruned: HashSet<PeerId> = a.prune.iter().map(|(p, _)| *p).collect();
         assert_eq!(pruned, peers[5..].iter().copied().collect());
         assert!(a.prune.iter().all(|(_, r)| *r == PruneReason::Excess));
+        // Never evaluated: only a short cooldown.
+        let t = t0 + Duration::from_secs(10) + EXCESS_COOLDOWN + Duration::from_secs(1);
+        assert_eq!(s.select(&peers[..5], t).unblock.len(), 3);
     }
 
     #[test]
@@ -848,18 +928,55 @@ mod tests {
         let st_id = peer_id_of(&st).unwrap();
         let mut s = PeerSelector::new(PeerSelectConfig { static_peers: vec![st.clone()], ..cfg() });
         let bad = PeerId::random();
-        connect_all(&mut s, &[bad, st_id], t0);
-        for _ in 0..INVALID_LIMIT {
+        let good: Vec<PeerId> = (0..3).map(|_| PeerId::random()).collect();
+        let mut all = vec![bad, st_id];
+        all.extend(&good);
+        connect_all(&mut s, &all, t0);
+        for _ in 0..3 {
             s.on_invalid(bad, t0);
             s.on_invalid(st_id, t0);
         }
-        let a = s.select(&[bad, st_id], t0);
+        let a = s.select(&all, t0);
         assert_eq!(a.prune, vec![(bad, PruneReason::Invalid)]);
+        assert_eq!(a.skipped_invalid, 0);
         // Static peer disconnected: redial it.
-        let a = s.select(&[], t0);
+        let a = s.select(&good, t0);
         assert_eq!(a.dial, vec![st]);
         assert!(s.allow_dial(&st_id, 100, 100, t0));
         assert!(s.allow_inbound(&st_id, 100, t0));
+        // After the cooldown the peer starts over: no invalid prune on reconnect.
+        let t1 = t0 + Duration::from_secs(3601);
+        let a = s.select(&good, t1);
+        assert_eq!(a.unblock, vec![bad]);
+        s.on_connected(bad, None, t1);
+        let mut back = good.clone();
+        back.push(bad);
+        assert!(s.select(&back, t1).prune.is_empty());
+    }
+
+    #[test]
+    fn invalid_counts_decay_and_mass_invalids_are_ours() {
+        let t0 = Instant::now();
+        let mut s = PeerSelector::new(cfg());
+        let peers: Vec<PeerId> = (0..6).map(|_| PeerId::random()).collect();
+        connect_all(&mut s, &peers, t0);
+        // Two of six peers (a third) sent invalid blocks at the same time: our clock or signer.
+        for p in &peers[..2] {
+            for _ in 0..3 {
+                s.on_invalid(*p, t0);
+            }
+        }
+        let a = s.select(&peers, t0);
+        assert!(a.prune.is_empty());
+        assert_eq!(a.skipped_invalid, 2);
+        // An old invalid count decays below the limit (half-life 1 h).
+        let mut s = PeerSelector::new(cfg());
+        connect_all(&mut s, &peers, t0);
+        for _ in 0..4 {
+            s.on_invalid(peers[0], t0);
+        }
+        let later = t0 + Duration::from_secs(2 * 3600);
+        assert!(s.select(&peers, later).prune.iter().all(|(_, r)| *r != PruneReason::Invalid));
     }
 
     #[test]
@@ -955,7 +1072,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("best-peers.txt");
         let mut s2 = PeerSelector::new(PeerSelectConfig { store: Some(path.clone()), ..cfg() });
-        assert_eq!(s2.maybe_store(&[], t0).unwrap(), None, "nothing to store");
+        assert_eq!(s2.maybe_store(&[], t0).unwrap(), None, "first call only starts the clock");
+        assert_eq!(s2.maybe_store(&[], t0 + STORE_EVERY).unwrap(), None, "nothing to store");
         write_store(&path, &best).unwrap();
         std::fs::write(
             &path,
@@ -968,6 +1086,16 @@ mod tests {
         let read = read_store(&path);
         assert_eq!(read, best.iter().map(|b| b.0.clone()).collect::<Vec<_>>());
         assert!(read_store(&dir.path().join("missing")).is_empty());
+        // maybe_store writes once per STORE_EVERY, after the first period.
+        let path3 = dir.path().join("best3.txt");
+        s.config.store = Some(path3.clone());
+        let conn = [inb, outb, none];
+        assert_eq!(s.maybe_store(&conn, t0).unwrap(), None);
+        assert!(!path3.exists());
+        assert_eq!(s.maybe_store(&conn, t0 + STORE_EVERY).unwrap(), Some(2));
+        assert_eq!(read_store(&path3).len(), 2);
+        assert_eq!(s.maybe_store(&conn, t0 + STORE_EVERY + Duration::from_secs(1)).unwrap(), None);
+        assert!(!path3.with_extension("tmp").exists());
     }
 
     #[test]
