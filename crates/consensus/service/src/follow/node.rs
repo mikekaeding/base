@@ -259,11 +259,15 @@ where
             // Gossip blocks reach the engine only in primary, so only primary can need a repair.
             source = source.with_repair_engine(Arc::clone(&engine) as Arc<dyn FollowEngine>);
             // The local head may be a gossip block the RPC chain dropped before a restart.
-            source.seed_local_chain(local.as_ref(), latest).await;
+            source.seed_local_chain(local.as_ref(), latest, &cancellation).await;
+        }
+        let source = Arc::new(source);
+        if p2p_mode == FollowP2pMode::Primary {
+            tasks.spawn(Arc::clone(&source).run_confirmations(cancellation.clone()));
         }
         let runtime = FollowRuntime::new(
             Arc::clone(&local),
-            Arc::new(source),
+            source,
             engine,
             cancellation.clone(),
             latest,

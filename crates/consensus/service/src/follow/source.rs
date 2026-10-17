@@ -139,6 +139,28 @@ pub enum RemoteL2ClientError {
     #[error("invalid follow source: {0}")]
     InvalidSource(String),
 
+    /// An unsafe chain repair before `block` waits for the engine to reach the common ancestor
+    /// (a normal transient while the insert loop drains its queue).
+    #[error(
+        "unsafe chain repair before block {block} waits for the engine (unsafe head {unsafe_head})"
+    )]
+    EngineBehind {
+        /// The RPC payload height that did not extend the served chain.
+        block: u64,
+        /// The engine's current unsafe head number.
+        unsafe_head: u64,
+    },
+
+    /// No common ancestor with the RPC chain within the repair depth: the local unsafe chain
+    /// needs a manual unwind.
+    #[error("no common ancestor with the RPC chain before block {block} within {searched} blocks")]
+    ReorgTooDeep {
+        /// The RPC payload height that did not extend the served chain.
+        block: u64,
+        /// RPC blocks walked back.
+        searched: usize,
+    },
+
     /// The RPC payload at `block` does not extend the block served before it, and replacing the
     /// served blocks with the RPC chain did not succeed (retried on the next fetch).
     #[error("unsafe chain repair before block {block} failed: {reason}")]

@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use alloy_primitives::B256;
 use async_trait::async_trait;
@@ -23,6 +23,13 @@ pub(super) enum ChainReplace {
         /// Current unsafe head number.
         unsafe_head: u64,
     },
+    /// The first payload is at or below the safe head; nothing was sent.
+    BelowSafe {
+        /// Current safe head number.
+        safe_head: u64,
+    },
+    /// The replacement did not finish within the time limit (engine lock or engine calls).
+    TimedOut,
     /// The engine's chain does not hold the expected parent, or the unsafe head is not the last
     /// payload after the inserts.
     Unexpected {
@@ -46,7 +53,9 @@ pub(super) trait FollowEngine: Debug + Send + Sync {
     /// reorg the current unsafe chain), the rest as ordinary unsafe payloads.
     ///
     /// Nothing is sent unless the engine has already processed the first payload's parent
-    /// height, so the execution layer always has that parent and never needs to sync.
+    /// height (so the execution layer always has that parent and never needs to sync) and the
+    /// first payload is above the safe head. Each insert is tried once (no in-place retry) and
+    /// the whole replacement is time-limited; any failure is returned for the caller to retry.
     async fn replace_unsafe_chain(
         &self,
         payloads: Vec<BaseExecutionPayloadEnvelope>,
@@ -59,11 +68,15 @@ pub(super) trait FollowEngine: Debug + Send + Sync {
     ) -> Result<(), FollowError>;
 }
 
+/// Upper bound on one [`FollowEngine::replace_unsafe_chain`] call, lock wait included.
+const REPLACE_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug)]
 pub(super) struct EngineApiFollowEngine<E: EngineClient> {
     client: Arc<E>,
     rollup_config: Arc<RollupConfig>,
     state: Mutex<EngineState>,
+    replace_timeout: Duration,
 }
 
 impl<E: EngineClient> EngineApiFollowEngine<E> {
@@ -81,7 +94,55 @@ impl<E: EngineClient> EngineApiFollowEngine<E> {
             safe_head: Some(safe),
             finalized_head: Some(finalized),
         });
-        Self { client, rollup_config, state: Mutex::new(state) }
+        Self { client, rollup_config, state: Mutex::new(state), replace_timeout: REPLACE_TIMEOUT }
+    }
+
+    /// Overrides the replacement time limit.
+    #[cfg(test)]
+    pub(super) const fn with_replace_timeout(mut self, limit: Duration) -> Self {
+        self.replace_timeout = limit;
+        self
+    }
+
+    async fn replace_locked(
+        &self,
+        payloads: Vec<BaseExecutionPayloadEnvelope>,
+    ) -> Result<ChainReplace, FollowError> {
+        let Some(first) = payloads.first() else {
+            return Ok(ChainReplace::Applied);
+        };
+        let first_number = first.execution_payload.block_number();
+        let first_parent = first.execution_payload.parent_hash();
+        let last_hash = payloads[payloads.len() - 1].execution_payload.block_hash();
+        // Held across every insert: the follow insert loop cannot interleave a queued block.
+        let mut state = self.state.lock().await;
+        let safe_head = state.sync_state.safe_head().block_info.number;
+        if first_number <= safe_head {
+            return Ok(ChainReplace::BelowSafe { safe_head });
+        }
+        let head = state.sync_state.unsafe_head().block_info;
+        if head.number.saturating_add(1) < first_number {
+            return Ok(ChainReplace::EngineBehind { unsafe_head: head.number });
+        }
+        if head.number.saturating_add(1) == first_number && head.hash != first_parent {
+            return Ok(ChainReplace::Unexpected { number: head.number, hash: head.hash });
+        }
+        for (i, envelope) in payloads.into_iter().enumerate() {
+            let client = Arc::clone(&self.client);
+            let rollup_config = Arc::clone(&self.rollup_config);
+            let task = if i == 0 {
+                InsertTask::authoritative_payload(client, rollup_config, envelope)
+            } else {
+                InsertTask::unsafe_payload(client, rollup_config, envelope)
+            };
+            // One attempt: a SYNCING or failing engine must not spin here holding the lock.
+            task.execute(&mut state).await.map_err(FollowError::engine_task)?;
+        }
+        let head = state.sync_state.unsafe_head().block_info;
+        if head.hash != last_hash {
+            return Ok(ChainReplace::Unexpected { number: head.number, hash: head.hash });
+        }
+        Ok(ChainReplace::Applied)
     }
 
     /// The engine's current unsafe head.
@@ -112,39 +173,9 @@ impl<E: EngineClient + Debug + 'static> FollowEngine for EngineApiFollowEngine<E
         &self,
         payloads: Vec<BaseExecutionPayloadEnvelope>,
     ) -> Result<ChainReplace, FollowError> {
-        let Some(first) = payloads.first() else {
-            return Ok(ChainReplace::Applied);
-        };
-        let first_number = first.execution_payload.block_number();
-        let first_parent = first.execution_payload.parent_hash();
-        let last_hash = payloads[payloads.len() - 1].execution_payload.block_hash();
-        // Held across every insert: the follow insert loop cannot interleave a queued block.
-        let mut state = self.state.lock().await;
-        let head = state.sync_state.unsafe_head().block_info;
-        if head.number.saturating_add(1) < first_number {
-            return Ok(ChainReplace::EngineBehind { unsafe_head: head.number });
-        }
-        if head.number.saturating_add(1) == first_number && head.hash != first_parent {
-            return Ok(ChainReplace::Unexpected { number: head.number, hash: head.hash });
-        }
-        for (i, envelope) in payloads.into_iter().enumerate() {
-            let client = Arc::clone(&self.client);
-            let rollup_config = Arc::clone(&self.rollup_config);
-            let task = if i == 0 {
-                InsertTask::authoritative_payload(client, rollup_config, envelope)
-            } else {
-                InsertTask::unsafe_payload(client, rollup_config, envelope)
-            };
-            EngineTask::Insert(Box::new(task))
-                .execute(&mut state)
-                .await
-                .map_err(FollowError::engine_task)?;
-        }
-        let head = state.sync_state.unsafe_head().block_info;
-        if head.hash != last_hash {
-            return Ok(ChainReplace::Unexpected { number: head.number, hash: head.hash });
-        }
-        Ok(ChainReplace::Applied)
+        tokio::time::timeout(self.replace_timeout, self.replace_locked(payloads))
+            .await
+            .unwrap_or(Ok(ChainReplace::TimedOut))
     }
 
     async fn update_safe_finalized_blocks(
@@ -179,10 +210,10 @@ mod tests {
     use alloy_rpc_types_engine::{
         ExecutionPayloadV1, ForkchoiceUpdated, PayloadStatus, PayloadStatusEnum,
     };
-    use base_common_consensus::{BaseTxEnvelope, TxDeposit};
+    use base_common_consensus::{BaseBlock, BaseTxEnvelope, TxDeposit};
     use base_common_genesis::RollupConfig;
     use base_common_rpc_types_engine::{BaseExecutionPayload, BaseExecutionPayloadEnvelope};
-    use base_consensus_engine::test_utils::test_engine_client_builder;
+    use base_consensus_engine::test_utils::{MockEngineClient, test_engine_client_builder};
     use base_protocol::{BlockInfo, L1BlockInfoBedrock, L2BlockInfo};
     use tokio::time::{self, Instant};
 
@@ -311,5 +342,120 @@ mod tests {
         );
         assert!(client.last_new_payload_v2().await.is_none());
         assert_eq!(engine.unsafe_head().await, genesis);
+    }
+
+    fn engine_client(
+        rollup_config: &Arc<RollupConfig>,
+        new_payload: Option<PayloadStatus>,
+        forkchoice: ForkchoiceUpdated,
+    ) -> Arc<MockEngineClient> {
+        let mut builder = test_engine_client_builder()
+            .with_config(Arc::clone(rollup_config))
+            .with_fork_choice_updated_v3_response(forkchoice);
+        if let Some(status) = new_payload {
+            builder = builder.with_new_payload_v2_response(status);
+        }
+        Arc::new(builder.build())
+    }
+
+    async fn forkchoice_calls(client: &MockEngineClient) -> usize {
+        client.storage().read().await.fork_choice_updated_v3_requests.len()
+    }
+
+    #[tokio::test]
+    async fn replace_unsafe_chain_never_touches_the_safe_chain() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        let client =
+            engine_client(&rollup_config, Some(valid_payload_status()), valid_forkchoice_updated());
+        let engine = EngineApiFollowEngine::new(
+            Arc::clone(&client),
+            rollup_config,
+            l2_block_info(3),
+            l2_block_info(2),
+            l2_block_info(0),
+        );
+        assert_eq!(
+            engine.replace_unsafe_chain(vec![payload(2)]).await.unwrap(),
+            ChainReplace::BelowSafe { safe_head: 2 }
+        );
+        assert!(client.last_new_payload_v2().await.is_none());
+        assert_eq!(forkchoice_calls(&client).await, 0);
+    }
+
+    #[tokio::test]
+    async fn replace_unsafe_chain_tries_a_syncing_engine_once() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        let syncing = ForkchoiceUpdated {
+            payload_status: PayloadStatus {
+                status: PayloadStatusEnum::Syncing,
+                latest_valid_hash: None,
+            },
+            payload_id: None,
+        };
+        let client = engine_client(&rollup_config, Some(valid_payload_status()), syncing);
+        let genesis = l2_block_info(0);
+        let engine = EngineApiFollowEngine::new(
+            Arc::clone(&client),
+            rollup_config,
+            genesis,
+            genesis,
+            genesis,
+        );
+
+        let started = Instant::now();
+        let result = engine.replace_unsafe_chain(vec![payload(1)]).await;
+        assert!(result.is_err(), "a forced insert the EL only syncs is an error: {result:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(forkchoice_calls(&client).await, 1, "no in-place retry");
+        assert_eq!(engine.unsafe_head().await, genesis, "lock released, head unchanged");
+
+        client.set_fork_choice_updated_v3_response(valid_forkchoice_updated()).await;
+        // With its true header hash, so the head check after the inserts matches.
+        let mut block1 = payload(1);
+        if let BaseExecutionPayload::V1(inner) = &mut block1.execution_payload {
+            let block: BaseBlock =
+                BaseExecutionPayload::V1(inner.clone()).try_into_block().expect("valid fixture");
+            inner.block_hash = block.header.hash_slow();
+        }
+        assert_eq!(
+            engine.replace_unsafe_chain(vec![block1]).await.unwrap(),
+            ChainReplace::Applied,
+            "the next fetch retries"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replace_unsafe_chain_is_time_limited_while_the_insert_loop_holds_the_engine() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        // No newPayload response: the insert loop's insert retries (holding the engine lock).
+        let client = engine_client(&rollup_config, None, valid_forkchoice_updated());
+        let genesis = l2_block_info(0);
+        let limit = Duration::from_millis(200);
+        let engine = Arc::new(
+            EngineApiFollowEngine::new(
+                Arc::clone(&client),
+                rollup_config,
+                genesis,
+                genesis,
+                genesis,
+            )
+            .with_replace_timeout(limit),
+        );
+        let insert_engine = Arc::clone(&engine);
+        let insert = tokio::spawn(async move { insert_engine.insert_payload(payload(1)).await });
+        while client.last_new_payload_v2().await.is_none() {
+            time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let started = Instant::now();
+        assert_eq!(
+            engine.replace_unsafe_chain(vec![payload(1)]).await.unwrap(),
+            ChainReplace::TimedOut
+        );
+        assert!(started.elapsed() < limit * 5);
+
+        // No deadlock: the insert loop finishes once the engine answers.
+        client.set_new_payload_v2_response(valid_payload_status()).await;
+        time::timeout(Duration::from_secs(2), insert).await.unwrap().unwrap().unwrap();
     }
 }
