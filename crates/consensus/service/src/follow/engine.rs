@@ -1,5 +1,6 @@
 use std::{fmt::Debug, sync::Arc};
 
+use alloy_primitives::B256;
 use async_trait::async_trait;
 use base_common_genesis::RollupConfig;
 use base_common_rpc_types_engine::BaseExecutionPayloadEnvelope;
@@ -12,12 +13,44 @@ use tokio::sync::Mutex;
 
 use crate::follow::error::FollowError;
 
+/// Outcome of [`FollowEngine::replace_unsafe_chain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChainReplace {
+    /// The unsafe head is now the last payload.
+    Applied,
+    /// The engine has not reached the parent height of the first payload yet; nothing was sent.
+    EngineBehind {
+        /// Current unsafe head number.
+        unsafe_head: u64,
+    },
+    /// The engine's chain does not hold the expected parent, or the unsafe head is not the last
+    /// payload after the inserts.
+    Unexpected {
+        /// Current unsafe head number.
+        number: u64,
+        /// Current unsafe head hash.
+        hash: B256,
+    },
+}
+
+#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub(super) trait FollowEngine: Debug + Send + Sync {
     async fn insert_payload(
         &self,
         envelope: BaseExecutionPayloadEnvelope,
     ) -> Result<(), FollowError>;
+
+    /// Replaces the unsafe chain with `payloads` (consecutive blocks, oldest first) in one engine
+    /// critical section: the first is inserted authoritatively (forced forkchoice update, may
+    /// reorg the current unsafe chain), the rest as ordinary unsafe payloads.
+    ///
+    /// Nothing is sent unless the engine has already processed the first payload's parent
+    /// height, so the execution layer always has that parent and never needs to sync.
+    async fn replace_unsafe_chain(
+        &self,
+        payloads: Vec<BaseExecutionPayloadEnvelope>,
+    ) -> Result<ChainReplace, FollowError>;
 
     async fn update_safe_finalized_blocks(
         &self,
@@ -50,6 +83,12 @@ impl<E: EngineClient> EngineApiFollowEngine<E> {
         });
         Self { client, rollup_config, state: Mutex::new(state) }
     }
+
+    /// The engine's current unsafe head.
+    #[cfg(test)]
+    pub(super) async fn unsafe_head(&self) -> L2BlockInfo {
+        self.state.lock().await.sync_state.unsafe_head()
+    }
 }
 
 #[async_trait]
@@ -67,6 +106,45 @@ impl<E: EngineClient + Debug + 'static> FollowEngine for EngineApiFollowEngine<E
             .execute(&mut *self.state.lock().await)
             .await
             .map_err(FollowError::engine_task)
+    }
+
+    async fn replace_unsafe_chain(
+        &self,
+        payloads: Vec<BaseExecutionPayloadEnvelope>,
+    ) -> Result<ChainReplace, FollowError> {
+        let Some(first) = payloads.first() else {
+            return Ok(ChainReplace::Applied);
+        };
+        let first_number = first.execution_payload.block_number();
+        let first_parent = first.execution_payload.parent_hash();
+        let last_hash = payloads[payloads.len() - 1].execution_payload.block_hash();
+        // Held across every insert: the follow insert loop cannot interleave a queued block.
+        let mut state = self.state.lock().await;
+        let head = state.sync_state.unsafe_head().block_info;
+        if head.number.saturating_add(1) < first_number {
+            return Ok(ChainReplace::EngineBehind { unsafe_head: head.number });
+        }
+        if head.number.saturating_add(1) == first_number && head.hash != first_parent {
+            return Ok(ChainReplace::Unexpected { number: head.number, hash: head.hash });
+        }
+        for (i, envelope) in payloads.into_iter().enumerate() {
+            let client = Arc::clone(&self.client);
+            let rollup_config = Arc::clone(&self.rollup_config);
+            let task = if i == 0 {
+                InsertTask::authoritative_payload(client, rollup_config, envelope)
+            } else {
+                InsertTask::unsafe_payload(client, rollup_config, envelope)
+            };
+            EngineTask::Insert(Box::new(task))
+                .execute(&mut state)
+                .await
+                .map_err(FollowError::engine_task)?;
+        }
+        let head = state.sync_state.unsafe_head().block_info;
+        if head.hash != last_hash {
+            return Ok(ChainReplace::Unexpected { number: head.number, hash: head.hash });
+        }
+        Ok(ChainReplace::Applied)
     }
 
     async fn update_safe_finalized_blocks(
@@ -108,7 +186,7 @@ mod tests {
     use base_protocol::{BlockInfo, L1BlockInfoBedrock, L2BlockInfo};
     use tokio::time::{self, Instant};
 
-    use super::{EngineApiFollowEngine, FollowEngine};
+    use super::{ChainReplace, EngineApiFollowEngine, FollowEngine};
 
     fn valid_payload_status() -> PayloadStatus {
         PayloadStatus { status: PayloadStatusEnum::Valid, latest_valid_hash: Some(B256::ZERO) }
@@ -196,5 +274,42 @@ mod tests {
             .expect("insert should finish after temporary error clears")
             .expect("insert task should not panic")
             .expect("temporary engine error should be retried");
+    }
+
+    #[tokio::test]
+    async fn replace_unsafe_chain_sends_nothing_ahead_of_or_off_the_engine_chain() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        let client = Arc::new(
+            test_engine_client_builder()
+                .with_config(Arc::clone(&rollup_config))
+                .with_new_payload_v2_response(valid_payload_status())
+                .with_fork_choice_updated_v3_response(valid_forkchoice_updated())
+                .build(),
+        );
+        let genesis = l2_block_info(0);
+        let engine = EngineApiFollowEngine::new(
+            Arc::clone(&client),
+            rollup_config,
+            genesis,
+            genesis,
+            genesis,
+        );
+
+        // Parent height 1 is not in the engine yet.
+        assert_eq!(
+            engine.replace_unsafe_chain(vec![payload(2)]).await.unwrap(),
+            ChainReplace::EngineBehind { unsafe_head: 0 }
+        );
+        // Parent height is the head, but the head is a different block.
+        let mut orphan = payload(1);
+        if let BaseExecutionPayload::V1(inner) = &mut orphan.execution_payload {
+            inner.parent_hash = B256::repeat_byte(0xee);
+        }
+        assert_eq!(
+            engine.replace_unsafe_chain(vec![orphan]).await.unwrap(),
+            ChainReplace::Unexpected { number: 0, hash: genesis.block_info.hash }
+        );
+        assert!(client.last_new_payload_v2().await.is_none());
+        assert_eq!(engine.unsafe_head().await, genesis);
     }
 }

@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use crate::{
     NetworkActor, NetworkBuilder, NodeActor, ShutdownSignal,
     follow::{
-        engine::EngineApiFollowEngine,
+        engine::{EngineApiFollowEngine, FollowEngine},
         error::FollowError,
         gossip::{
             FollowP2pMode, GossipCacheEngineClient, GossipFirstClient, GossipPayloadCache,
@@ -254,9 +254,14 @@ where
             }
         }
 
+        let mut source = GossipFirstClient::new(self.l2_source.clone(), cache, p2p_mode);
+        if p2p_mode == FollowP2pMode::Primary {
+            // Gossip blocks reach the engine only in primary, so only primary can need a repair.
+            source = source.with_repair_engine(Arc::clone(&engine) as Arc<dyn FollowEngine>);
+        }
         let runtime = FollowRuntime::new(
             Arc::clone(&local),
-            Arc::new(GossipFirstClient::new(self.l2_source.clone(), cache, p2p_mode)),
+            Arc::new(source),
             engine,
             cancellation.clone(),
             latest,
