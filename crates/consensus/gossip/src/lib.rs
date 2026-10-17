@@ -57,6 +57,12 @@ mod driver;
 pub use driver::GossipPair;
 pub use driver::{GossipDriver, GossipDriverConfig};
 
+mod peer_select;
+pub use peer_select::{
+    NON_MESH_WEIGHT, PeerDelivery, PeerSelectConfig, PeerSelector, PruneReason, SelectActions,
+    peer_id_of, read_store, write_store,
+};
+
 mod block_validity;
 pub use block_validity::BlockInvalidError;
 #[cfg(test)]

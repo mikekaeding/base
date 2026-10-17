@@ -147,4 +147,19 @@ base_metrics::define_metrics! {
     #[describe("Distribution of block versions")]
     #[label(name = "version", default = ["v1", "v2", "v3", "v4"])]
     block_version: counter,
+
+    #[describe("Delivery-based peer selection actions")]
+    #[label(
+        name = "action",
+        default = [
+            "prune_score",
+            "prune_invalid",
+            "prune_excess",
+            "skip_dial",
+            "reject_inbound",
+            "dial_static",
+            "dial_stored"
+        ]
+    )]
+    peer_select_actions: counter,
 }

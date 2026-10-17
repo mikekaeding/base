@@ -52,6 +52,15 @@ impl NetworkDriver {
         // Start the libp2p Swarm
         let gossip_listen_addr = self.gossip.start().await?;
 
+        // Delivery-based peer selection (off unless configured): dial static and stored peers.
+        self.gossip.start_peer_selection();
+        let peer_select_tick = self.gossip.peer_select.as_ref().map(|s| {
+            let period = s.config().interval;
+            let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick
+        });
+
         if self.enr_update {
             // Update the local ENR socket to the gossip listen address.
             // Parse the multiaddr to a socket address.
@@ -102,6 +111,7 @@ impl NetworkDriver {
             peer_score_inspector,
             gater_pruner,
             pending_dial_pruner,
+            peer_select_tick,
             signer,
         })
     }

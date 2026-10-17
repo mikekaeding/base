@@ -5,7 +5,9 @@ use std::{num::NonZeroUsize, time::Duration};
 use alloy_primitives::Address;
 use base_common_genesis::RollupConfig;
 use base_consensus_disc::{Discv5Builder, LocalNode};
-use base_consensus_gossip::{ConnectionLimitsConfig, GaterConfig, GossipDriverBuilder};
+use base_consensus_gossip::{
+    ConnectionLimitsConfig, GaterConfig, GossipDriverBuilder, PeerSelectConfig,
+};
 use base_consensus_peers::{BootNodes, BootStoreFile, PeerMonitoring, PeerScoreLevel};
 use base_consensus_sources::BlockSigner;
 use discv5::Config as Discv5Config;
@@ -91,7 +93,12 @@ impl NetworkBuilder {
         Self { enr_update, ..self }
     }
 
-    /// Sets the configuration for the connection gater.
+    /// Enables delivery-based peer selection (`None`: off, today's behaviour).
+    pub fn with_peer_select(self, config: Option<PeerSelectConfig>) -> Self {
+        Self { gossip: self.gossip.with_peer_select(config), ..self }
+    }
+
+    /// Sets the connection gater configuration.
     pub fn with_gater_config(self, config: GaterConfig) -> Self {
         Self { gossip: self.gossip.with_gater_config(config), ..self }
     }

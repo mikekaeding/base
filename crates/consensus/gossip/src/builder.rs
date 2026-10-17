@@ -14,7 +14,7 @@ use tokio::sync::watch::{self};
 use crate::{
     Behaviour, BlockHandler, ConnectionLimitsConfig, DEFAULT_MAX_ESTABLISHED_CONNECTIONS,
     DEFAULT_MAX_IDENTIFY_PEERSTORE_PEERS, GaterConfig, GossipDriver, GossipDriverBuilderError,
-    GossipDriverConfig, Handler,
+    GossipDriverConfig, Handler, PeerSelectConfig,
 };
 
 /// A builder for the [`GossipDriver`].
@@ -45,6 +45,8 @@ pub struct GossipDriverBuilder {
     max_identify_peerstore_peers: NonZeroUsize,
     /// Topic scoring. Disabled by default.
     topic_scoring: bool,
+    /// Delivery-based peer selection. Disabled by default.
+    peer_select: Option<PeerSelectConfig>,
 }
 
 impl GossipDriverBuilder {
@@ -70,6 +72,7 @@ impl GossipDriverBuilder {
             max_identify_peerstore_peers: DEFAULT_MAX_IDENTIFY_PEERSTORE_PEERS,
             rollup_config,
             topic_scoring: false,
+            peer_select: None,
         }
     }
 
@@ -138,6 +141,12 @@ impl GossipDriverBuilder {
     /// Sets the [`Multiaddr`] for the gossip driver to listen on.
     pub fn with_address(mut self, addr: Multiaddr) -> Self {
         self.gossip_addr = addr;
+        self
+    }
+
+    /// Enables delivery-based peer selection (`None`: off, today's behaviour).
+    pub fn with_peer_select(mut self, config: Option<PeerSelectConfig>) -> Self {
+        self.peer_select = config;
         self
     }
 
@@ -260,6 +269,7 @@ impl GossipDriverBuilder {
                     max_identify_peerstore_peers,
                     peer_monitoring: self.peer_monitoring,
                     connection_limits_config,
+                    peer_select: self.peer_select,
                 },
             ),
             signer_tx,

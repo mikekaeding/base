@@ -33,7 +33,8 @@ use tokio::{
 
 use crate::{
     Behaviour, BlockHandler, ConnectionGate, ConnectionGater, ConnectionLimitsConfig, Event,
-    GossipDriverBuilder, Handler, HandlerEncodeError, Metrics, PublishError,
+    GossipDriverBuilder, Handler, HandlerEncodeError, Metrics, PeerSelectConfig, PeerSelector,
+    PublishError, peer_id_of, read_store,
 };
 
 /// Configuration applied when constructing a [`GossipDriver`].
@@ -45,6 +46,8 @@ pub struct GossipDriverConfig {
     pub peer_monitoring: Option<PeerMonitoring>,
     /// The configured libp2p connection limits enforced by the swarm.
     pub connection_limits_config: ConnectionLimitsConfig,
+    /// Delivery-based peer selection (`None`: off).
+    pub peer_select: Option<PeerSelectConfig>,
 }
 
 /// A driver for a [`Swarm`] instance.
@@ -76,6 +79,10 @@ pub struct GossipDriver<G: ConnectionGate> {
     /// Next check for obsolete block topics. Kept across polls so busy traffic
     /// or cancellation of `next` cannot indefinitely postpone retirement.
     pub next_topic_retirement: TokioInstant,
+    /// Delivery-based peer selection (`None`: off, today's behaviour).
+    pub peer_select: Option<PeerSelector>,
+    /// Peers this driver disconnected for peer selection and that have not closed yet.
+    pub select_pruned: HashSet<PeerId>,
 }
 
 impl<G> GossipDriver<G>
@@ -115,6 +122,8 @@ where
             connection_limits_config: config.connection_limits_config,
             ping: Arc::new(Mutex::new(Default::default())),
             next_topic_retirement: TokioInstant::now(),
+            peer_select: config.peer_select.map(PeerSelector::new),
+            select_pruned: HashSet::new(),
         };
         #[cfg(feature = "metrics")]
         driver.record_block_topic_metrics();
@@ -309,6 +318,17 @@ where
             Metrics::dial_peer_error("invalid_enr").increment(1.0);
             return;
         };
+        if let Some(select) = &self.peer_select
+            && let Some(peer_id) = peer_id_of(&multiaddr)
+        {
+            let connected = self.swarm.connected_peers().count();
+            let pending = self.connection_gate.pending_dials().len();
+            if !select.allow_dial(&peer_id, connected, pending, Instant::now()) {
+                trace!(target: "gossip", %peer_id, connected, pending, "Peer selection: no free slot, not dialing");
+                Metrics::peer_select_actions("skip_dial").increment(1);
+                return;
+            }
+        }
         self.dial_multiaddr(multiaddr);
     }
 
@@ -394,6 +414,9 @@ where
                     Metrics::peer_scores().record(_peer_score);
                 }
 
+                if let (Some(select), Ok(time)) = (self.peer_select.as_mut(), result.as_ref()) {
+                    select.on_rtt(peer, *time);
+                }
                 let pings = Arc::clone(&self.ping);
                 tokio::spawn(async move {
                     if let Ok(time) = result {
@@ -411,6 +434,9 @@ where
         match event {
             libp2p::identify::Event::Received { connection_id, peer_id, info } => {
                 debug!(target: "gossip", ?connection_id, peer_id = %peer_id, ?info, "Received identify info from peer");
+                if let Some(select) = self.peer_select.as_mut() {
+                    select.on_identify(peer_id, &info.listen_addrs);
+                }
                 self.prune_peerstore_for_new_peer(peer_id);
                 self.peerstore.put(peer_id, info);
             }
@@ -466,7 +492,9 @@ where
                 // Subscription state makes retirement irreversible; the handler
                 // checks the clock once, before decoding, between sweeps.
                 if self.swarm.behaviour().gossipsub.topics().any(|topic| *topic == message.topic) {
+                    let topic = message.topic.clone();
                     let (status, payload) = self.handler.handle(message);
+                    self.record_delivery(src, &topic, &status, payload.is_some());
                     _ = self
                         .swarm
                         .behaviour_mut()
@@ -498,6 +526,123 @@ where
         None
     }
 
+    /// Feeds a validated (or rejected) gossip block to peer selection.
+    fn record_delivery(
+        &mut self,
+        src: PeerId,
+        topic: &libp2p::gossipsub::TopicHash,
+        status: &libp2p::gossipsub::MessageAcceptance,
+        accepted: bool,
+    ) {
+        let Some(select) = self.peer_select.as_mut() else { return };
+        let now = Instant::now();
+        match status {
+            libp2p::gossipsub::MessageAcceptance::Accept if accepted => {
+                let gossipsub = &self.swarm.behaviour().gossipsub;
+                let mesh: HashSet<PeerId> = gossipsub.mesh_peers(topic).copied().collect();
+                let connected: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+                select.on_block(src, &connected, |p| mesh.contains(p), now);
+            }
+            libp2p::gossipsub::MessageAcceptance::Reject => select.on_invalid(src, now),
+            _ => {}
+        }
+    }
+
+    /// Starts peer selection after the swarm listens: protects and dials the static peers, then
+    /// dials the stored best peers from the last run. A no-op when selection is off.
+    pub fn start_peer_selection(&mut self) {
+        let Some(select) = self.peer_select.as_mut() else { return };
+        let config = select.config().clone();
+        let stored = config.store.as_deref().map(read_store).unwrap_or_default();
+        let stored_ids: Vec<PeerId> = stored.iter().filter_map(peer_id_of).collect();
+        select.protect_stored(stored_ids.iter().copied());
+        let statics: Vec<PeerId> = select.static_ids().iter().copied().collect();
+        info!(
+            target: "gossip",
+            keep = config.keep,
+            explore = config.explore,
+            probation_secs = config.probation.as_secs(),
+            interval_secs = config.interval.as_secs(),
+            max_prunes = config.max_prunes,
+            cooldown_secs = config.cooldown.as_secs(),
+            half_life_blocks = config.half_life_blocks,
+            static_peers = config.static_peers.len(),
+            stored_peers = stored.len(),
+            protect_stored = config.protect_stored,
+            store = ?config.store,
+            max_established = self.connection_limits_config.max_established,
+            "Peer selection enabled"
+        );
+        if (self.connection_limits_config.max_established as usize) < config.target() {
+            warn!(target: "gossip", target = config.target(),
+                max_established = self.connection_limits_config.max_established,
+                "Peer selection target is above the connection limit; the limit wins");
+        }
+        for id in statics {
+            self.connection_gate.protect_peer(id);
+        }
+        for addr in config.static_peers {
+            Metrics::peer_select_actions("dial_static").increment(1);
+            self.dial_multiaddr(addr);
+        }
+        for addr in stored {
+            Metrics::peer_select_actions("dial_stored").increment(1);
+            self.dial_multiaddr(addr);
+        }
+    }
+
+    /// One peer selection run: prunes, unblocks, redials static peers and stores the best peers.
+    /// A no-op when selection is off.
+    pub fn run_peer_selection(&mut self) {
+        let Some(select) = self.peer_select.as_mut() else { return };
+        let now = Instant::now();
+        let connected: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+        let actions = select.select(&connected, now);
+        let scores: Vec<(PeerId, f64)> =
+            actions.prune.iter().map(|(p, _)| (*p, select.score(p, now))).collect();
+        let summary = select.summary(&connected, now);
+        let stored = match select.maybe_store(&connected, now) {
+            Ok(n) => n,
+            Err(error) => {
+                warn!(target: "gossip", %error, "Peer selection: could not write the best-peer store");
+                None
+            }
+        };
+        for peer in &actions.unblock {
+            self.connection_gate.unblock_peer(peer);
+        }
+        for ((peer, reason), (_, score)) in actions.prune.iter().zip(scores) {
+            Metrics::peer_select_actions(reason.as_str()).increment(1);
+            self.connection_gate.block_peer(peer);
+            if self.swarm.disconnect_peer_id(*peer).is_ok() {
+                self.select_pruned.insert(*peer);
+            }
+            info!(target: "gossip", peer_id = %peer, reason = reason.as_str(), score = format!("{score:.4}"), "Peer selection: pruned peer");
+        }
+        for addr in actions.dial {
+            Metrics::peer_select_actions("dial_static").increment(1);
+            self.dial_multiaddr(addr);
+        }
+        let top: Vec<String> = summary
+            .iter()
+            .take(5)
+            .map(|(id, score, wins, eligible, rtt)| {
+                let id = id.to_string();
+                let short = &id[id.len().saturating_sub(8)..];
+                format!("{short}:{score:.3}/{wins}w/{eligible:.0}e/{}ms", rtt.map_or(-1, |r| r as i64))
+            })
+            .collect();
+        info!(
+            target: "gossip",
+            connected = connected.len(),
+            pruned = actions.prune.len(),
+            unblocked = actions.unblock.len(),
+            stored = ?stored,
+            top = %top.join(" "),
+            "Peer selection"
+        );
+    }
+
     /// Handles the [`SwarmEvent<Event>`].
     pub fn handle_event(&mut self, event: SwarmEvent<Event>) -> Option<NetworkPayloadEnvelope> {
         match event {
@@ -518,6 +663,17 @@ where
                 }
 
                 let peer_count = self.swarm.connected_peers().count();
+                if let Some(select) = self.peer_select.as_mut() {
+                    let now = Instant::now();
+                    if endpoint.is_listener() && !select.allow_inbound(&peer_id, peer_count, now) {
+                        debug!(target: "gossip", peer_id = %peer_id, peer_count, "Peer selection: no free slot, closing inbound connection");
+                        Metrics::peer_select_actions("reject_inbound").increment(1);
+                        self.swarm.close_connection(connection_id);
+                        return None;
+                    }
+                    let dialed = (!endpoint.is_listener()).then(|| endpoint.get_remote_address().clone());
+                    select.on_connected(peer_id, dialed, now);
+                }
                 debug!(target: "gossip", peer_id = %peer_id, peer_count, "Connection established");
                 Metrics::gossipsub_connection("connected").increment(1.0);
                 Metrics::gossip_peer_count().set(peer_count as f64);
@@ -538,7 +694,13 @@ where
                 debug!(target: "gossip", error = ?error, "Incoming connection error");
                 Metrics::gossipsub_connection("incoming_error").increment(1.0);
             }
-            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. } => {
+                if num_established == 0 {
+                    let by_us = self.select_pruned.remove(&peer_id);
+                    if let Some(select) = self.peer_select.as_mut() {
+                        select.on_disconnected(peer_id, by_us, Instant::now());
+                    }
+                }
                 let peer_count = self.swarm.connected_peers().count();
                 debug!(target: "gossip", ?peer_id, ?cause, peer_count, "Connection closed");
                 Metrics::gossipsub_connection("closed").increment(1.0);
