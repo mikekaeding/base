@@ -9,7 +9,7 @@
 //! delivery signal is "did this peer deliver the block first?". For every accepted block each
 //! connected peer gets an *eligible* observation (weight 1 in our mesh for that topic,
 //! [`NON_MESH_WEIGHT`] outside it), and the source gets one *win*. The delivery score is the EWMA
-//! (by block count, `half_life_blocks`) of wins over eligible blocks, shrunk towards a prior
+//! (by wall-clock time, `half_life`) of wins over eligible blocks, shrunk towards a prior
 //! for peers with few observations, and divided by `1 + recent self-disconnects` (reliability).
 //! The prior, and the probation, shrink with the ping round trip ([`rtt_weight`]): on trader-va
 //! every peer that delivered first was within 20 ms, none 50 ms or more away ever did.
@@ -94,8 +94,9 @@ pub struct PeerSelectConfig {
     pub max_prunes: usize,
     /// How long a pruned peer is blocked from reconnecting.
     pub cooldown: Duration,
-    /// Half-life of the delivery score, in accepted blocks.
-    pub half_life_blocks: f64,
+    /// Half-life of the delivery score, in wall-clock time (block-count independent, so it means
+    /// the same before and after Denim's 200 ms blocks).
+    pub half_life: Duration,
     /// Best peers written to and read from the store.
     pub store_peers: usize,
     /// Optional file with the best peers, read at start and rewritten while running.
@@ -115,7 +116,7 @@ impl Default for PeerSelectConfig {
             interval: Duration::from_secs(60),
             max_prunes: 2,
             cooldown: Duration::from_secs(60 * 60),
-            half_life_blocks: 900.0,
+            half_life: Duration::from_secs(30 * 60),
             store_peers: 8,
             store: None,
             protect_stored: false,
@@ -155,10 +156,10 @@ impl PeerSelectConfig {
                 self.keep
             ));
         }
-        if !(self.half_life_blocks.is_finite() && self.half_life_blocks >= 1.0) {
+        if self.half_life < Duration::from_secs(1) || self.half_life > MAX_DURATION {
             return Err(format!(
-                "peer selection half-life must be at least 1 block, got {}",
-                self.half_life_blocks
+                "peer selection half-life must be 1 s to 7 days, got {:?}",
+                self.half_life
             ));
         }
         for addr in &self.static_peers {
@@ -217,8 +218,8 @@ pub struct PeerDelivery {
     pub wins: f64,
     /// Decayed blocks the peer could have delivered (in our mesh, or the source).
     pub eligible: f64,
-    /// Block sequence the two counters were last decayed to.
-    seq: u64,
+    /// When the two counters were last decayed.
+    decayed_at: Instant,
     /// Lifetime first deliveries (not decayed; for logs).
     pub total_wins: u64,
     /// Decayed count of invalid blocks received from this peer.
@@ -238,13 +239,13 @@ pub struct PeerDelivery {
 }
 
 impl PeerDelivery {
-    const fn new(now: Instant, seq: u64) -> Self {
+    const fn new(now: Instant) -> Self {
         Self {
             connected_since: None,
             disconnected_at: None,
             wins: 0.0,
             eligible: 0.0,
-            seq,
+            decayed_at: now,
             total_wins: 0,
             invalid: 0.0,
             invalid_at: now,
@@ -256,12 +257,17 @@ impl PeerDelivery {
         }
     }
 
-    fn decay_to(&mut self, seq: u64, half_life: f64) {
-        if seq > self.seq {
-            let f = 0.5f64.powf((seq - self.seq) as f64 / half_life);
+    fn factor(&self, now: Instant, half_life: Duration) -> f64 {
+        let age = now.saturating_duration_since(self.decayed_at).as_secs_f64();
+        0.5f64.powf(age / half_life.as_secs_f64())
+    }
+
+    fn decay_to(&mut self, now: Instant, half_life: Duration) {
+        if now > self.decayed_at {
+            let f = self.factor(now, half_life);
             self.wins *= f;
             self.eligible *= f;
-            self.seq = seq;
+            self.decayed_at = now;
         }
     }
 
@@ -282,8 +288,6 @@ impl PeerDelivery {
 pub struct PeerSelector {
     config: PeerSelectConfig,
     peers: HashMap<PeerId, PeerDelivery>,
-    /// Accepted blocks seen (the decay clock).
-    seq: u64,
     /// Static peers (always protected).
     static_ids: HashSet<PeerId>,
     /// Stored peers protected until their first disconnect (`protect_stored`).
@@ -304,7 +308,6 @@ impl PeerSelector {
         Self {
             config,
             peers: HashMap::new(),
-            seq: 0,
             static_ids,
             stored_protected: HashSet::new(),
             cooldown: HashMap::new(),
@@ -340,8 +343,7 @@ impl PeerSelector {
     }
 
     fn entry(&mut self, peer: PeerId, now: Instant) -> &mut PeerDelivery {
-        let seq = self.seq;
-        self.peers.entry(peer).or_insert_with(|| PeerDelivery::new(now, seq))
+        self.peers.entry(peer).or_insert_with(|| PeerDelivery::new(now))
     }
 
     /// Records an accepted block that `source` delivered first. Every `connected` peer gets an
@@ -354,20 +356,19 @@ impl PeerSelector {
         in_mesh: impl Fn(&PeerId) -> bool,
         now: Instant,
     ) {
-        self.seq += 1;
         self.accepted_since += 1;
-        let (seq, hl) = (self.seq, self.config.half_life_blocks);
+        let hl = self.config.half_life;
         for peer in connected {
             if *peer == source {
                 continue;
             }
             let w = if in_mesh(peer) { 1.0 } else { NON_MESH_WEIGHT };
             let p = self.entry(*peer, now);
-            p.decay_to(seq, hl);
+            p.decay_to(now, hl);
             p.eligible += w;
         }
         let p = self.entry(source, now);
-        p.decay_to(seq, hl);
+        p.decay_to(now, hl);
         p.eligible += 1.0;
         p.wins += 1.0;
         p.total_wins += 1;
@@ -437,7 +438,7 @@ impl PeerSelector {
     /// starts low and a near one at the average.
     pub fn score(&self, peer: &PeerId, now: Instant) -> f64 {
         let Some(p) = self.peers.get(peer) else { return self.prior() };
-        let f = 0.5f64.powf(self.seq.saturating_sub(p.seq) as f64 / self.config.half_life_blocks);
+        let f = p.factor(now, self.config.half_life);
         let (wins, eligible) = (p.wins * f, p.eligible * f);
         let prior = self.prior() * rtt_weight(p.rtt);
         let rate = PRIOR_BLOCKS.mul_add(prior, wins) / (eligible + PRIOR_BLOCKS);
@@ -680,10 +681,7 @@ impl PeerSelector {
             .iter()
             .map(|id| {
                 let p = self.peers.get(id);
-                let f = p.map_or(1.0, |p| {
-                    0.5f64
-                        .powf(self.seq.saturating_sub(p.seq) as f64 / self.config.half_life_blocks)
-                });
+                let f = p.map_or(1.0, |p| p.factor(now, self.config.half_life));
                 (
                     *id,
                     self.score(id, now),
@@ -810,7 +808,7 @@ mod tests {
             interval: Duration::from_secs(60),
             max_prunes: 2,
             cooldown: Duration::from_secs(3600),
-            half_life_blocks: 900.0,
+            half_life: Duration::from_secs(1800),
             ..Default::default()
         }
     }
@@ -838,7 +836,7 @@ mod tests {
             PeerSelectConfig { protect_stored: true, store_peers: 2, ..cfg() }.validate().is_ok()
         );
         assert!(PeerSelectConfig { keep: 1, ..cfg() }.validate().is_err());
-        assert!(PeerSelectConfig { half_life_blocks: 0.0, ..cfg() }.validate().is_err());
+        assert!(PeerSelectConfig { half_life: Duration::ZERO, ..cfg() }.validate().is_err());
         let no_id: Multiaddr = "/ip4/1.2.3.4/tcp/9222".parse().unwrap();
         assert!(PeerSelectConfig { static_peers: vec![no_id], ..cfg() }.validate().is_err());
         assert_eq!(PeerSelectConfig::default().target(), 12);
@@ -865,17 +863,20 @@ mod tests {
     #[test]
     fn score_decays_old_wins() {
         let t0 = Instant::now();
-        let mut s = PeerSelector::new(PeerSelectConfig { half_life_blocks: 100.0, ..cfg() });
+        let hl = Duration::from_secs(600);
+        let mut s = PeerSelector::new(PeerSelectConfig { half_life: hl, ..cfg() });
         let (a, b) = (PeerId::random(), PeerId::random());
         connect_all(&mut s, &[a, b], t0);
         let mesh = [a, b];
+        // The half-life is wall-clock time, not a block count: 500 blocks at once do not decay.
         for _ in 0..500 {
             s.on_block(a, &mesh, |_| true, t0);
         }
+        let t1 = t0 + 6 * hl;
         for _ in 0..500 {
-            s.on_block(b, &mesh, |_| true, t0);
+            s.on_block(b, &mesh, |_| true, t1);
         }
-        assert!(s.score(&b, t0) > 0.8 && s.score(&a, t0) < 0.1);
+        assert!(s.score(&b, t1) > 0.8 && s.score(&a, t1) < 0.1);
     }
 
     #[test]

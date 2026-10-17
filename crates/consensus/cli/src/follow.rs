@@ -71,13 +71,13 @@ pub struct PeerSelectArgs {
         default_value_t = 3600
     )]
     pub cooldown_secs: u64,
-    /// Half-life of the delivery score, in blocks.
+    /// Half-life of the delivery score, in seconds (wall clock, independent of the block time).
     #[arg(
-        long = "p2p.select.half-life-blocks",
-        env = "BASE_NODE_P2P_SELECT_HALF_LIFE_BLOCKS",
-        default_value_t = 900.0
+        long = "p2p.select.half-life-secs",
+        env = "BASE_NODE_P2P_SELECT_HALF_LIFE_SECS",
+        default_value_t = 1800
     )]
-    pub half_life_blocks: f64,
+    pub half_life_secs: u64,
     /// File for the best peers (read at start, rewritten every few minutes). Unset: no store.
     #[arg(long = "p2p.select.store", env = "BASE_NODE_P2P_SELECT_STORE")]
     pub store: Option<std::path::PathBuf>,
@@ -107,7 +107,7 @@ impl Default for PeerSelectArgs {
             interval_secs: 60,
             max_prunes: 2,
             cooldown_secs: 3600,
-            half_life_blocks: 900.0,
+            half_life_secs: 1800,
             store: None,
             store_peers: 8,
             protect_stored: false,
@@ -129,7 +129,7 @@ impl PeerSelectArgs {
             interval: Duration::from_secs(self.interval_secs),
             max_prunes: self.max_prunes,
             cooldown: Duration::from_secs(self.cooldown_secs),
-            half_life_blocks: self.half_life_blocks,
+            half_life: Duration::from_secs(self.half_life_secs),
             store_peers: self.store_peers,
             store: self.store.clone(),
             protect_stored: self.protect_stored,

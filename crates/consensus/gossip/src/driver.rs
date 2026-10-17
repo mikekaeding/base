@@ -551,7 +551,7 @@ where
             interval_secs = config.interval.as_secs(),
             max_prunes = config.max_prunes,
             cooldown_secs = config.cooldown.as_secs(),
-            half_life_blocks = config.half_life_blocks,
+            half_life_secs = config.half_life.as_secs(),
             static_peers = config.static_peers.len(),
             stored_peers = stored.len(),
             protect_stored = config.protect_stored,
