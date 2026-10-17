@@ -424,7 +424,7 @@ mod tests {
     use crate::{
         MockRemoteClient,
         follow::{
-            engine::FollowEngine,
+            engine::{ChainReplace, FollowEngine},
             local::MockFollowLocalClient,
             proof_gate::{ActiveProofGate, NoopProofGate},
         },
@@ -487,6 +487,15 @@ mod tests {
             time::sleep(self.delay).await;
             self.inserted.lock().await.push(envelope.execution_payload.block_number());
             Ok(())
+        }
+
+        async fn replace_unsafe_chain(
+            &self,
+            payloads: Vec<BaseExecutionPayloadEnvelope>,
+        ) -> Result<ChainReplace, FollowError> {
+            let mut inserted = self.inserted.lock().await;
+            inserted.extend(payloads.iter().map(|p| p.execution_payload.block_number()));
+            Ok(ChainReplace::Applied)
         }
 
         async fn update_safe_finalized_blocks(

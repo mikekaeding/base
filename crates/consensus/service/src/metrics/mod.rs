@@ -36,10 +36,26 @@ base_metrics::define_metrics! {
             "ambiguous",
             "retry",
             "hash_mismatch",
-            "rpc_parent_mismatch"
+            "rpc_parent_mismatch",
+            "reorg"
         ]
     )]
     follow_p2p_fallback_total: counter,
+    #[describe("Unsafe-chain repairs after the RPC sources did not extend the block served before")]
+    follow_p2p_reorg_repaired_total: counter,
+    #[describe("Unsafe-chain repair attempts that failed (retried on the next fetch), by reason")]
+    #[label(
+        name = "reason",
+        default = [
+            "rpc_error",
+            "too_deep",
+            "discontinuous",
+            "engine_behind",
+            "engine_unexpected",
+            "engine_error"
+        ]
+    )]
+    follow_p2p_reorg_repair_failed_total: counter,
     #[describe("Wall-clock duration of a single derivation pipeline step() call")]
     derivation_pipeline_step_duration_seconds: histogram,
     #[describe("Wall-clock duration the derivation actor waits for an inbound request")]

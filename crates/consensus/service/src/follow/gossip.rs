@@ -1,22 +1,27 @@
 //! Optional P2P unsafe-block gossip as the first payload source of the follow node.
 //!
-//! The follow runtime stays the only driver of the engine. The libp2p network actor validates
-//! each gossiped block (sequencer signature, timestamp window, hash) exactly as in node mode and
-//! hands it to [`GossipCacheEngineClient`], which only stores it in a bounded cache. The
-//! prefetcher then asks [`GossipFirstClient`] for each payload:
+//! The libp2p network actor validates each gossiped block (sequencer signature, timestamp
+//! window, hash) exactly as in node mode and hands it to [`GossipCacheEngineClient`], which only
+//! stores it in a bounded cache. The prefetcher then asks [`GossipFirstClient`] for each payload:
 //!
 //! - [`FollowP2pMode::Shadow`]: every payload still comes from the RPC sources. Gossip is only
 //!   measured (arrival lag behind the block timestamp, and how much earlier gossip had each block
 //!   than the RPC fetch completed).
 //! - [`FollowP2pMode::Primary`]: a cached gossip payload is used when it is the only candidate at
-//!   that height and its parent hash is the block returned just before it. Anything else (missing,
-//!   ambiguous, parent mismatch, a second request for the same height) falls through to the RPC
-//!   sources, so P2P can only make a block earlier, never block the follower.
+//!   that height and its parent hash is the block returned just before it, including one that
+//!   arrives while the RPC fetch of that height is in flight. Anything else (missing, ambiguous,
+//!   parent mismatch, a second request for the same height) falls through to the RPC sources.
+//!
+//! The RPC sources stay authoritative. A validated gossip block can still be dropped from the
+//! chain (the sequencer signed two blocks at one height, e.g. during a failover). When an RPC
+//! payload then does not extend the block served before it, the primary client replaces the
+//! served blocks back to the common ancestor with the RPC chain (one authoritative insert, then
+//! ordinary ones) before it returns that payload, so the insert loop never sees a gap.
 //!
 //! A network that fails to start, closes or loses all peers leaves the follower on RPC.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt::Debug,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -28,12 +33,15 @@ use alloy_primitives::B256;
 use async_trait::async_trait;
 use base_common_rpc_types_engine::BaseExecutionPayloadEnvelope;
 use base_protocol::BlockInfo;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tracing::{debug, info, warn};
 
 use crate::{
     EngineClientResult, Metrics, NetworkEngineClient,
-    follow::source::{RemoteClient, RemoteL2ClientError},
+    follow::{
+        engine::{ChainReplace, FollowEngine},
+        source::{RemoteClient, RemoteL2ClientError},
+    },
 };
 
 /// Heights kept in the gossip cache (about 8.5 minutes of 2 s blocks, 51 s of 200 ms blocks).
@@ -69,7 +77,9 @@ impl FromStr for FollowP2pMode {
             "" | "off" | "false" | "0" => Ok(Self::Off),
             "shadow" => Ok(Self::Shadow),
             "primary" => Ok(Self::Primary),
-            other => Err(format!("invalid follow P2P mode {other:?}: expected off, shadow or primary")),
+            other => {
+                Err(format!("invalid follow P2P mode {other:?}: expected off, shadow or primary"))
+            }
         }
     }
 }
@@ -96,6 +106,8 @@ struct Candidate {
 #[derive(Debug, Default)]
 pub struct GossipPayloadCache {
     inner: Mutex<BTreeMap<u64, Vec<Candidate>>>,
+    /// Woken on every new payload (a pending RPC fetch may take the gossip copy instead).
+    arrivals: Notify,
 }
 
 impl GossipPayloadCache {
@@ -112,7 +124,8 @@ impl GossipPayloadCache {
             return false;
         }
         let candidates = map.entry(number).or_default();
-        if candidates.iter().any(|c| c.hash == hash) || candidates.len() >= MAX_CANDIDATES_PER_HEIGHT
+        if candidates.iter().any(|c| c.hash == hash)
+            || candidates.len() >= MAX_CANDIDATES_PER_HEIGHT
         {
             return false;
         }
@@ -125,6 +138,8 @@ impl GossipPayloadCache {
             }
             map.remove(&lowest);
         }
+        drop(map);
+        self.arrivals.notify_waiters();
         true
     }
 
@@ -168,7 +183,10 @@ impl GossipCacheEngineClient {
 
 #[async_trait]
 impl NetworkEngineClient for GossipCacheEngineClient {
-    async fn send_unsafe_block(&self, block: BaseExecutionPayloadEnvelope) -> EngineClientResult<()> {
+    async fn send_unsafe_block(
+        &self,
+        block: BaseExecutionPayloadEnvelope,
+    ) -> EngineClientResult<()> {
         let received = Instant::now();
         let number = block.execution_payload.block_number();
         let timestamp = block.execution_payload.timestamp();
@@ -204,35 +222,106 @@ impl NetworkEngineClient for GossipCacheEngineClient {
     }
 }
 
+/// Served blocks remembered for unsafe-reorg repair.
+const SERVED_RING: usize = 64;
+
+/// Deepest unsafe reorg the follower repairs by itself (blocks replaced).
+const MAX_REORG_REPAIR_DEPTH: usize = 16;
+
+#[derive(Debug, Clone, Copy)]
+struct Served {
+    number: u64,
+    hash: B256,
+    from_gossip: bool,
+}
+
 #[derive(Debug, Default)]
 struct ServeState {
-    /// The last payload returned to the prefetcher (number, hash).
-    last: Option<(u64, B256)>,
+    /// The last payloads returned to the prefetcher: consecutive heights, oldest first.
+    served: VecDeque<Served>,
     /// The last height served from gossip; a repeat request for it goes to RPC.
     last_gossip: Option<u64>,
+    /// Set by a repair: heights at or below it are never served from gossip again.
+    no_gossip_through: Option<u64>,
+    /// An RPC payload did not extend the served chain and its repair has not completed.
+    repair_pending: bool,
+}
+
+impl ServeState {
+    fn last(&self) -> Option<Served> {
+        self.served.back().copied()
+    }
+
+    fn hash_at(&self, number: u64) -> Option<B256> {
+        let first = self.served.front()?.number;
+        let index = usize::try_from(number.checked_sub(first)?).ok()?;
+        self.served.get(index).map(|s| s.hash)
+    }
+
+    fn record(&mut self, number: u64, hash: B256, from_gossip: bool) {
+        while self.served.back().is_some_and(|s| s.number >= number) {
+            self.served.pop_back();
+        }
+        if self.served.back().is_some_and(|s| s.number.saturating_add(1) != number) {
+            self.served.clear();
+        }
+        self.served.push_back(Served { number, hash, from_gossip });
+        while self.served.len() > SERVED_RING {
+            self.served.pop_front();
+        }
+        if from_gossip {
+            self.last_gossip = Some(number);
+        }
+    }
+}
+
+/// Result of racing the RPC fetch of a height against its gossip copy.
+enum Fetched {
+    Gossip(Candidate),
+    Rpc(Result<BaseExecutionPayloadEnvelope, RemoteL2ClientError>),
 }
 
 /// A [`RemoteClient`] that answers payload requests from validated gossip first.
+///
+/// In [`FollowP2pMode::Primary`] with a repair engine, an RPC payload that does not extend the
+/// block served just before it (the sequencer signed two blocks at one height and gossip carried
+/// the one that was dropped) is not returned until the engine's unsafe chain has been replaced
+/// with the RPC chain from the common ancestor; see [`FollowEngine::replace_unsafe_chain`].
 #[derive(Debug)]
 pub struct GossipFirstClient<R> {
     inner: R,
     cache: Arc<GossipPayloadCache>,
     mode: FollowP2pMode,
     state: Mutex<ServeState>,
+    repair: Option<Arc<dyn FollowEngine>>,
 }
 
 impl<R> GossipFirstClient<R> {
     /// Wraps `inner` (the RPC sources).
     pub fn new(inner: R, cache: Arc<GossipPayloadCache>, mode: FollowP2pMode) -> Self {
-        Self { inner, cache, mode, state: Mutex::new(ServeState::default()) }
+        Self { inner, cache, mode, state: Mutex::new(ServeState::default()), repair: None }
+    }
+
+    /// Repairs the engine's unsafe chain through `engine` when the RPC chain drops a served block
+    /// (only used in [`FollowP2pMode::Primary`]).
+    pub(super) fn with_repair_engine(mut self, engine: Arc<dyn FollowEngine>) -> Self {
+        self.repair = Some(engine);
+        self
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ServeState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn pick_gossip(&self, number: u64) -> Result<Candidate, &'static str> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.lock_state();
+        if state.repair_pending || state.no_gossip_through.is_some_and(|h| number <= h) {
+            return Err("reorg");
+        }
         if state.last_gossip == Some(number) {
             return Err("retry");
         }
-        let Some((last_number, last_hash)) = state.last else {
+        let Some(last) = state.last() else {
             return Err("no_parent");
         };
         drop(state);
@@ -240,10 +329,10 @@ impl<R> GossipFirstClient<R> {
         if candidates.is_empty() {
             return Err("missing");
         }
-        if last_number.saturating_add(1) != number {
+        if last.number.saturating_add(1) != number {
             return Err("parent_mismatch");
         }
-        let mut matching = candidates.into_iter().filter(|c| c.parent_hash == last_hash);
+        let mut matching = candidates.into_iter().filter(|c| c.parent_hash == last.hash);
         match (matching.next(), matching.next()) {
             (Some(c), None) => Ok(c),
             (Some(_), Some(_)) => Err("ambiguous"),
@@ -251,12 +340,153 @@ impl<R> GossipFirstClient<R> {
         }
     }
 
-    fn record_served(&self, number: u64, hash: B256, from_gossip: bool) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.last = Some((number, hash));
-        if from_gossip {
-            state.last_gossip = Some(number);
+    fn serve_gossip(
+        &self,
+        number: u64,
+        candidate: Candidate,
+        raced: bool,
+    ) -> BaseExecutionPayloadEnvelope {
+        Metrics::follow_p2p_payload_source_total("p2p").increment(1);
+        debug!(target: "follow::p2p", block = number, hash = %candidate.hash, raced,
+            "Serving payload from gossip");
+        self.lock_state().record(number, candidate.hash, true);
+        candidate.payload
+    }
+
+    fn repair_failed(number: u64, reason: &'static str, detail: String) -> RemoteL2ClientError {
+        Metrics::follow_p2p_reorg_repair_failed_total(reason).increment(1);
+        warn!(target: "follow::p2p", block = number, reason, detail = %detail,
+            "Unsafe chain repair failed; retrying on the next fetch");
+        RemoteL2ClientError::ReorgRepair { block: number, reason: detail }
+    }
+}
+
+impl<R: RemoteClient> GossipFirstClient<R> {
+    /// Fetches `number` from the RPC sources, but takes its gossip copy instead when one that
+    /// passes [`Self::pick_gossip`] arrives before the RPC answer.
+    async fn rpc_or_gossip(&self, number: u64) -> Fetched {
+        let mut rpc = self.inner.get_payload_by_number(number);
+        loop {
+            // Registered before the cache is read, so an insert in between still wakes us.
+            let arrival = self.cache.arrivals.notified();
+            tokio::pin!(arrival);
+            arrival.as_mut().enable();
+            match self.pick_gossip(number) {
+                Ok(candidate) => return Fetched::Gossip(candidate),
+                Err("missing") => {}
+                Err(_) => return Fetched::Rpc(rpc.await),
+            }
+            tokio::select! {
+                biased;
+                result = &mut rpc => return Fetched::Rpc(result),
+                _ = &mut arrival => {}
+            }
         }
+    }
+
+    /// Makes the engine's unsafe chain end at the parent of `next` (the RPC payload at
+    /// `number`), replacing the served blocks the RPC chain did not keep.
+    ///
+    /// Walks the RPC chain back from `number - 1` to the first block whose parent is the block
+    /// served at that height (the common ancestor), at most [`MAX_REORG_REPAIR_DEPTH`] blocks and
+    /// never past the served blocks still remembered, checking that each RPC block is the parent
+    /// of the one after it. Any failure leaves the served state as it was, so the next request
+    /// for `number` retries; RPC errors are returned unchanged for the prefetcher's backoff.
+    async fn repair_served_chain(
+        &self,
+        engine: &dyn FollowEngine,
+        number: u64,
+        next: &BaseExecutionPayloadEnvelope,
+    ) -> Result<(), RemoteL2ClientError> {
+        let mut chain: Vec<BaseExecutionPayloadEnvelope> = Vec::new();
+        let mut expected = next.execution_payload.parent_hash();
+        let mut height = number.saturating_sub(1);
+        let ancestor = loop {
+            let served_parent = height.checked_sub(1).and_then(|p| self.lock_state().hash_at(p));
+            let Some(served_parent) =
+                served_parent.filter(|_| chain.len() < MAX_REORG_REPAIR_DEPTH)
+            else {
+                return Err(Self::repair_failed(
+                    number,
+                    "too_deep",
+                    format!(
+                        "no common ancestor within {} blocks (searched down to block {height})",
+                        chain.len()
+                    ),
+                ));
+            };
+            let payload = match self.inner.get_payload_by_number(height).await {
+                Ok(payload) => payload,
+                Err(e) => {
+                    Metrics::follow_p2p_reorg_repair_failed_total("rpc_error").increment(1);
+                    warn!(target: "follow::p2p", block = number, height, error = %e,
+                        "Unsafe chain repair could not read an RPC block; retrying on the next fetch");
+                    return Err(e);
+                }
+            };
+            let got = &payload.execution_payload;
+            if got.block_number() != height || got.block_hash() != expected {
+                return Err(Self::repair_failed(
+                    number,
+                    "discontinuous",
+                    format!(
+                        "RPC block {} {} is not the expected parent {expected} at {height}",
+                        got.block_number(),
+                        got.block_hash()
+                    ),
+                ));
+            }
+            let parent = got.parent_hash();
+            chain.push(payload);
+            if parent == served_parent {
+                break parent;
+            }
+            expected = parent;
+            height -= 1;
+        };
+        chain.reverse();
+        let canonical: Vec<(u64, B256)> = chain
+            .iter()
+            .map(|p| (p.execution_payload.block_number(), p.execution_payload.block_hash()))
+            .collect();
+        let from = canonical[0].0;
+        let depth = canonical.len();
+        match engine.replace_unsafe_chain(chain).await {
+            Ok(ChainReplace::Applied) => {}
+            Ok(ChainReplace::EngineBehind { unsafe_head }) => {
+                return Err(Self::repair_failed(
+                    number,
+                    "engine_behind",
+                    format!("engine unsafe head {unsafe_head} is below block {}", from - 1),
+                ));
+            }
+            Ok(ChainReplace::Unexpected { number: head, hash }) => {
+                return Err(Self::repair_failed(
+                    number,
+                    "engine_unexpected",
+                    format!("engine unsafe head is {head} {hash}"),
+                ));
+            }
+            Err(e) => return Err(Self::repair_failed(number, "engine_error", e.to_string())),
+        }
+
+        let mut state = self.lock_state();
+        let replaced = state.last();
+        let gossip_replaced =
+            state.served.iter().filter(|s| s.number >= from && s.from_gossip).count();
+        for &(n, h) in &canonical {
+            state.record(n, h, false);
+        }
+        state.no_gossip_through = Some(number.saturating_sub(1));
+        state.repair_pending = false;
+        drop(state);
+        Metrics::follow_p2p_reorg_repaired_total().increment(1);
+        warn!(target: "follow::p2p", block = number, from, to = number.saturating_sub(1), depth,
+            gossip_replaced, ancestor = %ancestor,
+            replaced_hash = %replaced.map(|s| s.hash).unwrap_or_default(),
+            canonical_hash = %next.execution_payload.parent_hash(),
+            "Repaired unsafe chain: replaced served blocks the RPC sources did not keep");
+        Ok(())
     }
 }
 
@@ -277,41 +507,58 @@ impl<R: RemoteClient> RemoteClient for GossipFirstClient<R> {
         &self,
         number: u64,
     ) -> Result<BaseExecutionPayloadEnvelope, RemoteL2ClientError> {
-        if self.mode == FollowP2pMode::Primary {
+        let fetched = if self.mode == FollowP2pMode::Primary {
             match self.pick_gossip(number) {
-                Ok(candidate) => {
-                    Metrics::follow_p2p_payload_source_total("p2p").increment(1);
-                    debug!(target: "follow::p2p", block = number, hash = %candidate.hash,
-                        "Serving payload from gossip");
-                    self.record_served(number, candidate.hash, true);
-                    return Ok(candidate.payload);
-                }
+                Ok(candidate) => return Ok(self.serve_gossip(number, candidate, false)),
+                Err("missing") => match self.rpc_or_gossip(number).await {
+                    Fetched::Gossip(candidate) => {
+                        return Ok(self.serve_gossip(number, candidate, true));
+                    }
+                    Fetched::Rpc(result) => {
+                        Metrics::follow_p2p_fallback_total("missing").increment(1);
+                        result
+                    }
+                },
                 Err(reason) => {
                     Metrics::follow_p2p_fallback_total(reason).increment(1);
-                    if reason != "missing" && reason != "no_parent" {
+                    if reason != "no_parent" {
                         warn!(target: "follow::p2p", block = number, reason,
                             "Gossip payload not used; reading from RPC sources");
                     }
+                    self.inner.get_payload_by_number(number).await
                 }
             }
-        }
+        } else {
+            self.inner.get_payload_by_number(number).await
+        };
 
-        let payload = self.inner.get_payload_by_number(number).await?;
+        let payload = fetched?;
         let rpc_ready = Instant::now();
         let hash = payload.execution_payload.block_hash();
         if self.mode == FollowP2pMode::Primary {
             // An RPC block that does not extend the block served just before it means the chain
-            // moved under us (an unsafe reorg); flag it, most of all after a gossip block.
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((last_number, last_hash)) = state.last
-                && last_number.saturating_add(1) == number
-                && payload.execution_payload.parent_hash() != last_hash
-            {
-                let after_gossip = state.last_gossip == Some(last_number);
-                drop(state);
-                Metrics::follow_p2p_fallback_total("rpc_parent_mismatch").increment(1);
-                warn!(target: "follow::p2p", block = number, after_gossip,
-                    "RPC payload does not extend the previously served block");
+            // moved under us (an unsafe reorg), most of all after a gossip block. Returning it
+            // as is would make the engine drop it and then sync on the block after it.
+            let parent_hash = payload.execution_payload.parent_hash();
+            let (tip, first_report) = {
+                let mut state = self.lock_state();
+                let tip = state.last().filter(|tip| {
+                    tip.number.saturating_add(1) == number && tip.hash != parent_hash
+                });
+                let first_report = !state.repair_pending;
+                state.repair_pending = tip.is_some() && self.repair.is_some();
+                (tip, first_report)
+            };
+            if let Some(tip) = tip {
+                if first_report {
+                    Metrics::follow_p2p_fallback_total("rpc_parent_mismatch").increment(1);
+                    warn!(target: "follow::p2p", block = number, after_gossip = tip.from_gossip,
+                        served_hash = %tip.hash, rpc_parent_hash = %parent_hash,
+                        "RPC payload does not extend the previously served block");
+                }
+                if let Some(engine) = &self.repair {
+                    self.repair_served_chain(engine.as_ref(), number, &payload).await?;
+                }
             }
         }
         Metrics::follow_p2p_payload_source_total("rpc").increment(1);
@@ -320,8 +567,8 @@ impl<R: RemoteClient> RemoteClient for GossipFirstClient<R> {
             let candidates = self.cache.candidates(number);
             match candidates.iter().find(|c| c.hash == hash) {
                 Some(c) => {
-                    let lead_ms = rpc_ready.saturating_duration_since(c.received).as_secs_f64()
-                        * 1000.0;
+                    let lead_ms =
+                        rpc_ready.saturating_duration_since(c.received).as_secs_f64() * 1000.0;
                     Metrics::follow_p2p_lead_seconds().record(lead_ms / 1000.0);
                     debug!(target: "follow::p2p", block = number, lead_ms = lead_ms.round() as i64,
                         "Gossip had block before RPC fetch completed");
@@ -337,7 +584,7 @@ impl<R: RemoteClient> RemoteClient for GossipFirstClient<R> {
                 }
             }
         }
-        self.record_served(number, hash, false);
+        self.lock_state().record(number, hash, false);
         Ok(payload)
     }
 }
@@ -353,12 +600,28 @@ pub(super) fn log_network_exit(result: Result<(), impl std::fmt::Display>) {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::{HashMap, HashSet},
+        time::Duration,
+    };
+
+    use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{Address, Bloom, Bytes, U256};
-    use alloy_rpc_types_engine::ExecutionPayloadV1;
+    use alloy_rpc_types_engine::{
+        ExecutionPayloadV1, ForkchoiceUpdated, PayloadStatus, PayloadStatusEnum,
+    };
+    use alloy_transport::TransportErrorKind;
+    use base_common_consensus::{BaseBlock, BaseTxEnvelope, TxDeposit};
+    use base_common_genesis::RollupConfig;
     use base_common_rpc_types_engine::BaseExecutionPayload;
+    use base_consensus_engine::test_utils::{MockEngineClient, test_engine_client_builder};
+    use base_protocol::{L1BlockInfoBedrock, L2BlockInfo};
 
     use super::*;
-    use crate::follow::source::MockRemoteClient;
+    use crate::follow::{
+        engine::{EngineApiFollowEngine, MockFollowEngine},
+        source::MockRemoteClient,
+    };
 
     fn hash(n: u64, variant: u8) -> B256 {
         let mut b = [0u8; 32];
@@ -399,6 +662,222 @@ mod tests {
         p.execution_payload.block_hash()
     }
 
+    /// RPC sources backed by a chain the test can change, with a call log and one-shot failures.
+    #[derive(Clone, Default)]
+    struct Rpc {
+        chain: Arc<Mutex<HashMap<u64, BaseExecutionPayloadEnvelope>>>,
+        calls: Arc<Mutex<Vec<u64>>>,
+        fail_once: Arc<Mutex<HashSet<u64>>>,
+    }
+
+    impl Rpc {
+        fn with(blocks: impl IntoIterator<Item = BaseExecutionPayloadEnvelope>) -> Self {
+            let rpc = Self::default();
+            rpc.set(blocks);
+            rpc
+        }
+
+        fn set(&self, blocks: impl IntoIterator<Item = BaseExecutionPayloadEnvelope>) {
+            let mut chain = self.chain.lock().unwrap();
+            for b in blocks {
+                chain.insert(b.execution_payload.block_number(), b);
+            }
+        }
+
+        fn calls(&self) -> Vec<u64> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn client(&self) -> MockRemoteClient {
+            let rpc = self.clone();
+            let mut source = MockRemoteClient::new();
+            source.expect_get_payload_by_number().returning(move |n| {
+                rpc.calls.lock().unwrap().push(n);
+                if rpc.fail_once.lock().unwrap().remove(&n) {
+                    return Err(RemoteL2ClientError::FetchBlock {
+                        tag: n.to_string(),
+                        source: TransportErrorKind::custom_str("rpc fixture"),
+                    });
+                }
+                rpc.chain
+                    .lock()
+                    .unwrap()
+                    .get(&n)
+                    .cloned()
+                    .ok_or_else(|| RemoteL2ClientError::BlockNotFound(n.to_string()))
+            });
+            source
+        }
+    }
+
+    /// Fake-hash chain `variant` for heights `range` (each block's parent has the same variant).
+    fn fake_chain(
+        range: std::ops::RangeInclusive<u64>,
+        variant: u8,
+    ) -> Vec<BaseExecutionPayloadEnvelope> {
+        range.map(|n| payload(n, variant, variant)).collect()
+    }
+
+    /// A repair engine that records the heights of each replacement and accepts it.
+    fn recording_engine(replaced: Arc<Mutex<Vec<Vec<u64>>>>) -> MockFollowEngine {
+        let mut engine = MockFollowEngine::new();
+        engine.expect_replace_unsafe_chain().returning(move |payloads| {
+            replaced
+                .lock()
+                .unwrap()
+                .push(payloads.iter().map(|p| p.execution_payload.block_number()).collect());
+            Ok(ChainReplace::Applied)
+        });
+        engine
+    }
+
+    fn primary(rpc: &Rpc, cache: &Arc<GossipPayloadCache>) -> GossipFirstClient<MockRemoteClient> {
+        GossipFirstClient::new(rpc.client(), Arc::clone(cache), FollowP2pMode::Primary)
+    }
+
+    // Real engine fixtures: blocks with an L1 info deposit and their true header hash, so the
+    // engine's insert rules (extend, skip older, authoritative reorg) apply as in production.
+
+    const GENESIS: B256 = B256::repeat_byte(0xaa);
+
+    fn sealed(number: u64, parent_hash: B256, salt: u8) -> BaseExecutionPayloadEnvelope {
+        let deposit = BaseTxEnvelope::from(TxDeposit {
+            input: L1BlockInfoBedrock::default().encode_calldata(),
+            ..Default::default()
+        })
+        .encoded_2718();
+        let mut inner = ExecutionPayloadV1 {
+            parent_hash,
+            fee_recipient: Address::ZERO,
+            state_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: Bloom::ZERO,
+            prev_randao: B256::ZERO,
+            block_number: number,
+            gas_limit: 30_000_000,
+            gas_used: 0,
+            timestamp: number,
+            extra_data: Bytes::from(vec![salt]),
+            base_fee_per_gas: U256::ZERO,
+            block_hash: B256::ZERO,
+            transactions: vec![deposit.into()],
+        };
+        let block: BaseBlock =
+            BaseExecutionPayload::V1(inner.clone()).try_into_block().expect("valid fixture");
+        inner.block_hash = block.header.hash_slow();
+        BaseExecutionPayloadEnvelope {
+            parent_beacon_block_root: None,
+            execution_payload: BaseExecutionPayload::V1(inner),
+        }
+    }
+
+    /// Blocks `from..=to` on top of `parent`, distinguished by `salt`.
+    fn sealed_chain(
+        parent: B256,
+        from: u64,
+        to: u64,
+        salt: u8,
+    ) -> Vec<BaseExecutionPayloadEnvelope> {
+        let mut parent = parent;
+        (from..=to)
+            .map(|n| {
+                let block = sealed(n, parent, salt);
+                parent = block.execution_payload.block_hash();
+                block
+            })
+            .collect()
+    }
+
+    fn real_engine() -> (Arc<EngineApiFollowEngine<MockEngineClient>>, Arc<MockEngineClient>) {
+        let rollup_config = Arc::new(RollupConfig::default());
+        let valid = PayloadStatus { status: PayloadStatusEnum::Valid, latest_valid_hash: None };
+        let client = Arc::new(
+            test_engine_client_builder()
+                .with_config(Arc::clone(&rollup_config))
+                .with_new_payload_v2_response(valid.clone())
+                .with_fork_choice_updated_v3_response(ForkchoiceUpdated {
+                    payload_status: valid,
+                    payload_id: None,
+                })
+                .build(),
+        );
+        let genesis = L2BlockInfo {
+            block_info: BlockInfo { hash: GENESIS, number: 0, ..Default::default() },
+            ..Default::default()
+        };
+        let engine = Arc::new(EngineApiFollowEngine::new(
+            Arc::clone(&client),
+            rollup_config,
+            genesis,
+            genesis,
+            genesis,
+        ));
+        (engine, client)
+    }
+
+    async fn head_hash(engine: &EngineApiFollowEngine<MockEngineClient>) -> B256 {
+        engine.unsafe_head().await.block_info.hash
+    }
+
+    async fn last_new_payload(client: &MockEngineClient) -> B256 {
+        client.last_new_payload_v2().await.expect("a payload was sent").execution_payload.block_hash
+    }
+
+    async fn forkchoice_heads(client: &MockEngineClient) -> Vec<B256> {
+        let storage = client.storage();
+        let storage = storage.read().await;
+        storage.fork_choice_updated_v3_requests.iter().map(|(s, _)| s.head_block_hash).collect()
+    }
+
+    /// Canonical blocks 1..=6, a sibling gossip block 3' (same parent as canonical 3) and a
+    /// gossip 4' on top of it, plus a primary client wired to the real engine.
+    struct Equivocation {
+        canonical: Vec<BaseExecutionPayloadEnvelope>,
+        fork: Vec<BaseExecutionPayloadEnvelope>,
+        rpc: Rpc,
+        cache: Arc<GossipPayloadCache>,
+        engine: Arc<EngineApiFollowEngine<MockEngineClient>>,
+        client: Arc<MockEngineClient>,
+        source: GossipFirstClient<MockRemoteClient>,
+    }
+
+    impl Equivocation {
+        fn new() -> Self {
+            let canonical = sealed_chain(GENESIS, 1, 6, 0);
+            let fork = sealed_chain(canonical[1].execution_payload.block_hash(), 3, 4, 9);
+            let rpc = Rpc::with(canonical.clone());
+            let cache = Arc::new(GossipPayloadCache::default());
+            let (engine, client) = real_engine();
+            let source = primary(&rpc, &cache)
+                .with_repair_engine(Arc::clone(&engine) as Arc<dyn FollowEngine>);
+            Self { canonical, fork, rpc, cache, engine, client, source }
+        }
+
+        fn hash(&self, n: u64) -> B256 {
+            self.canonical[n as usize - 1].execution_payload.block_hash()
+        }
+
+        fn fork_hash(&self, n: u64) -> B256 {
+            self.fork[n as usize - 3].execution_payload.block_hash()
+        }
+
+        /// Serves and inserts canonical 1 and 2 from RPC, then serves gossip `3'..=to'`.
+        async fn serve_fork(&self, to: u64) -> Vec<BaseExecutionPayloadEnvelope> {
+            for n in 1..=2 {
+                let p = self.source.get_payload_by_number(n).await.unwrap();
+                self.engine.insert_payload(p).await.unwrap();
+            }
+            let mut served = Vec::new();
+            for n in 3..=to {
+                self.cache.insert(self.fork[n as usize - 3].clone(), Instant::now());
+                let p = self.source.get_payload_by_number(n).await.unwrap();
+                assert_eq!(served_hash(&p), self.fork_hash(n), "gossip {n}' is served");
+                served.push(p);
+            }
+            served
+        }
+    }
+
     #[test]
     fn mode_parses_and_defaults_off() {
         assert_eq!("".parse::<FollowP2pMode>().unwrap(), FollowP2pMode::Off);
@@ -427,7 +906,8 @@ mod tests {
     #[tokio::test]
     async fn shadow_always_reads_rpc() {
         let cache = Arc::new(GossipPayloadCache::default());
-        let client = GossipFirstClient::new(rpc_source(7), Arc::clone(&cache), FollowP2pMode::Shadow);
+        let client =
+            GossipFirstClient::new(rpc_source(7), Arc::clone(&cache), FollowP2pMode::Shadow);
         client.get_payload_by_number(1).await.unwrap();
         cache.insert(payload(2, 1, 7), Instant::now());
         let p = client.get_payload_by_number(2).await.unwrap();
@@ -437,7 +917,8 @@ mod tests {
     #[tokio::test]
     async fn primary_serves_gossip_only_on_a_matching_parent() {
         let cache = Arc::new(GossipPayloadCache::default());
-        let client = GossipFirstClient::new(rpc_source(7), Arc::clone(&cache), FollowP2pMode::Primary);
+        let client =
+            GossipFirstClient::new(rpc_source(7), Arc::clone(&cache), FollowP2pMode::Primary);
         // First payload after start comes from RPC (no known parent yet).
         cache.insert(payload(1, 1, 7), Instant::now());
         assert_eq!(served_hash(&client.get_payload_by_number(1).await.unwrap()), hash(1, 7));
@@ -454,7 +935,8 @@ mod tests {
     #[tokio::test]
     async fn primary_falls_back_on_ambiguity_and_on_repeat_requests() {
         let cache = Arc::new(GossipPayloadCache::default());
-        let client = GossipFirstClient::new(rpc_source(7), Arc::clone(&cache), FollowP2pMode::Primary);
+        let client =
+            GossipFirstClient::new(rpc_source(7), Arc::clone(&cache), FollowP2pMode::Primary);
         client.get_payload_by_number(1).await.unwrap();
         // Two candidates with the right parent: ambiguous, so RPC.
         cache.insert(payload(2, 1, 7), Instant::now());
@@ -496,11 +978,276 @@ mod tests {
         assert_eq!(*rx.borrow(), 0);
         assert_eq!(cache.highest(), Some(5));
 
-        let primary = GossipCacheEngineClient::new(Arc::clone(&cache), FollowP2pMode::Primary, Some(tx));
+        let primary =
+            GossipCacheEngineClient::new(Arc::clone(&cache), FollowP2pMode::Primary, Some(tx));
         primary.send_unsafe_block(payload(6, 1, 1)).await.unwrap();
         assert_eq!(*rx.borrow(), 6);
         // An older block never lowers the hint.
         primary.send_unsafe_block(payload(4, 1, 1)).await.unwrap();
         assert_eq!(*rx.borrow(), 6);
+    }
+
+    #[tokio::test]
+    async fn repair_after_the_gossip_block_was_inserted_reorgs_to_canonical() {
+        let t = Equivocation::new();
+        let fork = t.serve_fork(3).await;
+        // The insert loop already applied 3'.
+        t.engine.insert_payload(fork[0].clone()).await.unwrap();
+        assert_eq!(head_hash(&t.engine).await, t.fork_hash(3));
+
+        let p4 = t.source.get_payload_by_number(4).await.unwrap();
+        assert_eq!(served_hash(&p4), t.hash(4));
+        assert_eq!(head_hash(&t.engine).await, t.hash(3), "authoritative insert reorged 3' -> 3");
+        t.engine.insert_payload(p4).await.unwrap();
+        assert_eq!(head_hash(&t.engine).await, t.hash(4), "RPC 4 now extends the head");
+        let heads = forkchoice_heads(&t.client).await;
+        assert_eq!(&heads[heads.len() - 3..], &[t.fork_hash(3), t.hash(3), t.hash(4)]);
+        assert_eq!(t.rpc.calls(), vec![1, 2, 4, 3]);
+    }
+
+    #[tokio::test]
+    async fn repair_before_the_queued_gossip_block_is_inserted_converges() {
+        let t = Equivocation::new();
+        let fork = t.serve_fork(3).await;
+        // 3' is still queued for the insert loop when RPC 4 shows the canonical chain.
+        let p4 = t.source.get_payload_by_number(4).await.unwrap();
+        assert_eq!(head_hash(&t.engine).await, t.hash(3));
+        // The queued 3' arrives afterwards: same height as the head, so it is skipped unsent.
+        t.engine.insert_payload(fork[0].clone()).await.unwrap();
+        assert_eq!(head_hash(&t.engine).await, t.hash(3));
+        assert_eq!(last_new_payload(&t.client).await, t.hash(3), "3' never reaches the EL");
+        t.engine.insert_payload(p4).await.unwrap();
+        assert_eq!(head_hash(&t.engine).await, t.hash(4));
+        assert!(!forkchoice_heads(&t.client).await.contains(&t.fork_hash(3)));
+    }
+
+    #[tokio::test]
+    async fn depth_two_repair_replaces_both_gossip_blocks() {
+        let t = Equivocation::new();
+        let fork = t.serve_fork(4).await;
+        // 3' was inserted, 4' is still queued.
+        t.engine.insert_payload(fork[0].clone()).await.unwrap();
+
+        let p5 = t.source.get_payload_by_number(5).await.unwrap();
+        assert_eq!(served_hash(&p5), t.hash(5));
+        assert_eq!(head_hash(&t.engine).await, t.hash(4));
+        t.engine.insert_payload(fork[1].clone()).await.unwrap();
+        assert_eq!(head_hash(&t.engine).await, t.hash(4), "queued 4' is skipped");
+        t.engine.insert_payload(p5).await.unwrap();
+        assert_eq!(head_hash(&t.engine).await, t.hash(5));
+        assert_eq!(t.rpc.calls(), vec![1, 2, 5, 4, 3]);
+
+        // Later heights follow the repaired chain: gossip 6 on canonical 5 is served again.
+        t.cache.insert(t.canonical[5].clone(), Instant::now());
+        let p6 = t.source.get_payload_by_number(6).await.unwrap();
+        assert_eq!(served_hash(&p6), t.hash(6));
+        assert_eq!(t.rpc.calls(), vec![1, 2, 5, 4, 3], "6 came from gossip");
+    }
+
+    #[tokio::test]
+    async fn repair_waits_for_the_engine_to_reach_the_common_ancestor() {
+        let t = Equivocation::new();
+        // Served 1, 2 (RPC) and 3' (gossip) but the insert loop has not applied anything yet.
+        for n in 1..=2 {
+            t.source.get_payload_by_number(n).await.unwrap();
+        }
+        t.cache.insert(t.fork[0].clone(), Instant::now());
+        let fork3 = t.source.get_payload_by_number(3).await.unwrap();
+        let err = t.source.get_payload_by_number(4).await.unwrap_err();
+        assert!(matches!(err, RemoteL2ClientError::ReorgRepair { block: 4, .. }), "{err:?}");
+        assert!(t.client.last_new_payload_v2().await.is_none(), "nothing sent ahead of the EL");
+
+        // The insert loop drains the queue (1, 2, 3'), then the retry repairs.
+        for p in [t.canonical[0].clone(), t.canonical[1].clone(), fork3] {
+            t.engine.insert_payload(p).await.unwrap();
+        }
+        let p4 = t.source.get_payload_by_number(4).await.unwrap();
+        assert_eq!(served_hash(&p4), t.hash(4));
+        assert_eq!(head_hash(&t.engine).await, t.hash(3));
+    }
+
+    async fn serve_fake_fork(
+        depth: u64,
+    ) -> (Result<BaseExecutionPayloadEnvelope, RemoteL2ClientError>, Vec<Vec<u64>>, Vec<u64>) {
+        // RPC: chain 7. Gossip: 2..=depth+1 on chain 1, forking off RPC block 1.
+        let rpc = Rpc::with(fake_chain(1..=depth + 2, 7));
+        let cache = Arc::new(GossipPayloadCache::default());
+        let replaced = Arc::new(Mutex::new(Vec::new()));
+        let source = primary(&rpc, &cache)
+            .with_repair_engine(Arc::new(recording_engine(Arc::clone(&replaced))));
+        source.get_payload_by_number(1).await.unwrap();
+        for n in 2..=depth + 1 {
+            cache.insert(payload(n, 1, if n == 2 { 7 } else { 1 }), Instant::now());
+            assert_eq!(served_hash(&source.get_payload_by_number(n).await.unwrap()), hash(n, 1));
+        }
+        let result = source.get_payload_by_number(depth + 2).await;
+        let replaced = replaced.lock().unwrap().clone();
+        (result, replaced, rpc.calls())
+    }
+
+    #[tokio::test]
+    async fn repair_is_bounded_in_depth() {
+        let depth = MAX_REORG_REPAIR_DEPTH as u64;
+        let (result, replaced, _) = serve_fake_fork(depth).await;
+        assert_eq!(served_hash(&result.unwrap()), hash(depth + 2, 7));
+        assert_eq!(replaced, vec![(2..=depth + 1).collect::<Vec<_>>()]);
+
+        let (result, replaced, calls) = serve_fake_fork(depth + 1).await;
+        assert!(
+            matches!(result, Err(RemoteL2ClientError::ReorgRepair { block, .. }) if block == depth + 3)
+        );
+        assert!(replaced.is_empty(), "nothing is inserted without a common ancestor");
+        assert_eq!(calls.len(), 1 + 1 + MAX_REORG_REPAIR_DEPTH, "1, the new block, the walk");
+    }
+
+    #[tokio::test]
+    async fn repair_never_walks_past_the_served_blocks() {
+        let rpc = Rpc::with(fake_chain(1..=3, 7));
+        let cache = Arc::new(GossipPayloadCache::default());
+        let replaced = Arc::new(Mutex::new(Vec::new()));
+        let source = primary(&rpc, &cache)
+            .with_repair_engine(Arc::new(recording_engine(Arc::clone(&replaced))));
+        source.get_payload_by_number(1).await.unwrap();
+        cache.insert(payload(2, 1, 7), Instant::now());
+        source.get_payload_by_number(2).await.unwrap();
+        // The RPC chain now differs from block 1 on, which was the first block served.
+        rpc.set(fake_chain(1..=3, 8));
+        let err = source.get_payload_by_number(3).await.unwrap_err();
+        assert!(matches!(err, RemoteL2ClientError::ReorgRepair { block: 3, .. }), "{err:?}");
+        assert!(replaced.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repair_rejects_a_discontinuous_rpc_chain() {
+        let rpc = Rpc::with(fake_chain(1..=4, 7));
+        let cache = Arc::new(GossipPayloadCache::default());
+        let replaced = Arc::new(Mutex::new(Vec::new()));
+        let source = primary(&rpc, &cache)
+            .with_repair_engine(Arc::new(recording_engine(Arc::clone(&replaced))));
+        for n in 1..=2 {
+            source.get_payload_by_number(n).await.unwrap();
+        }
+        cache.insert(payload(3, 1, 7), Instant::now());
+        source.get_payload_by_number(3).await.unwrap();
+        // Block 3 from RPC is not the parent RPC block 4 names (sources disagree).
+        rpc.set([payload(3, 5, 7)]);
+        let err = source.get_payload_by_number(4).await.unwrap_err();
+        assert!(matches!(err, RemoteL2ClientError::ReorgRepair { block: 4, .. }), "{err:?}");
+        assert!(replaced.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rpc_error_mid_repair_is_returned_and_the_retry_repairs() {
+        let rpc = Rpc::with(fake_chain(1..=4, 7));
+        let cache = Arc::new(GossipPayloadCache::default());
+        let replaced = Arc::new(Mutex::new(Vec::new()));
+        let source = primary(&rpc, &cache)
+            .with_repair_engine(Arc::new(recording_engine(Arc::clone(&replaced))));
+        for n in 1..=2 {
+            source.get_payload_by_number(n).await.unwrap();
+        }
+        cache.insert(payload(3, 1, 7), Instant::now());
+        assert_eq!(served_hash(&source.get_payload_by_number(3).await.unwrap()), hash(3, 1));
+
+        rpc.fail_once.lock().unwrap().insert(3);
+        let err = source.get_payload_by_number(4).await.unwrap_err();
+        assert!(matches!(err, RemoteL2ClientError::FetchBlock { .. }), "{err:?}");
+        assert!(replaced.lock().unwrap().is_empty());
+
+        // The fork continues on gossip, but nothing is served from gossip until the repair.
+        cache.insert(payload(4, 1, 1), Instant::now());
+        let p4 = source.get_payload_by_number(4).await.unwrap();
+        assert_eq!(served_hash(&p4), hash(4, 7));
+        assert_eq!(*replaced.lock().unwrap(), vec![vec![3]]);
+        assert_eq!(rpc.calls(), vec![1, 2, 4, 3, 4, 3]);
+    }
+
+    #[tokio::test]
+    async fn shadow_never_repairs() {
+        let rpc = Rpc::with(fake_chain(1..=2, 7));
+        let cache = Arc::new(GossipPayloadCache::default());
+        // No expectations: any engine call panics.
+        let source =
+            GossipFirstClient::new(rpc.client(), Arc::clone(&cache), FollowP2pMode::Shadow)
+                .with_repair_engine(Arc::new(MockFollowEngine::new()));
+        for n in 1..=2 {
+            source.get_payload_by_number(n).await.unwrap();
+        }
+        rpc.set(fake_chain(3..=3, 8));
+        assert_eq!(served_hash(&source.get_payload_by_number(3).await.unwrap()), hash(3, 8));
+        assert_eq!(rpc.calls(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn consistent_chain_needs_no_extra_rpc_calls() {
+        let rpc = Rpc::with(fake_chain(1..=5, 7));
+        let cache = Arc::new(GossipPayloadCache::default());
+        let source = primary(&rpc, &cache).with_repair_engine(Arc::new(MockFollowEngine::new()));
+        source.get_payload_by_number(1).await.unwrap();
+        for n in [2, 3, 5] {
+            cache.insert(payload(n, 7, 7), Instant::now());
+        }
+        for n in 2..=5 {
+            assert_eq!(served_hash(&source.get_payload_by_number(n).await.unwrap()), hash(n, 7));
+        }
+        assert_eq!(rpc.calls(), vec![1, 4], "2, 3 and 5 came from gossip");
+    }
+
+    /// RPC sources that answer after a delay; `automock` cannot hold an answer back while a gossip
+    /// block arrives.
+    #[derive(Debug)]
+    struct SlowRpc {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl RemoteClient for SlowRpc {
+        async fn get_block_number(&self, _: BlockNumberOrTag) -> Result<u64, RemoteL2ClientError> {
+            Ok(0)
+        }
+
+        async fn get_block_info(
+            &self,
+            _: BlockNumberOrTag,
+        ) -> Result<BlockInfo, RemoteL2ClientError> {
+            Ok(BlockInfo::default())
+        }
+
+        async fn get_payload_by_number(
+            &self,
+            number: u64,
+        ) -> Result<BaseExecutionPayloadEnvelope, RemoteL2ClientError> {
+            if number > 1 {
+                tokio::time::sleep(self.delay).await;
+            }
+            Ok(payload(number, 7, 7))
+        }
+    }
+
+    #[tokio::test]
+    async fn gossip_arriving_during_the_rpc_fetch_is_served() {
+        let delay = Duration::from_secs(2);
+        let cache = Arc::new(GossipPayloadCache::default());
+        let source =
+            GossipFirstClient::new(SlowRpc { delay }, Arc::clone(&cache), FollowP2pMode::Primary);
+        source.get_payload_by_number(1).await.unwrap();
+
+        let arrive = |p: BaseExecutionPayloadEnvelope| {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                cache.insert(p, Instant::now());
+            })
+        };
+        arrive(payload(2, 1, 7));
+        let started = Instant::now();
+        let p2 = source.get_payload_by_number(2).await.unwrap();
+        assert_eq!(served_hash(&p2), hash(2, 1), "gossip copy wins the race");
+        assert!(started.elapsed() < delay / 2);
+
+        // A gossip block that does not extend the served one does not end the RPC wait early.
+        arrive(payload(3, 1, 9));
+        let p3 = source.get_payload_by_number(3).await.unwrap();
+        assert_eq!(served_hash(&p3), hash(3, 7));
     }
 }

@@ -138,6 +138,16 @@ pub enum RemoteL2ClientError {
     /// A fallback source URL is not usable.
     #[error("invalid follow source: {0}")]
     InvalidSource(String),
+
+    /// The RPC payload at `block` does not extend the block served before it, and replacing the
+    /// served blocks with the RPC chain did not succeed (retried on the next fetch).
+    #[error("unsafe chain repair before block {block} failed: {reason}")]
+    ReorgRepair {
+        /// The RPC payload height that did not extend the served chain.
+        block: u64,
+        /// Why the repair did not complete.
+        reason: String,
+    },
 }
 
 /// Trait for fetching L2 block data from the remote node.
