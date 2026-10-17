@@ -381,11 +381,16 @@ impl PeerSelector {
     }
 
     /// The delivery score: higher is better. Average peers score about `1 / target`.
+    ///
+    /// The prior is scaled by [`rtt_weight`]: on trader-va every peer that ever delivered a block
+    /// first was within 20 ms, and none of the peers 50 ms or more away did, so a far newcomer
+    /// starts low and a near one at the average.
     pub fn score(&self, peer: &PeerId, now: Instant) -> f64 {
         let Some(p) = self.peers.get(peer) else { return self.prior() };
         let f = 0.5f64.powf(self.seq.saturating_sub(p.seq) as f64 / self.config.half_life_blocks);
         let (wins, eligible) = (p.wins * f, p.eligible * f);
-        let rate = PRIOR_BLOCKS.mul_add(self.prior(), wins) / (eligible + PRIOR_BLOCKS);
+        let prior = self.prior() * rtt_weight(p.rtt);
+        let rate = PRIOR_BLOCKS.mul_add(prior, wins) / (eligible + PRIOR_BLOCKS);
         rate / (1.0 + p.decayed_disconnects(now))
     }
 
@@ -599,6 +604,24 @@ impl PeerSelector {
         v.sort_by(|a, b| b.1.total_cmp(&a.1));
         v
     }
+}
+
+/// Round trip at or below which a peer's prior is the full average-peer prior.
+pub const RTT_NEAR: Duration = Duration::from_millis(25);
+
+/// Round trip at or above which a peer's prior is [`RTT_FAR_WEIGHT`] of it.
+pub const RTT_FAR: Duration = Duration::from_millis(100);
+
+/// Prior weight of a peer at or beyond [`RTT_FAR`].
+pub const RTT_FAR_WEIGHT: f64 = 0.1;
+
+/// Prior weight for a ping round trip: 1 up to [`RTT_NEAR`], falling linearly to
+/// [`RTT_FAR_WEIGHT`] at [`RTT_FAR`]. Unknown (not pinged yet): 1.
+pub fn rtt_weight(rtt: Option<Duration>) -> f64 {
+    let Some(rtt) = rtt else { return 1.0 };
+    let (near, far) = (RTT_NEAR.as_secs_f64(), RTT_FAR.as_secs_f64());
+    let x = ((rtt.as_secs_f64() - near) / (far - near)).clamp(0.0, 1.0);
+    (RTT_FAR_WEIGHT - 1.0).mul_add(x, 1.0)
 }
 
 /// Reads the store: one `<multiaddr> [score] [wins]` per line, `#` comments. Bad lines are
@@ -934,6 +957,27 @@ mod tests {
     }
 
     #[test]
+    fn far_newcomers_start_low() {
+        assert_eq!(rtt_weight(None), 1.0);
+        assert_eq!(rtt_weight(Some(Duration::from_millis(10))), 1.0);
+        assert!((rtt_weight(Some(Duration::from_micros(62_500))) - 0.55).abs() < 1e-9);
+        assert_eq!(rtt_weight(Some(Duration::from_millis(180))), RTT_FAR_WEIGHT);
+        let t0 = Instant::now();
+        let mut s = PeerSelector::new(cfg());
+        let (near, far) = (PeerId::random(), PeerId::random());
+        s.on_connected(near, None, t0);
+        s.on_connected(far, None, t0);
+        s.on_rtt(near, Duration::from_millis(12));
+        s.on_rtt(far, Duration::from_millis(150));
+        assert!(s.score(&near, t0) > 5.0 * s.score(&far, t0));
+        // Wins outweigh the prior: a far peer that delivers first is kept.
+        for _ in 0..200 {
+            s.on_block(far, &[near, far], |_| true, t0);
+        }
+        assert!(s.score(&far, t0) > s.score(&near, t0));
+    }
+
+    #[test]
     fn public_tcp_filter() {
         for (a, ok) in [
             ("/ip4/9.9.9.9/tcp/1", true),
@@ -973,14 +1017,21 @@ mod tests {
         let Ok(path) = std::env::var("BASE_P2P_SELECT_REPLAY") else { return };
         let text = std::fs::read_to_string(&path).expect("replay file");
         let settings = std::env::var("BASE_P2P_SELECT_REPLAY_KE").unwrap_or_else(|_| "8:4".into());
+        let seeds: u64 = std::env::var("BASE_P2P_SELECT_REPLAY_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
         for ke in settings.split(',') {
-            let (k, e) = ke.split_once(':').expect("keep:explore");
+            let v: Vec<u64> = ke.split(':').map(|x| x.parse().unwrap()).collect();
             let config = PeerSelectConfig {
-                keep: k.parse().unwrap(),
-                explore: e.parse().unwrap(),
+                keep: v[0] as usize,
+                explore: v[1] as usize,
+                probation: Duration::from_secs(v.get(2).copied().unwrap_or(600)),
                 ..PeerSelectConfig::default()
             };
-            println!("{}", replay(&text, config));
+            for seed in 0..seeds {
+                println!("{}", replay(&text, config.clone(), seed));
+            }
         }
     }
 
@@ -988,8 +1039,11 @@ mod tests {
     /// assumed to arrive this much after the actual first copy.
     const CENSORED_MS: f64 = 100.0;
 
-    fn replay(text: &str, config: PeerSelectConfig) -> String {
+    /// `seed` shuffles the order in which simultaneous connections are admitted (0: file order).
+    fn replay(text: &str, config: PeerSelectConfig, seed: u64) -> String {
         let t0 = Instant::now();
+        let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut rtts: HashMap<PeerId, Duration> = HashMap::new();
         let mut ids: HashMap<String, PeerId> = HashMap::new();
         let mut id = |s: &str| *ids.entry(s.to_string()).or_insert_with(PeerId::random);
         let mut s = PeerSelector::new(config.clone());
@@ -1000,14 +1054,23 @@ mod tests {
         let (mut extra, mut lead_real, mut lead_sel): (Vec<f64>, Vec<f64>, Vec<f64>) =
             (Vec::new(), Vec::new(), Vec::new());
         let (mut out_all, mut out_kept, mut admitted_sum) = (0u64, 0u64, 0u64);
-        let admit =
-            |s: &PeerSelector, real: &[PeerId], admitted: &mut Vec<PeerId>, now: Instant| {
-                for p in real {
-                    if !admitted.contains(p) && s.allow_dial(p, admitted.len(), 0, now) {
-                        admitted.push(*p);
+        fn admit_now(
+            s: &mut PeerSelector,
+            real: &[PeerId],
+            admitted: &mut Vec<PeerId>,
+            rtts: &HashMap<PeerId, Duration>,
+            now: Instant,
+        ) {
+            for p in real {
+                if !admitted.contains(p) && s.allow_dial(p, admitted.len(), 0, now) {
+                    admitted.push(*p);
+                    s.on_connected(*p, None, now);
+                    if let Some(r) = rtts.get(p) {
+                        s.on_rtt(*p, *r);
                     }
                 }
-            };
+            }
+        }
         for line in text.lines() {
             let f: Vec<&str> = line.split(' ').collect();
             let now = t0 + Duration::from_millis(f[1].parse().unwrap());
@@ -1019,23 +1082,27 @@ mod tests {
                     s.on_disconnected(*p, true, at);
                     prunes += 1;
                 }
-                admit(&s, &real, &mut admitted, at);
-                for p in &admitted {
-                    if s.stats(p).is_none_or(|st| st.connected_since.is_none()) {
-                        s.on_connected(*p, None, at);
-                    }
-                }
                 next_tick += config.interval;
+                admit_now(&mut s, &real, &mut admitted, &rtts, at);
+            }
+            if f[0] == "B" {
+                admit_now(&mut s, &real, &mut admitted, &rtts, now);
             }
             match f[0] {
                 "C" => {
                     let p = id(f[2]);
-                    if !real.contains(&p) {
-                        real.push(p);
+                    if let Some(ms) = f.get(3).and_then(|v| v.parse::<f64>().ok()) {
+                        rtts.insert(p, Duration::from_secs_f64(ms / 1000.0));
                     }
-                    if !admitted.contains(&p) && s.allow_dial(&p, admitted.len(), 0, now) {
-                        admitted.push(p);
-                        s.on_connected(p, None, now);
+                    if !real.contains(&p) {
+                        // Insert at a random position among the connections of the same instant.
+                        let pos = if seed == 0 {
+                            real.len()
+                        } else {
+                            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            (rng >> 33) as usize % (real.len() + 1)
+                        };
+                        real.insert(pos, p);
                     }
                 }
                 "D" => {
@@ -1106,12 +1173,14 @@ mod tests {
         };
         let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
         format!(
-            "{{\"keep\":{},\"explore\":{},\"blocks\":{},\"first_from_kept_pct\":{:.2},\"censored\":{},\
+            "{{\"keep\":{},\"explore\":{},\"probation_s\":{},\"seed\":{},\"blocks\":{},\"first_from_kept_pct\":{:.2},\"censored\":{},\
              \"extra_ms_mean\":{:.2},\"extra_ms_p99\":{:.1},\"lead_ms_p50_real\":{:.1},\"lead_ms_p50_selected\":{:.1},\
              \"lead_ms_mean_real\":{:.1},\"lead_ms_mean_selected\":{:.1},\"peers_mean\":{:.1},\"prunes\":{},\
              \"egress_kept_pct\":{:.1}}}",
             config.keep,
             config.explore,
+            config.probation.as_secs(),
+            seed,
             blocks,
             100.0 * kept_first as f64 / blocks.max(1) as f64,
             censored,

@@ -59,8 +59,8 @@ pub use driver::{GossipDriver, GossipDriverConfig};
 
 mod peer_select;
 pub use peer_select::{
-    NON_MESH_WEIGHT, PeerDelivery, PeerSelectConfig, PeerSelector, PruneReason, SelectActions,
-    peer_id_of, read_store, write_store,
+    NON_MESH_WEIGHT, PeerDelivery, PeerSelectConfig, PeerSelector, PruneReason, RTT_FAR,
+    RTT_FAR_WEIGHT, RTT_NEAR, SelectActions, peer_id_of, read_store, rtt_weight, write_store,
 };
 
 mod block_validity;
