@@ -939,6 +939,7 @@ mod tests {
         let a = s.select(&all, t0);
         assert_eq!(a.prune, vec![(bad, PruneReason::Invalid)]);
         assert_eq!(a.skipped_invalid, 0);
+        s.on_disconnected(bad, true, t0);
         // Static peer disconnected: redial it.
         let a = s.select(&good, t0);
         assert_eq!(a.dial, vec![st]);
@@ -957,6 +958,8 @@ mod tests {
     #[test]
     fn invalid_counts_decay_and_mass_invalids_are_ours() {
         let t0 = Instant::now();
+        // keep 3 + explore 3: the 6 peers fit under the cap.
+        let cfg = || PeerSelectConfig { explore: 3, ..cfg() };
         let mut s = PeerSelector::new(cfg());
         let peers: Vec<PeerId> = (0..6).map(|_| PeerId::random()).collect();
         connect_all(&mut s, &peers, t0);
