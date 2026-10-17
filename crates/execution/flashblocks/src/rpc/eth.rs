@@ -85,8 +85,7 @@ use tokio::{sync::broadcast::error::RecvError, time};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{debug, trace, warn};
 
-use crate::PendingBlocks;
-use crate::{FlashblocksAPI, PendingBlocksAPI, metrics::Metrics};
+use crate::{FlashblocksAPI, PendingBlocks, PendingBlocksAPI, metrics::Metrics};
 
 /// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
 const MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS: u64 = 6_000;
@@ -472,23 +471,13 @@ where
         // gas-limit binary search is needed.
         if transaction.as_eip8130().is_some() {
             Eip8130EverestGate::check(&self.eth_api, block_id)?;
-            return Eip8130GasEstimator::estimate(
-                &self.eth_api,
-                transaction,
-                block_id,
-                overrides,
-            )
-            .await;
+            return Eip8130GasEstimator::estimate(&self.eth_api, transaction, block_id, overrides)
+                .await;
         }
 
-        EthCall::estimate_gas_at(
-            &self.eth_api,
-            transaction,
-            block_id,
-            overrides,
-        )
-        .await
-        .map_err(Into::into)
+        EthCall::estimate_gas_at(&self.eth_api, transaction, block_id, overrides)
+            .await
+            .map_err(Into::into)
     }
 
     async fn simulate_v1(
@@ -761,30 +750,22 @@ fn apply_pending_simulation_overrides(
 
 #[cfg(test)]
 mod tests {
+    use alloy_consensus::{Header, Sealed};
+    use alloy_evm::overrides::apply_block_overrides;
+    use alloy_primitives::{B256, Bytes, TxKind};
+    use alloy_rpc_types::{simulate::SimBlock, state::AccountOverride};
+    use base_common_flashblocks::{ExecutionPayloadBaseV1, Flashblock, Metadata};
+    use revm::{
+        Context, ExecuteEvm, MainBuilder, MainContext,
+        bytecode::Bytecode,
+        context::{BlockEnv, TxEnv},
+        primitives::hardfork::SpecId,
+        state::AccountInfo,
+    };
+    use revm_database::{CacheDB, EmptyDB};
+
     use super::*;
     use crate::PendingBlocksBuilder;
-    use alloy_consensus::Header;
-    use alloy_consensus::Sealed;
-    use alloy_evm::overrides::apply_block_overrides;
-    use alloy_primitives::B256;
-    use alloy_primitives::Bytes;
-    use alloy_primitives::TxKind;
-    use alloy_rpc_types::simulate::SimBlock;
-    use alloy_rpc_types::state::AccountOverride;
-    use base_common_flashblocks::ExecutionPayloadBaseV1;
-    use base_common_flashblocks::Flashblock;
-    use base_common_flashblocks::Metadata;
-    use revm::Context;
-    use revm::ExecuteEvm;
-    use revm::MainBuilder;
-    use revm::MainContext;
-    use revm::bytecode::Bytecode;
-    use revm::context::BlockEnv;
-    use revm::context::TxEnv;
-    use revm::primitives::hardfork::SpecId;
-    use revm::state::AccountInfo;
-    use revm_database::CacheDB;
-    use revm_database::EmptyDB;
 
     #[test]
     fn pending_call_opcodes_use_the_same_snapshot_header_as_state()

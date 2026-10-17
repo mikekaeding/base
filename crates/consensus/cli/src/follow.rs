@@ -4,9 +4,9 @@ use std::{num::ParseIntError, sync::Arc, time::Duration};
 
 use alloy_provider::{Provider, RootProvider};
 use base_cli_utils::{LogConfig, RuntimeManager};
+use base_common_chains::ChainConfig;
 use base_common_genesis::RollupConfig;
 use base_common_network::Base;
-use base_common_chains::ChainConfig;
 use base_consensus_node::{
     EngineConfig, FollowNode, FollowNodeConfig, FollowP2pConfig, FollowP2pMode, L1Config,
     NetworkBuilder, NodeOperatingMode, RemoteL2Client, RemoteL2ClientOptions, SignerLookup,
@@ -833,7 +833,10 @@ mod tests {
         );
         let cfg = args.load_rollup_config().unwrap();
         let (network, lookup) = args.p2p_network(&cfg).await.expect("p2p network config");
-        assert!(lookup.expect("mainnet has a built-in signer").await.is_none(), "L1 signer equals the built-in one");
+        assert!(
+            lookup.expect("mainnet has a built-in signer").await.is_none(),
+            "L1 signer equals the built-in one"
+        );
         let cache = Arc::new(GossipPayloadCache::default());
         let client = GossipCacheEngineClient::new(Arc::clone(&cache), FollowP2pMode::Shadow, None);
         let cancel = CancellationToken::new();

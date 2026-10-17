@@ -210,8 +210,11 @@ where
         if let Some(network) = network {
             // The network runs beside the follower, never inside its task set: a P2P failure
             // only leaves the follower on its RPC sources.
-            let client =
-                GossipCacheEngineClient::new(Arc::clone(&cache), p2p_mode, Some(head_sender.clone()));
+            let client = GossipCacheEngineClient::new(
+                Arc::clone(&cache),
+                p2p_mode,
+                Some(head_sender.clone()),
+            );
             let signer_lookup = self
                 .p2p
                 .as_ref()

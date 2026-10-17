@@ -1,28 +1,17 @@
-use super::accumulate_pending_state_overrides;
+use std::{error::Error, time::Instant};
+
 use alloy_evm::overrides::apply_state_overrides;
-use alloy_primitives::Address;
-use alloy_primitives::B256;
-use alloy_primitives::Bytes;
-use alloy_primitives::KECCAK256_EMPTY;
-use alloy_primitives::TxKind;
-use alloy_primitives::U256;
+use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY, TxKind, U256};
 use alloy_rpc_types_eth::state::StateOverride;
-use revm::Context;
-use revm::Database;
-use revm::DatabaseCommit;
-use revm::ExecuteEvm;
-use revm::MainBuilder;
-use revm::MainContext;
-use revm::context::TxEnv;
-use revm::database::InMemoryDB;
-use revm::primitives::hardfork::SpecId;
-use revm::state::Account;
-use revm::state::AccountInfo;
-use revm::state::Bytecode;
-use revm::state::EvmState;
-use revm::state::EvmStorageSlot;
-use std::error::Error;
-use std::time::Instant;
+use revm::{
+    Context, Database, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext,
+    context::TxEnv,
+    database::InMemoryDB,
+    primitives::hardfork::SpecId,
+    state::{Account, AccountInfo, Bytecode, EvmState, EvmStorageSlot},
+};
+
+use super::accumulate_pending_state_overrides;
 
 type TestResult = Result<(), Box<dyn Error>>;
 

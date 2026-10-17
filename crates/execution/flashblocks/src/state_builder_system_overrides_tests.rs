@@ -1,39 +1,32 @@
-use super::PendingStateBuilder;
-use alloy_consensus::Block;
-use alloy_consensus::Header;
-use alloy_eips::eip2935::HISTORY_STORAGE_ADDRESS;
-use alloy_eips::eip2935::HISTORY_STORAGE_CODE;
-use alloy_eips::eip4788::BEACON_ROOTS_ADDRESS;
-use alloy_eips::eip4788::BEACON_ROOTS_CODE;
+use std::{
+    error::Error,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+use alloy_consensus::{Block, Header};
+use alloy_eips::{
+    eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE},
+    eip4788::{BEACON_ROOTS_ADDRESS, BEACON_ROOTS_CODE},
+};
 use alloy_evm::overrides::apply_state_overrides;
-use alloy_primitives::Address;
-use alloy_primitives::B256;
-use alloy_primitives::Bytes;
-use alloy_primitives::TxKind;
-use alloy_primitives::U256;
-use alloy_primitives::address;
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address};
 use alloy_rpc_types_eth::state::StateOverride;
 use base_common_evm::L1BlockInfo;
 use base_execution_chainspec::BaseChainSpecBuilder;
 use base_execution_evm::BaseEvmConfig;
 use reth_evm::ConfigureEvm;
-use revm::Context;
-use revm::Database;
-use revm::DatabaseCommit;
-use revm::ExecuteEvm;
-use revm::MainBuilder;
-use revm::MainContext;
-use revm::context::TxEnv;
-use revm::database::InMemoryDB;
-use revm::database::State;
-use revm::primitives::hardfork::SpecId;
-use revm::state::AccountInfo;
-use revm::state::Bytecode;
-use revm::state::EvmState;
-use std::error::Error;
-use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use revm::{
+    Context, Database, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext,
+    context::TxEnv,
+    database::{InMemoryDB, State},
+    primitives::hardfork::SpecId,
+    state::{AccountInfo, Bytecode, EvmState},
+};
+
+use super::PendingStateBuilder;
 
 type TestResult = Result<(), Box<dyn Error>>;
 

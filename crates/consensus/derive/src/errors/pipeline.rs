@@ -1,7 +1,6 @@
 //! This module contains derivation errors thrown within the pipeline.
 
-use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::{boxed::Box, string::String};
 
 use alloy_eips::BlockId;
 use alloy_primitives::B256;

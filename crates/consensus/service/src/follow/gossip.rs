@@ -69,7 +69,9 @@ impl FromStr for FollowP2pMode {
             "" | "off" | "false" | "0" => Ok(Self::Off),
             "shadow" => Ok(Self::Shadow),
             "primary" => Ok(Self::Primary),
-            other => Err(format!("invalid follow P2P mode {other:?}: expected off, shadow or primary")),
+            other => {
+                Err(format!("invalid follow P2P mode {other:?}: expected off, shadow or primary"))
+            }
         }
     }
 }
@@ -112,7 +114,8 @@ impl GossipPayloadCache {
             return false;
         }
         let candidates = map.entry(number).or_default();
-        if candidates.iter().any(|c| c.hash == hash) || candidates.len() >= MAX_CANDIDATES_PER_HEIGHT
+        if candidates.iter().any(|c| c.hash == hash)
+            || candidates.len() >= MAX_CANDIDATES_PER_HEIGHT
         {
             return false;
         }
@@ -168,7 +171,10 @@ impl GossipCacheEngineClient {
 
 #[async_trait]
 impl NetworkEngineClient for GossipCacheEngineClient {
-    async fn send_unsafe_block(&self, block: BaseExecutionPayloadEnvelope) -> EngineClientResult<()> {
+    async fn send_unsafe_block(
+        &self,
+        block: BaseExecutionPayloadEnvelope,
+    ) -> EngineClientResult<()> {
         let received = Instant::now();
         let number = block.execution_payload.block_number();
         let timestamp = block.execution_payload.timestamp();
@@ -320,8 +326,8 @@ impl<R: RemoteClient> RemoteClient for GossipFirstClient<R> {
             let candidates = self.cache.candidates(number);
             match candidates.iter().find(|c| c.hash == hash) {
                 Some(c) => {
-                    let lead_ms = rpc_ready.saturating_duration_since(c.received).as_secs_f64()
-                        * 1000.0;
+                    let lead_ms =
+                        rpc_ready.saturating_duration_since(c.received).as_secs_f64() * 1000.0;
                     Metrics::follow_p2p_lead_seconds().record(lead_ms / 1000.0);
                     debug!(target: "follow::p2p", block = number, lead_ms = lead_ms.round() as i64,
                         "Gossip had block before RPC fetch completed");
@@ -427,7 +433,8 @@ mod tests {
     #[tokio::test]
     async fn shadow_always_reads_rpc() {
         let cache = Arc::new(GossipPayloadCache::default());
-        let client = GossipFirstClient::new(rpc_source(7), Arc::clone(&cache), FollowP2pMode::Shadow);
+        let client =
+            GossipFirstClient::new(rpc_source(7), Arc::clone(&cache), FollowP2pMode::Shadow);
         client.get_payload_by_number(1).await.unwrap();
         cache.insert(payload(2, 1, 7), Instant::now());
         let p = client.get_payload_by_number(2).await.unwrap();
@@ -437,7 +444,8 @@ mod tests {
     #[tokio::test]
     async fn primary_serves_gossip_only_on_a_matching_parent() {
         let cache = Arc::new(GossipPayloadCache::default());
-        let client = GossipFirstClient::new(rpc_source(7), Arc::clone(&cache), FollowP2pMode::Primary);
+        let client =
+            GossipFirstClient::new(rpc_source(7), Arc::clone(&cache), FollowP2pMode::Primary);
         // First payload after start comes from RPC (no known parent yet).
         cache.insert(payload(1, 1, 7), Instant::now());
         assert_eq!(served_hash(&client.get_payload_by_number(1).await.unwrap()), hash(1, 7));
@@ -454,7 +462,8 @@ mod tests {
     #[tokio::test]
     async fn primary_falls_back_on_ambiguity_and_on_repeat_requests() {
         let cache = Arc::new(GossipPayloadCache::default());
-        let client = GossipFirstClient::new(rpc_source(7), Arc::clone(&cache), FollowP2pMode::Primary);
+        let client =
+            GossipFirstClient::new(rpc_source(7), Arc::clone(&cache), FollowP2pMode::Primary);
         client.get_payload_by_number(1).await.unwrap();
         // Two candidates with the right parent: ambiguous, so RPC.
         cache.insert(payload(2, 1, 7), Instant::now());
@@ -496,7 +505,8 @@ mod tests {
         assert_eq!(*rx.borrow(), 0);
         assert_eq!(cache.highest(), Some(5));
 
-        let primary = GossipCacheEngineClient::new(Arc::clone(&cache), FollowP2pMode::Primary, Some(tx));
+        let primary =
+            GossipCacheEngineClient::new(Arc::clone(&cache), FollowP2pMode::Primary, Some(tx));
         primary.send_unsafe_block(payload(6, 1, 1)).await.unwrap();
         assert_eq!(*rx.borrow(), 6);
         // An older block never lowers the hint.

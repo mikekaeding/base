@@ -1,15 +1,22 @@
-use std::time::Instant;
-use std::{fmt::Debug, sync::Arc, time::Duration};
+use std::{
+    fmt::Debug,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_eips::BlockNumberOrTag;
 use base_common_rpc_types_engine::BaseExecutionPayloadEnvelope;
-use tokio::sync::watch;
-use tokio::{sync::mpsc, time};
+use tokio::{
+    sync::{mpsc, watch},
+    time,
+};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::follow::{error::FollowError, source::RemoteClient, source::RemoteL2ClientError};
+use crate::follow::{
+    error::FollowError,
+    source::{RemoteClient, RemoteL2ClientError},
+};
 
 /// Number of source L2 payloads to keep prefetched ahead of the insert loop.
 pub(super) const PREFETCH_WINDOW: usize = 50;

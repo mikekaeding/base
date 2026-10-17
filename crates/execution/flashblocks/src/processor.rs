@@ -27,10 +27,9 @@ use reth_revm::{State, database::StateProviderDatabase};
 use revm_database::states::bundle_state::BundleRetention;
 use tokio::sync::{Mutex, broadcast::Sender, mpsc::UnboundedReceiver};
 
-use crate::FlashblocksReset;
 use crate::{
-    AssembledBlock, BlockAssembler, ExecutionError, FlashblockCache, PendingBlocks,
-    PendingBlocksBuilder, PendingStateBuilder, ProtocolError, ProviderError, Result,
+    AssembledBlock, BlockAssembler, ExecutionError, FlashblockCache, FlashblocksReset,
+    PendingBlocks, PendingBlocksBuilder, PendingStateBuilder, ProtocolError, ProviderError, Result,
     StateProcessorError,
     metrics::Metrics,
     validation::{
@@ -1075,8 +1074,7 @@ where
 mod tests {
     use std::{sync::mpsc as std_mpsc, thread, time::Duration};
 
-    use alloy_consensus::Sealable;
-    use alloy_consensus::{Header, Sealed};
+    use alloy_consensus::{Header, Sealable, Sealed};
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{B256, Bytes, TxKind, U256, hex};
     use alloy_rpc_types_engine::PayloadId;
@@ -1099,7 +1097,8 @@ mod tests {
             MockEthProvider::<BasePrimitives>::new().with_chain_spec(BaseChainSpec::mainnet());
         // Our fork authenticates the canonical parent before reusing or rebuilding pending state,
         // so the fixture's parent must be a real canonical header.
-        let genesis = Header { gas_limit: 30_000_000, base_fee_per_gas: Some(1), ..Default::default() };
+        let genesis =
+            Header { gas_limit: 30_000_000, base_fee_per_gas: Some(1), ..Default::default() };
         let genesis_hash = genesis.hash_slow();
         client.add_header(genesis_hash, genesis);
         let mut l1_attributes = hex!("015d8eb9").to_vec();
@@ -1163,15 +1162,14 @@ mod tests {
         let pending = Arc::new(ArcSwapOption::from(Some(Arc::new(builder.build().unwrap()))));
         let (tx, rx) = mpsc::unbounded_channel();
         let (sender, _) = broadcast::channel(1);
-        let processor =
-            StateProcessor::new(
-                client,
-                Arc::clone(&pending),
-                3,
-                Arc::new(Mutex::new(rx)),
-                sender,
-                broadcast::channel(16).0,
-            );
+        let processor = StateProcessor::new(
+            client,
+            Arc::clone(&pending),
+            3,
+            Arc::new(Mutex::new(rx)),
+            sender,
+            broadcast::channel(16).0,
+        );
         tx.send(StateUpdate::Flashblock(incoming.clone())).unwrap();
         drop(tx);
 

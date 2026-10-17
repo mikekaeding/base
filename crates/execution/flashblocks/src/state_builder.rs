@@ -1,7 +1,8 @@
-use std::fmt::Debug;
-use std::sync::Mutex;
-use std::sync::PoisonError;
-use std::{sync::Arc, time::Instant};
+use std::{
+    fmt::Debug,
+    sync::{Arc, Mutex, PoisonError},
+    time::Instant,
+};
 
 use alloy_consensus::{
     Block, Header, TxReceipt,
@@ -9,9 +10,7 @@ use alloy_consensus::{
 };
 use alloy_eips::Encodable2718;
 use alloy_evm::block::SystemCaller;
-use alloy_primitives::B256;
-use alloy_primitives::Bytes;
-use alloy_primitives::U256;
+use alloy_primitives::{B256, Bytes, U256};
 use alloy_rpc_types::TransactionTrait;
 use alloy_rpc_types_eth::state::StateOverride;
 use base_common_chains::Upgrades;
@@ -24,18 +23,19 @@ use base_common_rpc_types::{BaseTransactionReceipt, Transaction};
 use base_execution_rpc::BaseReceiptBuilder as BaseRpcReceiptBuilder;
 use reth_evm::{Evm, FromRecoveredTx};
 use reth_rpc_convert::transaction::ConvertReceiptInput;
-use revm::database::State;
 use revm::{
     Database, DatabaseCommit,
     context::{
         Block as _,
         result::{ExecutionResult, ResultAndState},
     },
+    database::State,
     state::EvmState,
 };
 
-use crate::ProviderError;
-use crate::{ExecutionError, PendingBlocks, StateProcessorError, UnifiedReceiptBuilder};
+use crate::{
+    ExecutionError, PendingBlocks, ProviderError, StateProcessorError, UnifiedReceiptBuilder,
+};
 
 /// Represents the result of executing or fetching a cached pending transaction.
 #[derive(Debug, Clone)]
@@ -539,8 +539,7 @@ mod tests {
         ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, Metadata,
     };
     use base_execution_chainspec::BaseChainSpecBuilder;
-    use base_execution_evm::BaseEvmConfig;
-    use base_execution_evm::RethL1BlockInfo;
+    use base_execution_evm::{BaseEvmConfig, RethL1BlockInfo};
     use reth_evm::ConfigureEvm;
     use reth_revm::State;
     use revm::{
