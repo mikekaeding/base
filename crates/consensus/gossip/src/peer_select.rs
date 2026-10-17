@@ -162,7 +162,7 @@ impl PruneReason {
 }
 
 /// What one selection run asks the driver to do.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SelectActions {
     /// Peers to disconnect and block for the cooldown.
     pub prune: Vec<(PeerId, PruneReason)>,
@@ -202,7 +202,7 @@ pub struct PeerDelivery {
 }
 
 impl PeerDelivery {
-    fn new(now: Instant, seq: u64) -> Self {
+    const fn new(now: Instant, seq: u64) -> Self {
         Self {
             connected_since: None,
             disconnected_at: None,
@@ -749,7 +749,8 @@ mod tests {
     #[test]
     fn prunes_lowest_beyond_keep_respecting_probation_and_max_prunes() {
         let t0 = Instant::now();
-        let mut s = PeerSelector::new(cfg());
+        // keep 3 + explore 4: the 7 peers fit under the cap, only scores prune.
+        let mut s = PeerSelector::new(PeerSelectConfig { explore: 4, ..cfg() });
         let peers: Vec<PeerId> = (0..7).map(|_| PeerId::random()).collect();
         connect_all(&mut s, &peers[..6], t0);
         for i in 0..600u32 {
