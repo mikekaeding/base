@@ -25,14 +25,14 @@ use std::{
     fmt::Debug,
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::B256;
 use async_trait::async_trait;
 use base_common_rpc_types_engine::BaseExecutionPayloadEnvelope;
-use base_protocol::BlockInfo;
+use base_protocol::{BlockInfo, L2BlockInfo};
 use tokio::sync::{Notify, watch};
 use tracing::{debug, info, warn};
 
@@ -40,6 +40,8 @@ use crate::{
     EngineClientResult, Metrics, NetworkEngineClient,
     follow::{
         engine::{ChainReplace, FollowEngine},
+        error::FollowError,
+        local::FollowLocalClient,
         source::{RemoteClient, RemoteL2ClientError},
     },
 };
@@ -228,11 +230,35 @@ const SERVED_RING: usize = 64;
 /// Deepest unsafe reorg the follower repairs by itself (blocks replaced).
 const MAX_REORG_REPAIR_DEPTH: usize = 16;
 
+/// Upper bound on reading the local chain at startup.
+const LOCAL_SEED_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Where a served (or seeded) block came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provenance {
+    /// Returned from the RPC sources.
+    Rpc,
+    /// Returned from validated gossip.
+    Gossip,
+    /// The local chain at startup (it may end in a gossip block the RPC chain dropped).
+    Local,
+}
+
+impl Provenance {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rpc => "rpc",
+            Self::Gossip => "gossip",
+            Self::Local => "local",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Served {
     number: u64,
     hash: B256,
-    from_gossip: bool,
+    provenance: Provenance,
 }
 
 #[derive(Debug, Default)]
@@ -258,18 +284,18 @@ impl ServeState {
         self.served.get(index).map(|s| s.hash)
     }
 
-    fn record(&mut self, number: u64, hash: B256, from_gossip: bool) {
+    fn record(&mut self, number: u64, hash: B256, provenance: Provenance) {
         while self.served.back().is_some_and(|s| s.number >= number) {
             self.served.pop_back();
         }
         if self.served.back().is_some_and(|s| s.number.saturating_add(1) != number) {
             self.served.clear();
         }
-        self.served.push_back(Served { number, hash, from_gossip });
+        self.served.push_back(Served { number, hash, provenance });
         while self.served.len() > SERVED_RING {
             self.served.pop_front();
         }
-        if from_gossip {
+        if provenance == Provenance::Gossip {
             self.last_gossip = Some(number);
         }
     }
@@ -349,7 +375,7 @@ impl<R> GossipFirstClient<R> {
         Metrics::follow_p2p_payload_source_total("p2p").increment(1);
         debug!(target: "follow::p2p", block = number, hash = %candidate.hash, raced,
             "Serving payload from gossip");
-        self.lock_state().record(number, candidate.hash, true);
+        self.lock_state().record(number, candidate.hash, Provenance::Gossip);
         candidate.payload
     }
 
@@ -362,6 +388,70 @@ impl<R> GossipFirstClient<R> {
 }
 
 impl<R: RemoteClient> GossipFirstClient<R> {
+    /// Seeds the served blocks with the local chain ending at `head` (the follower's start
+    /// block), only in [`FollowP2pMode::Primary`].
+    ///
+    /// The local head can be a gossip block the RPC chain dropped (served just before a
+    /// restart). Seeding lets the first RPC payload be checked against it and repaired like any
+    /// served block. Reads `head` and up to [`MAX_REORG_REPAIR_DEPTH`] ancestors that link to it;
+    /// if the local node fails to answer, seeds only `head` and its parent hash (enough for a
+    /// depth-1 repair). Never fails and is bounded in time.
+    pub(super) async fn seed_local_chain(&self, local: &dyn FollowLocalClient, head: L2BlockInfo) {
+        if self.mode != FollowP2pMode::Primary {
+            return;
+        }
+        let head = head.block_info;
+        let chain = match tokio::time::timeout(
+            LOCAL_SEED_TIMEOUT,
+            Self::local_ancestors(local, head.number, head.parent_hash),
+        )
+        .await
+        {
+            Ok(Ok(ancestors)) => ancestors,
+            Ok(Err(error)) => {
+                warn!(target: "follow::p2p", block = head.number, %error,
+                    "Reading local blocks to seed the served chain failed; seeding the start block only");
+                vec![(head.number.saturating_sub(1), head.parent_hash)]
+            }
+            Err(_) => {
+                warn!(target: "follow::p2p", block = head.number,
+                    timeout_ms = LOCAL_SEED_TIMEOUT.as_millis() as u64,
+                    "Reading local blocks to seed the served chain timed out; seeding the start block only");
+                vec![(head.number.saturating_sub(1), head.parent_hash)]
+            }
+        };
+        let mut state = self.lock_state();
+        for (n, h) in chain {
+            state.record(n, h, Provenance::Local);
+        }
+        state.record(head.number, head.hash, Provenance::Local);
+        let from = state.served.front().map_or(head.number, |s| s.number);
+        drop(state);
+        info!(target: "follow::p2p", from, to = head.number, hash = %head.hash,
+            "Seeded the served chain from local blocks");
+    }
+
+    /// The local blocks below `number` that link to `parent_hash`, oldest first.
+    async fn local_ancestors(
+        local: &dyn FollowLocalClient,
+        number: u64,
+        mut parent_hash: B256,
+    ) -> Result<Vec<(u64, B256)>, FollowError> {
+        let mut chain = Vec::new();
+        for n in (number.saturating_sub(MAX_REORG_REPAIR_DEPTH as u64)..number).rev() {
+            let Some(block) = local.block_info(BlockNumberOrTag::Number(n)).await? else {
+                break;
+            };
+            if block.block_info.hash != parent_hash {
+                break;
+            }
+            parent_hash = block.block_info.parent_hash;
+            chain.push((n, block.block_info.hash));
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
     /// Fetches `number` from the RPC sources, but takes its gossip copy instead when one that
     /// passes [`Self::pick_gossip`] arrives before the RPC answer.
     async fn rpc_or_gossip(&self, number: u64) -> Fetched {
@@ -472,17 +562,20 @@ impl<R: RemoteClient> GossipFirstClient<R> {
 
         let mut state = self.lock_state();
         let replaced = state.last();
-        let gossip_replaced =
-            state.served.iter().filter(|s| s.number >= from && s.from_gossip).count();
+        let replaced_from = |p: Provenance| {
+            state.served.iter().filter(|s| s.number >= from && s.provenance == p).count()
+        };
+        let (gossip_replaced, local_replaced) =
+            (replaced_from(Provenance::Gossip), replaced_from(Provenance::Local));
         for &(n, h) in &canonical {
-            state.record(n, h, false);
+            state.record(n, h, Provenance::Rpc);
         }
         state.no_gossip_through = Some(number.saturating_sub(1));
         state.repair_pending = false;
         drop(state);
         Metrics::follow_p2p_reorg_repaired_total().increment(1);
         warn!(target: "follow::p2p", block = number, from, to = number.saturating_sub(1), depth,
-            gossip_replaced, ancestor = %ancestor,
+            gossip_replaced, local_replaced, ancestor = %ancestor,
             replaced_hash = %replaced.map(|s| s.hash).unwrap_or_default(),
             canonical_hash = %next.execution_payload.parent_hash(),
             "Repaired unsafe chain: replaced served blocks the RPC sources did not keep");
@@ -552,7 +645,7 @@ impl<R: RemoteClient> RemoteClient for GossipFirstClient<R> {
             if let Some(tip) = tip {
                 if first_report {
                     Metrics::follow_p2p_fallback_total("rpc_parent_mismatch").increment(1);
-                    warn!(target: "follow::p2p", block = number, after_gossip = tip.from_gossip,
+                    warn!(target: "follow::p2p", block = number, served_from = tip.provenance.as_str(),
                         served_hash = %tip.hash, rpc_parent_hash = %parent_hash,
                         "RPC payload does not extend the previously served block");
                 }
@@ -584,7 +677,7 @@ impl<R: RemoteClient> RemoteClient for GossipFirstClient<R> {
                 }
             }
         }
-        self.lock_state().record(number, hash, false);
+        self.lock_state().record(number, hash, Provenance::Rpc);
         Ok(payload)
     }
 }
@@ -620,6 +713,7 @@ mod tests {
     use super::*;
     use crate::follow::{
         engine::{EngineApiFollowEngine, MockFollowEngine},
+        local::MockFollowLocalClient,
         source::MockRemoteClient,
     };
 
@@ -788,7 +882,47 @@ mod tests {
             .collect()
     }
 
+    fn genesis() -> L2BlockInfo {
+        L2BlockInfo {
+            block_info: BlockInfo { hash: GENESIS, number: 0, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    fn info_of(p: &BaseExecutionPayloadEnvelope) -> L2BlockInfo {
+        L2BlockInfo {
+            block_info: BlockInfo {
+                hash: p.execution_payload.block_hash(),
+                number: p.execution_payload.block_number(),
+                parent_hash: p.execution_payload.parent_hash(),
+                timestamp: p.execution_payload.timestamp(),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A local node whose canonical chain is `blocks`.
+    fn local_chain(blocks: Vec<L2BlockInfo>) -> MockFollowLocalClient {
+        let mut local = MockFollowLocalClient::new();
+        local.expect_block_info().returning(move |tag| {
+            Ok(match tag {
+                BlockNumberOrTag::Number(n) => {
+                    blocks.iter().find(|b| b.block_info.number == n).copied()
+                }
+                _ => None,
+            })
+        });
+        local
+    }
+
     fn real_engine() -> (Arc<EngineApiFollowEngine<MockEngineClient>>, Arc<MockEngineClient>) {
+        real_engine_at(genesis())
+    }
+
+    /// A real engine whose unsafe head is `head` (safe and finalized at genesis).
+    fn real_engine_at(
+        head: L2BlockInfo,
+    ) -> (Arc<EngineApiFollowEngine<MockEngineClient>>, Arc<MockEngineClient>) {
         let rollup_config = Arc::new(RollupConfig::default());
         let valid = PayloadStatus { status: PayloadStatusEnum::Valid, latest_valid_hash: None };
         let client = Arc::new(
@@ -801,16 +935,12 @@ mod tests {
                 })
                 .build(),
         );
-        let genesis = L2BlockInfo {
-            block_info: BlockInfo { hash: GENESIS, number: 0, ..Default::default() },
-            ..Default::default()
-        };
         let engine = Arc::new(EngineApiFollowEngine::new(
             Arc::clone(&client),
             rollup_config,
-            genesis,
-            genesis,
-            genesis,
+            head,
+            genesis(),
+            genesis(),
         ));
         (engine, client)
     }
@@ -1249,5 +1379,88 @@ mod tests {
         arrive(payload(3, 1, 9));
         let p3 = source.get_payload_by_number(3).await.unwrap();
         assert_eq!(served_hash(&p3), hash(3, 7));
+    }
+
+    /// Restart fixture: canonical 1..=5 on RPC, and a local node (and engine) whose head is the
+    /// gossip block 3' that the RPC chain dropped.
+    struct Restart {
+        canonical: Vec<BaseExecutionPayloadEnvelope>,
+        fork3: BaseExecutionPayloadEnvelope,
+        rpc: Rpc,
+        engine: Arc<EngineApiFollowEngine<MockEngineClient>>,
+        client: Arc<MockEngineClient>,
+        source: GossipFirstClient<MockRemoteClient>,
+    }
+
+    fn restart_on_fork() -> Restart {
+        let canonical = sealed_chain(GENESIS, 1, 5, 0);
+        let fork3 = sealed(3, canonical[1].execution_payload.block_hash(), 9);
+        let rpc = Rpc::with(canonical.clone());
+        let (engine, client) = real_engine_at(info_of(&fork3));
+        let source = primary(&rpc, &Arc::new(GossipPayloadCache::default()))
+            .with_repair_engine(Arc::clone(&engine) as Arc<dyn FollowEngine>);
+        Restart { canonical, fork3, rpc, engine, client, source }
+    }
+
+    #[tokio::test]
+    async fn restart_on_a_dropped_gossip_head_repairs_from_the_seeded_local_chain() {
+        let Restart { canonical, fork3, rpc, engine, client, source } = restart_on_fork();
+        let local = local_chain(vec![
+            genesis(),
+            info_of(&canonical[0]),
+            info_of(&canonical[1]),
+            info_of(&fork3),
+        ]);
+        source.seed_local_chain(&local, info_of(&fork3)).await;
+
+        let p4 = source.get_payload_by_number(4).await.unwrap();
+        assert_eq!(served_hash(&p4), canonical[3].execution_payload.block_hash());
+        assert_eq!(head_hash(&engine).await, canonical[2].execution_payload.block_hash());
+        engine.insert_payload(p4).await.unwrap();
+        assert_eq!(head_hash(&engine).await, canonical[3].execution_payload.block_hash());
+        let heads = forkchoice_heads(&client).await;
+        assert_eq!(
+            heads,
+            vec![
+                canonical[2].execution_payload.block_hash(),
+                canonical[3].execution_payload.block_hash()
+            ]
+        );
+        assert_eq!(rpc.calls(), vec![4, 3]);
+    }
+
+    #[tokio::test]
+    async fn failed_local_seeding_falls_back_to_the_start_block() {
+        let Restart { canonical, fork3, rpc, engine, source, .. } = restart_on_fork();
+        let mut local = MockFollowLocalClient::new();
+        local
+            .expect_block_info()
+            .times(1)
+            .returning(|tag| Err(FollowError::LocalBlockUnavailable(tag)));
+        source.seed_local_chain(&local, info_of(&fork3)).await;
+
+        // The start block and its parent hash still allow a depth-1 repair.
+        let p4 = source.get_payload_by_number(4).await.unwrap();
+        assert_eq!(served_hash(&p4), canonical[3].execution_payload.block_hash());
+        assert_eq!(head_hash(&engine).await, canonical[2].execution_payload.block_hash());
+        assert_eq!(rpc.calls(), vec![4, 3]);
+    }
+
+    #[tokio::test]
+    async fn consistent_local_chain_at_start_needs_no_extra_rpc_calls() {
+        let canonical = sealed_chain(GENESIS, 1, 4, 0);
+        let rpc = Rpc::with(canonical.clone());
+        let cache = Arc::new(GossipPayloadCache::default());
+        // No expectations: any engine call panics.
+        let source = primary(&rpc, &cache).with_repair_engine(Arc::new(MockFollowEngine::new()));
+        let local = local_chain(canonical[..3].iter().map(info_of).collect());
+        source.seed_local_chain(&local, info_of(&canonical[2])).await;
+        let p4 = source.get_payload_by_number(4).await.unwrap();
+        assert_eq!(served_hash(&p4), canonical[3].execution_payload.block_hash());
+        assert_eq!(rpc.calls(), vec![4]);
+
+        // Shadow never reads the local chain (no expectations: a call panics).
+        let shadow = GossipFirstClient::new(rpc.client(), cache, FollowP2pMode::Shadow);
+        shadow.seed_local_chain(&MockFollowLocalClient::new(), info_of(&canonical[2])).await;
     }
 }
