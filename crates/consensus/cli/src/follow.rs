@@ -4,14 +4,14 @@ use std::{num::ParseIntError, sync::Arc, time::Duration};
 
 use alloy_provider::{Provider, RootProvider};
 use base_cli_utils::{LogConfig, RuntimeManager};
+use base_common_chains::ChainConfig;
 use base_common_genesis::RollupConfig;
 use base_common_network::Base;
-use base_common_chains::ChainConfig;
+use base_consensus_gossip::PeerSelectConfig;
 use base_consensus_node::{
     EngineConfig, FollowNode, FollowNodeConfig, FollowP2pConfig, FollowP2pMode, L1Config,
     NetworkBuilder, NodeMode, RemoteL2Client, RemoteL2ClientOptions, SignerLookup,
 };
-use base_consensus_gossip::PeerSelectConfig;
 use base_consensus_providers::{L1RpcProvider, OnlineBeaconClient};
 use base_consensus_rpc::RpcBuilder;
 use clap::Args;
@@ -900,7 +900,10 @@ mod tests {
         assert_eq!((c.keep, c.explore, c.target()), (6, 3, 9));
         assert_eq!(c.probation, Duration::from_secs(300));
         assert_eq!(c.interval, Duration::from_secs(60));
-        assert_eq!(c.store.as_deref(), Some(std::path::Path::new("/consensus-data/p2p-best-peers.txt")));
+        assert_eq!(
+            c.store.as_deref(),
+            Some(std::path::Path::new("/consensus-data/p2p-best-peers.txt"))
+        );
         assert_eq!(c.static_peers.len(), 1);
         // Invalid settings are an error, never a silent default.
         let bad = parse_config(&["--p2p.select", "--p2p.select.keep", "1"]);
@@ -979,7 +982,10 @@ mod tests {
         );
         let cfg = args.load_rollup_config().unwrap();
         let (network, lookup) = args.p2p_network(&cfg).await.expect("p2p network config");
-        assert!(lookup.expect("mainnet has a built-in signer").await.is_none(), "L1 signer equals the built-in one");
+        assert!(
+            lookup.expect("mainnet has a built-in signer").await.is_none(),
+            "L1 signer equals the built-in one"
+        );
         let cache = Arc::new(GossipPayloadCache::default());
         let client = GossipCacheEngineClient::new(Arc::clone(&cache), FollowP2pMode::Shadow, None);
         let cancel = CancellationToken::new();
