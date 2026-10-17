@@ -6,10 +6,10 @@
 //! Gossipsub hands the application only the first copy of each message (`propagation_source`).
 //! Later copies are dropped by message id inside gossipsub and, with gossipsub v1.2, mostly never
 //! sent at all: our IDONTWANT reaches the other mesh peers first. So the observable per-peer
-//! delivery signal is "did this peer deliver the block first?". For every accepted block each peer
+//! delivery signal is "did this peer deliver the block first?". For every accepted block each
 //! connected peer gets an *eligible* observation (weight 1 in our mesh for that topic,
-//! [`NON_MESH_WEIGHT`] outside it), and the source gets one *win*. The delivery score is the EWMA (by block
-//! count, `half_life_blocks`) of wins over eligible blocks, shrunk towards an average-peer prior
+//! [`NON_MESH_WEIGHT`] outside it), and the source gets one *win*. The delivery score is the EWMA
+//! (by block count, `half_life_blocks`) of wins over eligible blocks, shrunk towards a prior
 //! for peers with few observations, and divided by `1 + recent self-disconnects` (reliability).
 //! The prior, and the probation, shrink with the ping round trip ([`rtt_weight`]): on trader-va
 //! every peer that delivered first was within 20 ms, none 50 ms or more away ever did.
