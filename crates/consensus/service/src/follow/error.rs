@@ -111,6 +111,19 @@ pub enum FollowError {
         expected: u64,
     },
 
+    /// P2P primary skipped too many payloads in a row that do not extend the unsafe head.
+    #[error(
+        "payload {number} does not extend unsafe head {head} ({skipped} skipped in a row); exiting so the supervisor restarts the follower"
+    )]
+    UnsafeHeadNotExtended {
+        /// The payload number.
+        number: u64,
+        /// The engine's unsafe head number.
+        head: u64,
+        /// Consecutive skipped payloads.
+        skipped: usize,
+    },
+
     /// No block was imported for longer than `--follow.stall-exit-secs`.
     #[error(
         "no block imported for {idle_secs} s (limit {limit_secs} s); exiting so the supervisor restarts the follower"

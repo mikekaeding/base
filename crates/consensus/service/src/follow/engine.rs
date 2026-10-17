@@ -1,4 +1,11 @@
-use std::{fmt::Debug, sync::Arc, time::Duration};
+use std::{
+    fmt::Debug,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use alloy_primitives::B256;
 use async_trait::async_trait;
@@ -10,6 +17,7 @@ use base_consensus_engine::{
 };
 use base_protocol::L2BlockInfo;
 use tokio::sync::Mutex;
+use tracing::{debug, warn};
 
 use crate::follow::error::FollowError;
 
@@ -71,12 +79,21 @@ pub(super) trait FollowEngine: Debug + Send + Sync {
 /// Upper bound on one [`FollowEngine::replace_unsafe_chain`] call, lock wait included.
 const REPLACE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Consecutive non-extending payloads the strict insert path skips before it fails. More than
+/// the prefetch queue can hold, so only a follower that can no longer extend its head (e.g. the
+/// EL keeps answering SYNCING) exits for a restart from the local head.
+const MAX_STRICT_SKIPS: usize = crate::follow::prefetcher::PREFETCH_WINDOW + 1;
+
 #[derive(Debug)]
 pub(super) struct EngineApiFollowEngine<E: EngineClient> {
     client: Arc<E>,
     rollup_config: Arc<RollupConfig>,
     state: Mutex<EngineState>,
     replace_timeout: Duration,
+    /// Only insert payloads that extend the unsafe head (P2P primary).
+    strict: bool,
+    /// Consecutive payloads skipped by the strict check.
+    strict_skips: AtomicUsize,
 }
 
 impl<E: EngineClient> EngineApiFollowEngine<E> {
@@ -94,7 +111,24 @@ impl<E: EngineClient> EngineApiFollowEngine<E> {
             safe_head: Some(safe),
             finalized_head: Some(finalized),
         });
-        Self { client, rollup_config, state: Mutex::new(state), replace_timeout: REPLACE_TIMEOUT }
+        Self {
+            client,
+            rollup_config,
+            state: Mutex::new(state),
+            replace_timeout: REPLACE_TIMEOUT,
+            strict: false,
+            strict_skips: AtomicUsize::new(0),
+        }
+    }
+
+    /// Inserts only payloads that extend the unsafe head (number = head + 1, parent = head hash)
+    /// and skips any other. For P2P primary: after a partial unsafe chain repair, queued gossip
+    /// blocks of the dropped fork must never reach the EL with an unknown parent (it would accept
+    /// them as SYNCING and sync to them). Without it (off, shadow) a block past a gap is still sent
+    /// and the EL syncs past it, the existing recovery.
+    pub(super) const fn with_strict_extension(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 
     /// Overrides the replacement time limit.
@@ -158,13 +192,42 @@ impl<E: EngineClient + Debug + 'static> FollowEngine for EngineApiFollowEngine<E
         &self,
         envelope: BaseExecutionPayloadEnvelope,
     ) -> Result<(), FollowError> {
+        let mut state = self.state.lock().await;
+        if self.strict {
+            let head = state.sync_state.unsafe_head().block_info;
+            let number = envelope.execution_payload.block_number();
+            let parent = envelope.execution_payload.parent_hash();
+            let next = head.number.saturating_add(1);
+            if number > next || (number == next && parent != head.hash) {
+                let skips = self.strict_skips.fetch_add(1, Ordering::Relaxed) + 1;
+                if skips > MAX_STRICT_SKIPS {
+                    return Err(FollowError::UnsafeHeadNotExtended {
+                        number,
+                        head: head.number,
+                        skipped: skips,
+                    });
+                }
+                if skips == 1 || skips.is_multiple_of(10) {
+                    warn!(target: "follow", block = number, %parent, head = head.number,
+                        head_hash = %head.hash, skipped = skips,
+                        "Skipping payload that does not extend the unsafe head");
+                } else {
+                    debug!(target: "follow", block = number, head = head.number,
+                        "Skipping payload that does not extend the unsafe head");
+                }
+                return Ok(());
+            }
+            if number == next {
+                self.strict_skips.store(0, Ordering::Relaxed);
+            }
+        }
         let task = InsertTask::unsafe_payload(
             Arc::clone(&self.client),
             Arc::clone(&self.rollup_config),
             envelope,
         );
         EngineTask::Insert(Box::new(task))
-            .execute(&mut *self.state.lock().await)
+            .execute(&mut state)
             .await
             .map_err(FollowError::engine_task)
     }
@@ -217,7 +280,8 @@ mod tests {
     use base_protocol::{BlockInfo, L1BlockInfoBedrock, L2BlockInfo};
     use tokio::time::{self, Instant};
 
-    use super::{ChainReplace, EngineApiFollowEngine, FollowEngine};
+    use super::{ChainReplace, EngineApiFollowEngine, FollowEngine, MAX_STRICT_SKIPS};
+    use crate::follow::error::FollowError;
 
     fn valid_payload_status() -> PayloadStatus {
         PayloadStatus { status: PayloadStatusEnum::Valid, latest_valid_hash: Some(B256::ZERO) }
@@ -457,5 +521,55 @@ mod tests {
         // No deadlock: the insert loop finishes once the engine answers.
         client.set_new_payload_v2_response(valid_payload_status()).await;
         time::timeout(Duration::from_secs(2), insert).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_extension_skips_gaps_and_only_strict_mode_does() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        let genesis = l2_block_info(0);
+        // Block 2 on top of the genesis head: a gap (its parent 1 is unknown to the EL).
+        for strict in [false, true] {
+            let client = engine_client(
+                &rollup_config,
+                Some(valid_payload_status()),
+                valid_forkchoice_updated(),
+            );
+            let engine = EngineApiFollowEngine::new(
+                Arc::clone(&client),
+                Arc::clone(&rollup_config),
+                genesis,
+                genesis,
+                genesis,
+            )
+            .with_strict_extension(strict);
+            engine.insert_payload(payload(2)).await.unwrap();
+            assert_eq!(
+                client.last_new_payload_v2().await.is_some(),
+                !strict,
+                "off/shadow still send the block past a gap (EL sync recovery); primary skips it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_extension_fails_after_more_skips_than_the_queue_holds() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        let client =
+            engine_client(&rollup_config, Some(valid_payload_status()), valid_forkchoice_updated());
+        let genesis = l2_block_info(0);
+        let engine = EngineApiFollowEngine::new(
+            Arc::clone(&client),
+            rollup_config,
+            genesis,
+            genesis,
+            genesis,
+        )
+        .with_strict_extension(true);
+        for n in 2..2 + MAX_STRICT_SKIPS as u64 {
+            engine.insert_payload(payload(n)).await.unwrap();
+        }
+        let err = engine.insert_payload(payload(100)).await.unwrap_err();
+        assert!(matches!(err, FollowError::UnsafeHeadNotExtended { number: 100, .. }), "{err:?}");
+        assert!(client.last_new_payload_v2().await.is_none());
     }
 }

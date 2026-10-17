@@ -164,13 +164,17 @@ where
             .ok_or(FollowError::LocalBlockUnavailable(BlockNumberOrTag::Latest))?;
         let safe = local.block_info(BlockNumberOrTag::Safe).await?.unwrap_or_default();
         let finalized = local.block_info(BlockNumberOrTag::Finalized).await?.unwrap_or_default();
-        let engine = Arc::new(EngineApiFollowEngine::new(
-            Arc::clone(&self.engine_client),
-            Arc::clone(&self.config),
-            latest,
-            safe,
-            finalized,
-        ));
+        let primary = self.p2p.as_ref().is_some_and(|p2p| p2p.mode == FollowP2pMode::Primary);
+        let engine = Arc::new(
+            EngineApiFollowEngine::new(
+                Arc::clone(&self.engine_client),
+                Arc::clone(&self.config),
+                latest,
+                safe,
+                finalized,
+            )
+            .with_strict_extension(primary),
+        );
         let rpc = self
             .rpc_builder
             .clone()
