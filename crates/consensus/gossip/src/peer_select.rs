@@ -961,7 +961,7 @@ mod tests {
         assert_eq!(rtt_weight(None), 1.0);
         assert_eq!(rtt_weight(Some(Duration::from_millis(10))), 1.0);
         assert!((rtt_weight(Some(Duration::from_micros(62_500))) - 0.55).abs() < 1e-9);
-        assert_eq!(rtt_weight(Some(Duration::from_millis(180))), RTT_FAR_WEIGHT);
+        assert!((rtt_weight(Some(Duration::from_millis(180))) - RTT_FAR_WEIGHT).abs() < 1e-9);
         let t0 = Instant::now();
         let mut s = PeerSelector::new(cfg());
         let (near, far) = (PeerId::random(), PeerId::random());
