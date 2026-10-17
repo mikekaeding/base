@@ -62,6 +62,9 @@ const DISCONNECT_HALF_LIFE: Duration = Duration::from_secs(60 * 60);
 /// A connection shorter than this that the remote ends counts as a self-disconnect.
 const SHORT_CONNECTION: Duration = Duration::from_secs(10 * 60);
 
+/// Shortest probation (for the farthest peers).
+const MIN_PROBATION: Duration = Duration::from_secs(60);
+
 /// Minimum time between two writes of the store file.
 const STORE_EVERY: Duration = Duration::from_secs(5 * 60);
 
@@ -456,9 +459,18 @@ impl PeerSelector {
             }
         }
 
+        // Far peers get a shorter probation (scaled by the RTT prior weight, at least
+        // MIN_PROBATION): none of them ever delivered first on trader-va, so trying the next
+        // newcomer sooner finds the near ones faster.
         let on_probation = |p: Option<&PeerDelivery>| {
-            p.and_then(|p| p.connected_since)
-                .is_none_or(|t| now.saturating_duration_since(t) < self.config.probation)
+            p.and_then(|p| p.connected_since.map(|t| (t, p.rtt))).is_none_or(|(t, rtt)| {
+                let probation = self
+                    .config
+                    .probation
+                    .mul_f64(rtt_weight(rtt))
+                    .max(MIN_PROBATION.min(self.config.probation));
+                now.saturating_duration_since(t) < probation
+            })
         };
         let remaining: Vec<PeerId> =
             connected.iter().copied().filter(|p| !pruned.contains(p)).collect();
@@ -978,6 +990,27 @@ mod tests {
     }
 
     #[test]
+    fn far_peers_have_a_shorter_probation() {
+        let t0 = Instant::now();
+        let mut s = PeerSelector::new(PeerSelectConfig { keep: 2, explore: 2, ..cfg() });
+        let peers: Vec<PeerId> = (0..4).map(|_| PeerId::random()).collect();
+        connect_all(&mut s, &peers, t0);
+        s.on_rtt(peers[0], Duration::from_millis(5));
+        s.on_rtt(peers[1], Duration::from_millis(8));
+        s.on_rtt(peers[2], Duration::from_millis(150));
+        s.on_rtt(peers[3], Duration::from_millis(12));
+        for i in 0..60 {
+            s.on_block(peers[i % 2], &peers, |_| true, t0);
+        }
+        // At 90 s only the far peer is past its (60 s) probation; 1 established < keep 2.
+        assert!(s.select(&peers, t0 + Duration::from_secs(90)).prune.is_empty());
+        // At 650 s all are established: 4 > keep 2, the far one and the near loser go.
+        let a = s.select(&peers, t0 + Duration::from_secs(650));
+        let pruned: HashSet<PeerId> = a.prune.iter().map(|(p, _)| *p).collect();
+        assert_eq!(pruned, [peers[2], peers[3]].into_iter().collect());
+    }
+
+    #[test]
     fn public_tcp_filter() {
         for (a, ok) in [
             ("/ip4/9.9.9.9/tcp/1", true),
@@ -1054,6 +1087,10 @@ mod tests {
         let (mut extra, mut lead_real, mut lead_sel): (Vec<f64>, Vec<f64>, Vec<f64>) =
             (Vec::new(), Vec::new(), Vec::new());
         let (mut out_all, mut out_kept, mut admitted_sum) = (0u64, 0u64, 0u64);
+        // The same, counting only blocks after the first 15 minutes (warm-up without a store).
+        let warm = Duration::from_secs(15 * 60);
+        let (mut w_blocks, mut w_first, mut w_extra, mut w_out_all, mut w_out_kept) =
+            (0u64, 0u64, Vec::<f64>::new(), 0u64, 0u64);
         fn admit_now(
             s: &mut PeerSelector,
             real: &[PeerId],
@@ -1133,13 +1170,22 @@ mod tests {
                             let (k, v) = kv.rsplit_once('=').unwrap();
                             let nb: u64 = v.parse().unwrap();
                             out_all += nb;
-                            if admitted.contains(&id(k)) {
+                            let kept = admitted.contains(&id(k));
+                            if kept {
                                 out_kept += nb;
+                            }
+                            if now.saturating_duration_since(t0) >= warm {
+                                w_out_all += nb;
+                                if kept {
+                                    w_out_kept += nb;
+                                }
                             }
                         }
                     }
                     let lead: Option<f64> = f[6].parse().ok();
-                    let (src, off) = if admitted.contains(&first) {
+                    let warmed = now.saturating_duration_since(t0) >= warm;
+                    let first_kept = admitted.contains(&first);
+                    let (src, off) = if first_kept {
                         kept_first += 1;
                         (Some(first), 0.0)
                     } else if let Some((p, ms)) = dups
@@ -1153,6 +1199,11 @@ mod tests {
                         (None, CENSORED_MS)
                     };
                     extra.push(off);
+                    if warmed {
+                        w_blocks += 1;
+                        w_first += u64::from(first_kept);
+                        w_extra.push(off);
+                    }
                     if let Some(l) = lead {
                         lead_real.push(l);
                         lead_sel.push(l - off);
@@ -1176,7 +1227,8 @@ mod tests {
             "{{\"keep\":{},\"explore\":{},\"probation_s\":{},\"seed\":{},\"blocks\":{},\"first_from_kept_pct\":{:.2},\"censored\":{},\
              \"extra_ms_mean\":{:.2},\"extra_ms_p99\":{:.1},\"lead_ms_p50_real\":{:.1},\"lead_ms_p50_selected\":{:.1},\
              \"lead_ms_mean_real\":{:.1},\"lead_ms_mean_selected\":{:.1},\"peers_mean\":{:.1},\"prunes\":{},\
-             \"egress_kept_pct\":{:.1}}}",
+             \"egress_kept_pct\":{:.1},\"warm_blocks\":{},\"warm_first_from_kept_pct\":{:.2},\"warm_extra_ms_mean\":{:.2},\
+             \"warm_egress_kept_pct\":{:.1}}}",
             config.keep,
             config.explore,
             config.probation.as_secs(),
@@ -1193,6 +1245,10 @@ mod tests {
             admitted_sum as f64 / blocks.max(1) as f64,
             prunes,
             100.0 * out_kept as f64 / out_all.max(1) as f64,
+            w_blocks,
+            100.0 * w_first as f64 / w_blocks.max(1) as f64,
+            mean(&w_extra),
+            100.0 * w_out_kept as f64 / w_out_all.max(1) as f64,
         )
     }
 }
