@@ -46,7 +46,7 @@ impl ConsensusCli {
 
 /// Commands for the Base Consensus CLI.
 #[derive(Subcommand, Clone, Debug)]
-#[expect(clippy::large_enum_variant)]
+#[allow(clippy::large_enum_variant)]
 pub enum ConsensusCommands {
     /// Start the node.
     #[command(name = "node")]
