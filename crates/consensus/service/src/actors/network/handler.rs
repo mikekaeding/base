@@ -11,6 +11,7 @@ use base_consensus_gossip::{
 };
 use base_consensus_sources::BlockSignerHandler;
 use discv5::Enr;
+use futures::future::OptionFuture;
 use tokio::{
     select,
     sync::{mpsc, watch},
@@ -35,6 +36,8 @@ pub struct NetworkHandler {
     pub gater_pruner: tokio::time::Interval,
     /// Periodic pruner for pending outbound dials that have timed out.
     pub pending_dial_pruner: tokio::time::Interval,
+    /// Delivery-based peer selection runs (`None`: selection off).
+    pub peer_select_tick: Option<tokio::time::Interval>,
     /// A handler for the block signer.
     pub signer: Option<BlockSignerHandler>,
 }
@@ -167,6 +170,9 @@ impl GossipTransport for NetworkHandler {
                 }
                 _ = self.pending_dial_pruner.tick() => {
                     self.gossip.clear_expired_pending_connections();
+                }
+                Some(_) = OptionFuture::from(self.peer_select_tick.as_mut().map(|t| t.tick())) => {
+                    self.gossip.run_peer_selection();
                 }
             }
         }

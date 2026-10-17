@@ -11,6 +11,7 @@ use base_consensus_node::{
     EngineConfig, FollowNode, FollowNodeConfig, FollowP2pConfig, FollowP2pMode, L1Config,
     NetworkBuilder, NodeMode, RemoteL2Client, RemoteL2ClientOptions, SignerLookup,
 };
+use base_consensus_gossip::PeerSelectConfig;
 use base_consensus_providers::{L1RpcProvider, OnlineBeaconClient};
 use base_consensus_rpc::RpcBuilder;
 use clap::Args;
@@ -24,6 +25,110 @@ use crate::{
     L1ConfigFile, L2ClientArgs, L2ConfigFile, LogArgs, MetricsArgs, P2PArgs, RpcArgs,
     metrics::CliMetrics,
 };
+
+/// Delivery-based peer selection for the follow node's gossip network.
+///
+/// Off by default (today's behaviour: up to `--p2p.peers.hi` peers, whichever connect). When on,
+/// the node keeps the `keep` peers that deliver blocks first most often, plus `explore` slots for
+/// new peers on probation, prunes the rest, and remembers the best peers across restarts.
+#[derive(Args, Clone, Debug, PartialEq)]
+pub struct PeerSelectArgs {
+    /// Enable delivery-based peer selection.
+    #[arg(long = "p2p.select", env = "BASE_NODE_P2P_SELECT")]
+    pub enabled: bool,
+    /// Peers kept for their first-delivery score (static peers count here).
+    #[arg(long = "p2p.select.keep", env = "BASE_NODE_P2P_SELECT_KEEP", default_value_t = 8)]
+    pub keep: usize,
+    /// Extra slots for new peers on probation.
+    #[arg(long = "p2p.select.explore", env = "BASE_NODE_P2P_SELECT_EXPLORE", default_value_t = 4)]
+    pub explore: usize,
+    /// Probation of a new peer, in seconds (never pruned for its score meanwhile).
+    #[arg(
+        long = "p2p.select.probation-secs",
+        env = "BASE_NODE_P2P_SELECT_PROBATION_SECS",
+        default_value_t = 600
+    )]
+    pub probation_secs: u64,
+    /// Seconds between selection runs.
+    #[arg(
+        long = "p2p.select.interval-secs",
+        env = "BASE_NODE_P2P_SELECT_INTERVAL_SECS",
+        default_value_t = 60
+    )]
+    pub interval_secs: u64,
+    /// Most peers pruned for their score per run.
+    #[arg(
+        long = "p2p.select.max-prunes",
+        env = "BASE_NODE_P2P_SELECT_MAX_PRUNES",
+        default_value_t = 2
+    )]
+    pub max_prunes: usize,
+    /// Seconds a pruned peer is blocked from reconnecting.
+    #[arg(
+        long = "p2p.select.cooldown-secs",
+        env = "BASE_NODE_P2P_SELECT_COOLDOWN_SECS",
+        default_value_t = 3600
+    )]
+    pub cooldown_secs: u64,
+    /// Half-life of the delivery score, in blocks.
+    #[arg(
+        long = "p2p.select.half-life-blocks",
+        env = "BASE_NODE_P2P_SELECT_HALF_LIFE_BLOCKS",
+        default_value_t = 900.0
+    )]
+    pub half_life_blocks: f64,
+    /// File for the best peers (read at start, rewritten every few minutes). Unset: no store.
+    #[arg(long = "p2p.select.store", env = "BASE_NODE_P2P_SELECT_STORE")]
+    pub store: Option<std::path::PathBuf>,
+    /// Best peers kept in the store.
+    #[arg(
+        long = "p2p.select.store-peers",
+        env = "BASE_NODE_P2P_SELECT_STORE_PEERS",
+        default_value_t = 8
+    )]
+    pub store_peers: usize,
+    /// Protect peers read from the store (never pruned) until they disconnect.
+    #[arg(long = "p2p.select.protect-stored", env = "BASE_NODE_P2P_SELECT_PROTECT_STORED")]
+    pub protect_stored: bool,
+    /// Static peers, always kept and redialed: comma-separated multiaddrs with `/p2p/<peer id>`.
+    #[arg(long = "p2p.select.static", env = "BASE_NODE_P2P_SELECT_STATIC", value_delimiter = ',')]
+    pub static_peers: Vec<libp2p::Multiaddr>,
+}
+
+impl Default for PeerSelectArgs {
+    fn default() -> Self {
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            args: PeerSelectArgs,
+        }
+        <Wrap as clap::Parser>::parse_from::<[_; 0], &str>([]).args
+    }
+}
+
+impl PeerSelectArgs {
+    /// The selection config, `None` when off. Invalid settings are an error.
+    pub fn config(&self) -> eyre::Result<Option<PeerSelectConfig>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let config = PeerSelectConfig {
+            keep: self.keep,
+            explore: self.explore,
+            probation: Duration::from_secs(self.probation_secs),
+            interval: Duration::from_secs(self.interval_secs),
+            max_prunes: self.max_prunes,
+            cooldown: Duration::from_secs(self.cooldown_secs),
+            half_life_blocks: self.half_life_blocks,
+            store_peers: self.store_peers,
+            store: self.store.clone(),
+            protect_stored: self.protect_stored,
+            static_peers: self.static_peers.clone(),
+        };
+        config.validate().map_err(|e| eyre::eyre!(e))?;
+        Ok(Some(config))
+    }
+}
 
 /// Upper bound on the background lookup of the unsafe-block signer in L1 `SystemConfig`.
 const P2P_SIGNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -216,6 +321,11 @@ pub struct ConsensusFollowNodeConfigArgs {
     #[command(flatten)]
     pub p2p_flags: EmbeddedP2PArgs,
 
+    /// Delivery-based peer selection (`--p2p.select*`), used only when `--follow.p2p` is not
+    /// `off`. Off by default.
+    #[command(flatten)]
+    pub peer_select: PeerSelectArgs,
+
     /// RPC CLI arguments.
     #[command(flatten)]
     pub rpc_flags: RpcArgs,
@@ -356,6 +466,7 @@ impl From<EmbeddedConsensusFollowNodeConfigArgs> for ConsensusFollowNodeConfigAr
             // The embedded follower has no P2P flags; it always follows RPC sources only.
             p2p_mode: FollowP2pMode::Off,
             p2p_flags: EmbeddedP2PArgs::default(),
+            peer_select: PeerSelectArgs::default(),
             rpc_flags: args.rpc_flags.into(),
             l2_config: args.l2_config,
             l1_config: args.l1_config,
@@ -509,6 +620,7 @@ impl ConsensusFollowNodeArgs {
     ) -> eyre::Result<(NetworkBuilder, Option<SignerLookup>)> {
         let p2p = P2PArgs::from(self.config.p2p_flags.clone());
         p2p.check_ports()?;
+        let peer_select = self.config.peer_select.config()?;
         let chain_id = cfg.l2_chain_id.id();
         let genesis_signer =
             ChainConfig::by_chain_id(chain_id).and_then(|chain| chain.unsafe_block_signer);
@@ -521,7 +633,7 @@ impl ConsensusFollowNodeArgs {
             )
             .await
             .map_err(|_| eyre::eyre!("unsafe block signer lookup on L1 timed out"))??;
-            return Ok((NetworkBuilder::from(network), None));
+            return Ok((NetworkBuilder::from(network).with_peer_select(peer_select), None));
         };
         let network = p2p.clone().config(cfg, chain_id, None, timeout, Some(builtin)).await?;
         info!(target: "rollup_node", signer = %network.unsafe_block_signer,
@@ -555,7 +667,7 @@ impl ConsensusFollowNodeArgs {
                 }
             }
         });
-        Ok((NetworkBuilder::from(network), Some(lookup)))
+        Ok((NetworkBuilder::from(network).with_peer_select(peer_select), Some(lookup)))
     }
 
     /// Starts a follow node with default external endpoint configuration.
@@ -761,6 +873,40 @@ mod tests {
         assert_eq!(config.p2p_mode, FollowP2pMode::Primary);
         assert_eq!(config.p2p_flags.network.listen_udp_port, 9222);
         assert_eq!(config.p2p_flags.network.peers_hi, 40);
+    }
+
+    #[test]
+    fn peer_select_defaults_off_and_parses() {
+        let config = parse_config(&[]);
+        assert!(!config.peer_select.enabled);
+        assert_eq!(config.peer_select.config().unwrap(), None);
+        assert_eq!(config.peer_select, PeerSelectArgs::default());
+        let id = "16Uiu2HAmHeqbhBTnRjapz3AQ4sqrUY4D8TBpbDP3LiLW7LCGV6uv";
+        let st = format!("/ip4/1.2.3.4/tcp/9222/p2p/{id}");
+        let config = parse_config(&[
+            "--p2p.select",
+            "--p2p.select.keep",
+            "6",
+            "--p2p.select.explore",
+            "3",
+            "--p2p.select.probation-secs",
+            "300",
+            "--p2p.select.store",
+            "/consensus-data/p2p-best-peers.txt",
+            "--p2p.select.static",
+            &st,
+        ]);
+        let c = config.peer_select.config().unwrap().unwrap();
+        assert_eq!((c.keep, c.explore, c.target()), (6, 3, 9));
+        assert_eq!(c.probation, Duration::from_secs(300));
+        assert_eq!(c.interval, Duration::from_secs(60));
+        assert_eq!(c.store.as_deref(), Some(std::path::Path::new("/consensus-data/p2p-best-peers.txt")));
+        assert_eq!(c.static_peers.len(), 1);
+        // Invalid settings are an error, never a silent default.
+        let bad = parse_config(&["--p2p.select", "--p2p.select.keep", "1"]);
+        assert!(bad.peer_select.config().is_err());
+        let no_id = parse_config(&["--p2p.select", "--p2p.select.static", "/ip4/1.2.3.4/tcp/9222"]);
+        assert!(no_id.peer_select.config().is_err());
     }
 
     #[test]

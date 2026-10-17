@@ -129,4 +129,19 @@ base_metrics::define_metrics! {
 
     #[describe("Sync protocol substream requests")]
     sync_requests: counter,
+
+    #[describe("Delivery-based peer selection actions")]
+    #[label(
+        name = "action",
+        default = [
+            "prune_score",
+            "prune_invalid",
+            "prune_excess",
+            "skip_dial",
+            "reject_inbound",
+            "dial_static",
+            "dial_stored"
+        ]
+    )]
+    peer_select_actions: counter,
 }
