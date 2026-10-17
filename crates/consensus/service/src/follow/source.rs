@@ -2,6 +2,7 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use alloy_consensus::Block;
 use alloy_eips::BlockNumberOrTag;
+use alloy_primitives::B256;
 use alloy_provider::{Provider, RootProvider};
 use alloy_pubsub::PubSubConnect;
 use alloy_rpc_client::ClientBuilder;
@@ -188,6 +189,13 @@ pub trait RemoteClient: Debug + Send + Sync {
         &self,
         number: u64,
     ) -> Result<BaseExecutionPayloadEnvelope, RemoteL2ClientError>;
+
+    /// Reads the hash of block `number` for a background confirmation. With fallback sources,
+    /// "not found" from the first healthy source is final (the other sources are asked only
+    /// after an error or timeout).
+    async fn confirm_block_hash(&self, number: u64) -> Result<B256, RemoteL2ClientError> {
+        self.get_block_info(BlockNumberOrTag::Number(number)).await.map(|b| b.hash)
+    }
 }
 
 /// Opt-in options for [`RemoteL2Client::with_options`].
@@ -542,6 +550,22 @@ impl RemoteClient for RemoteL2Client {
                 reads.call("label", |p| async move { fetch_block_info(&p, tag).await }).await
             }
         }
+    }
+
+    async fn confirm_block_hash(&self, number: u64) -> Result<B256, RemoteL2ClientError> {
+        let tag = BlockNumberOrTag::Number(number);
+        let block = match &self.mode {
+            Mode::Legacy { provider } => fetch_block_info(provider, tag).await,
+            Mode::Fallback { reads, .. } => {
+                reads
+                    .call_first_answer(
+                        "confirm",
+                        |p| async move { fetch_block_info(&p, tag).await },
+                    )
+                    .await
+            }
+        };
+        block.map(|b| b.hash)
     }
 
     async fn get_payload_by_number(

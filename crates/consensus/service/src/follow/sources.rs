@@ -241,6 +241,30 @@ impl<P: Clone + Debug + Send + Sync> SourceSet<P> {
         Err(not_found.or(last_error).unwrap_or(RemoteL2ClientError::NoSources))
     }
 
+    /// Runs `op` against the sources in order until one answers, where "not found" is an answer:
+    /// it is returned at once and the remaining sources are not asked. Only errors and timeouts
+    /// move on to the next source. For background reads that retry on their own schedule and
+    /// must not load the fallback sources while a block propagates.
+    pub(super) async fn call_first_answer<T, F, Fut>(
+        &self,
+        what: &'static str,
+        op: F,
+    ) -> Result<T, RemoteL2ClientError>
+    where
+        F: Fn(P) -> Fut,
+        Fut: Future<Output = Result<T, RemoteL2ClientError>>,
+    {
+        let mut last_error = None;
+        for i in self.order(Instant::now()) {
+            match self.try_one(i, what, &op).await {
+                Outcome::Value(v) => return Ok(v),
+                Outcome::NotFound(e) => return Err(e),
+                Outcome::Failed(e) => last_error = Some(e),
+            }
+        }
+        Err(last_error.unwrap_or(RemoteL2ClientError::NoSources))
+    }
+
     /// Reads block `number` (payload fetches).
     ///
     /// Errors and timeouts move on to the next source at once. A clean "not found" from the first
@@ -407,6 +431,20 @@ mod tests {
             }
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn first_answer_stops_at_not_found_and_moves_on_only_after_errors() {
+        let (a, b) = (Fake::new(Behavior::NotFound), Fake::new(Behavior::Ok(7)));
+        let set = set(&[a.clone(), b.clone()], Duration::from_millis(200));
+        for _ in 0..3 {
+            let r = set.call_first_answer("confirm", run).await;
+            assert!(matches!(r, Err(RemoteL2ClientError::BlockNotFound(_))));
+        }
+        assert_eq!((a.calls(), b.calls()), (3, 0), "not found never fans out");
+        a.set(Behavior::Fail);
+        assert_eq!(set.call_first_answer("confirm", run).await.unwrap(), 7);
+        assert_eq!(b.calls(), 1, "an error moves on to the next source");
     }
 
     #[tokio::test]

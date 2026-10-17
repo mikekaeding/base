@@ -228,23 +228,29 @@ impl NetworkEngineClient for GossipCacheEngineClient {
 /// Served blocks remembered for unsafe-reorg repair.
 const SERVED_RING: usize = 64;
 
-/// Deepest unsafe reorg the follower repairs by itself (blocks replaced).
-const MAX_REORG_REPAIR_DEPTH: usize = 16;
+/// Deepest unsafe reorg the follower repairs by itself (blocks replaced); also the local
+/// ancestors seeded at startup.
+const MAX_REORG_REPAIR_DEPTH: usize = 24;
 
 /// Most served blocks at the tip (gossip, or the local chain seeded at startup) that the RPC
 /// sources have not confirmed yet. At the cap the next payload comes from RPC, so a fork that
-/// gossip keeps extending stays well inside [`MAX_REORG_REPAIR_DEPTH`].
-const MAX_UNCONFIRMED_RUN: usize = 8;
+/// gossip keeps extending stays well inside [`MAX_REORG_REPAIR_DEPTH`]. 2.4 s of 200 ms blocks.
+const MAX_UNCONFIRMED_RUN: usize = 12;
 
 /// Upper bound on reading the local chain at startup.
 const LOCAL_SEED_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Delay before the first RPC confirmation of a newly served block.
-const CONFIRM_DELAY: Duration = Duration::from_millis(100);
+/// Youngest a served block may be before it is read for confirmation (gossip leads the RPC
+/// sources by about 60-330 ms). Raised by 100 ms on each "not found" and lowered by 10 ms on
+/// each match, within [`CONFIRM_AGE_MAX`].
+const CONFIRM_AGE: Duration = Duration::from_millis(300);
 
-/// First and longest wait between confirmation reads while the RPC sources lack the block.
-const CONFIRM_NOT_FOUND_BACKOFF: (Duration, Duration) =
-    (Duration::from_millis(50), Duration::from_millis(200));
+/// Upper bound of the adaptive confirmation age.
+const CONFIRM_AGE_MAX: Duration = Duration::from_secs(1);
+
+/// Shortest time between two confirmation reads (and the wait after a "not found"); at
+/// 200 ms blocks each read confirms one or two blocks at once.
+const CONFIRM_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Wait after a failed confirmation read.
 const CONFIRM_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
@@ -277,9 +283,11 @@ struct Served {
     provenance: Provenance,
     /// The RPC sources have this block (an RPC block, or one whose hash RPC returned).
     confirmed: bool,
+    /// When it was served (or seeded).
+    at: tokio::time::Instant,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ServeState {
     /// The last payloads returned to the prefetcher: consecutive heights, oldest first.
     served: VecDeque<Served>,
@@ -293,6 +301,22 @@ struct ServeState {
     rpc_disagrees: Option<u64>,
     /// The block whose repair last failed as too deep (reported once at ERROR).
     too_deep_reported: Option<u64>,
+    /// Current confirmation age (adapts to how far the RPC sources trail gossip).
+    confirm_age: Duration,
+}
+
+impl Default for ServeState {
+    fn default() -> Self {
+        Self {
+            served: VecDeque::new(),
+            last_gossip: None,
+            no_gossip_through: None,
+            repair_pending: false,
+            rpc_disagrees: None,
+            too_deep_reported: None,
+            confirm_age: CONFIRM_AGE,
+        }
+    }
 }
 
 impl ServeState {
@@ -318,7 +342,8 @@ impl ServeState {
             self.served.clear();
         }
         let confirmed = provenance == Provenance::Rpc;
-        self.served.push_back(Served { number, hash, provenance, confirmed });
+        let at = tokio::time::Instant::now();
+        self.served.push_back(Served { number, hash, provenance, confirmed, at });
         while self.served.len() > SERVED_RING {
             self.served.pop_front();
         }
@@ -352,6 +377,8 @@ enum Fetched {
 enum Confirm {
     /// Nothing to confirm (or a repair is due first).
     Idle,
+    /// No unconfirmed block is old enough yet; the oldest one is in this long.
+    NotDue(Duration),
     /// A block was confirmed (or the served chain changed meanwhile); look again at once.
     Progress,
     /// The RPC sources have a different block at a served height.
@@ -540,31 +567,27 @@ impl<R: RemoteClient> GossipFirstClient<R> {
     /// Confirms served blocks against the RPC sources until `cancellation`, only needed in
     /// [`FollowP2pMode::Primary`].
     ///
-    /// One read at a time (the oldest unconfirmed block; a match confirms everything below it
-    /// too), header only, starting [`CONFIRM_DELAY`] after a block is served, so the RPC load
-    /// stays at or below one block read per gossip block plus short "not found" retries.
+    /// One header read at a time, of the newest unconfirmed block at least the confirmation age
+    /// old (a match confirms everything below it), via
+    /// [`RemoteClient::confirm_block_hash`] so "not found" never fans out to the fallback
+    /// sources. At most one read per [`CONFIRM_INTERVAL`] while gossip flows, whatever the
+    /// block rate.
     pub(super) async fn run_confirmations(
         self: Arc<Self>,
         cancellation: CancellationToken,
     ) -> Result<(), FollowError> {
-        let mut not_found_wait = Duration::ZERO;
         loop {
-            let outcome = self.confirm_next().await;
-            not_found_wait = if outcome == Confirm::NotYet {
-                (not_found_wait * 2).clamp(CONFIRM_NOT_FOUND_BACKOFF.0, CONFIRM_NOT_FOUND_BACKOFF.1)
-            } else {
-                Duration::ZERO
-            };
-            let wait = match outcome {
+            let wait = match self.confirm_next().await {
                 Confirm::Idle => {
                     tokio::select! {
                         _ = cancellation.cancelled() => return Ok(()),
                         _ = self.confirm_wake.notified() => {}
                     }
-                    CONFIRM_DELAY
+                    continue;
                 }
-                Confirm::Progress | Confirm::Disagrees => Duration::ZERO,
-                Confirm::NotYet => not_found_wait,
+                Confirm::NotDue(wait) => wait,
+                Confirm::Disagrees => continue,
+                Confirm::Progress | Confirm::NotYet => CONFIRM_INTERVAL,
                 Confirm::Failed => CONFIRM_FAILURE_BACKOFF,
             };
             tokio::select! {
@@ -574,23 +597,37 @@ impl<R: RemoteClient> GossipFirstClient<R> {
         }
     }
 
-    /// Reads the oldest unconfirmed served block from the RPC sources once.
+    /// Reads the newest unconfirmed served block that is old enough from the RPC sources once.
     async fn confirm_next(&self) -> Confirm {
         let target = {
             let state = self.lock_state();
             if state.repair_pending || state.rpc_disagrees.is_some() {
-                None
-            } else {
-                state.served.iter().find(|s| !s.confirmed).map(|s| (s.number, s.hash))
+                return Confirm::Idle;
+            }
+            let now = tokio::time::Instant::now();
+            let age = state.confirm_age;
+            let Some(oldest) = state.served.iter().find(|s| !s.confirmed) else {
+                return Confirm::Idle;
+            };
+            match state
+                .served
+                .iter()
+                .rev()
+                .find(|s| !s.confirmed && now.saturating_duration_since(s.at) >= age)
+            {
+                Some(s) => (s.number, s.hash),
+                None => return Confirm::NotDue(age.saturating_sub(now - oldest.at)),
             }
         };
-        let Some((number, hash)) = target else {
-            return Confirm::Idle;
-        };
-        let result = self.inner.get_block_info(BlockNumberOrTag::Number(number)).await;
-        let rpc_hash = match result {
-            Ok(info) => info.hash,
-            Err(RemoteL2ClientError::BlockNotFound(_)) => return Confirm::NotYet,
+        let (number, hash) = target;
+        let rpc_hash = match self.inner.confirm_block_hash(number).await {
+            Ok(rpc_hash) => rpc_hash,
+            Err(RemoteL2ClientError::BlockNotFound(_)) => {
+                let mut state = self.lock_state();
+                state.confirm_age =
+                    (state.confirm_age + Duration::from_millis(100)).min(CONFIRM_AGE_MAX);
+                return Confirm::NotYet;
+            }
             Err(error) => {
                 debug!(target: "follow::p2p", block = number, %error, "Confirmation read failed");
                 return Confirm::Failed;
@@ -604,6 +641,8 @@ impl<R: RemoteClient> GossipFirstClient<R> {
             }
             if rpc_hash == hash {
                 state.confirm_through(number);
+                state.confirm_age =
+                    state.confirm_age.saturating_sub(Duration::from_millis(10)).max(CONFIRM_AGE);
                 return Confirm::Progress;
             }
             state.rpc_disagrees = Some(number);
@@ -813,6 +852,10 @@ impl<R: RemoteClient> RemoteClient for GossipFirstClient<R> {
         self.inner.get_block_info(tag).await
     }
 
+    async fn confirm_block_hash(&self, number: u64) -> Result<B256, RemoteL2ClientError> {
+        self.inner.confirm_block_hash(number).await
+    }
+
     async fn get_payload_by_number(
         &self,
         number: u64,
@@ -1018,6 +1061,16 @@ mod tests {
             let rpc = self.clone();
             source.expect_get_block_number().returning(move |_| {
                 Ok(rpc.chain.lock().unwrap().keys().max().copied().unwrap_or_default())
+            });
+            let rpc = self.clone();
+            source.expect_confirm_block_hash().returning(move |n| {
+                rpc.info_calls.lock().unwrap().push(n);
+                let chain = rpc.chain.lock().unwrap();
+                let block = chain
+                    .get(&n)
+                    .ok_or_else(|| RemoteL2ClientError::BlockNotFound(n.to_string()))?;
+                let hash = rpc.info_override.lock().unwrap().get(&n).copied();
+                Ok(hash.unwrap_or_else(|| block.execution_payload.block_hash()))
             });
             let rpc = self.clone();
             source.expect_get_block_info().returning(move |tag| {
@@ -1491,17 +1544,17 @@ mod tests {
 
     #[tokio::test]
     async fn gossip_fork_stops_being_served_after_the_unconfirmed_cap() {
-        let rpc = Rpc::with(fake_chain(1..=12, 7));
+        let cap = MAX_UNCONFIRMED_RUN as u64;
+        let rpc = Rpc::with(fake_chain(1..=cap + 4, 7));
         let cache = Arc::new(GossipPayloadCache::default());
         let replaced = Arc::new(Mutex::new(Vec::new()));
         let source = primary(&rpc, &cache)
             .with_repair_engine(Arc::new(recording_engine(Arc::clone(&replaced))));
         source.get_payload_by_number(1).await.unwrap();
         // A second sequencer keeps extending its fork on gossip; nothing confirms it.
-        for n in 2..=12 {
+        for n in 2..=cap + 4 {
             cache.insert(payload(n, 1, if n == 2 { 7 } else { 1 }), Instant::now());
         }
-        let cap = MAX_UNCONFIRMED_RUN as u64;
         for n in 2..=cap + 1 {
             assert_eq!(served_hash(&source.get_payload_by_number(n).await.unwrap()), hash(n, 1));
         }
@@ -1516,7 +1569,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rpc_confirmation_mismatch_sends_the_next_fetch_to_rpc_and_repairs() {
         let rpc = Rpc::with(fake_chain(1..=4, 7));
         let cache = Arc::new(GossipPayloadCache::default());
@@ -1526,6 +1579,8 @@ mod tests {
         source.get_payload_by_number(1).await.unwrap();
         cache.insert(payload(2, 1, 7), Instant::now());
         assert_eq!(served_hash(&source.get_payload_by_number(2).await.unwrap()), hash(2, 1));
+        assert!(matches!(source.confirm_next().await, Confirm::NotDue(_)), "too young");
+        tokio::time::advance(CONFIRM_AGE).await;
         assert_eq!(source.confirm_next().await, Confirm::Disagrees);
         assert_eq!(source.confirm_next().await, Confirm::Idle, "one read per disagreement");
 
@@ -1538,23 +1593,35 @@ mod tests {
         assert_eq!(rpc.info_calls(), vec![2]);
     }
 
-    #[tokio::test]
-    async fn confirmed_gossip_keeps_flowing_past_the_cap() {
-        let rpc = Rpc::with(fake_chain(1..=30, 7));
+    #[tokio::test(start_paused = true)]
+    async fn confirmation_reads_only_the_newest_block_old_enough() {
+        let rpc = Rpc::with(fake_chain(1..=8, 7));
         let cache = Arc::new(GossipPayloadCache::default());
         let source = primary(&rpc, &cache).with_repair_engine(Arc::new(MockFollowEngine::new()));
         source.get_payload_by_number(1).await.unwrap();
-        for n in 2..=30 {
+        for n in 2..=6 {
             cache.insert(payload(n, 7, 7), Instant::now());
-            assert_eq!(served_hash(&source.get_payload_by_number(n).await.unwrap()), hash(n, 7));
-            assert_eq!(source.confirm_next().await, Confirm::Progress);
+            source.get_payload_by_number(n).await.unwrap();
         }
+        tokio::time::advance(Duration::from_millis(150)).await;
+        for n in 7..=8 {
+            cache.insert(payload(n, 7, 7), Instant::now());
+            source.get_payload_by_number(n).await.unwrap();
+        }
+        tokio::time::advance(CONFIRM_AGE - Duration::from_millis(150)).await;
+        // One read of 6, the newest block old enough, confirms 2..=6; 7 and 8 are not due yet.
+        assert_eq!(source.confirm_next().await, Confirm::Progress);
+        assert_eq!(rpc.info_calls(), vec![6]);
+        assert_eq!(source.lock_state().unconfirmed_run(), 2);
+        assert!(matches!(source.confirm_next().await, Confirm::NotDue(_)));
+        tokio::time::advance(Duration::from_millis(150)).await;
+        assert_eq!(source.confirm_next().await, Confirm::Progress);
+        assert_eq!(rpc.info_calls(), vec![6, 8]);
         assert_eq!(source.confirm_next().await, Confirm::Idle);
         assert_eq!(rpc.calls(), vec![1], "every block after 1 came from gossip");
-        assert_eq!(rpc.info_calls(), (2..=30).collect::<Vec<_>>(), "one header read per block");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn confirmation_waits_for_blocks_the_rpc_sources_lack() {
         let rpc = Rpc::with(fake_chain(1..=1, 7));
         let cache = Arc::new(GossipPayloadCache::default());
@@ -1562,9 +1629,97 @@ mod tests {
         source.get_payload_by_number(1).await.unwrap();
         cache.insert(payload(2, 7, 7), Instant::now());
         source.get_payload_by_number(2).await.unwrap();
+        tokio::time::advance(CONFIRM_AGE).await;
         assert_eq!(source.confirm_next().await, Confirm::NotYet);
         rpc.set(fake_chain(2..=2, 7));
+        // The age grew after "not found": not due again until 100 ms later.
+        assert!(matches!(source.confirm_next().await, Confirm::NotDue(_)));
+        tokio::time::advance(Duration::from_millis(100)).await;
         assert_eq!(source.confirm_next().await, Confirm::Progress);
+    }
+
+    /// RPC sources whose blocks appear `lag` after their slot (block `n` at `n * block_time`).
+    /// Hand-rolled: answers depend on the (paused) clock, and the header path must not be used.
+    #[derive(Debug, Clone)]
+    struct LaggingRpc {
+        start: tokio::time::Instant,
+        block_time: Duration,
+        lag: Duration,
+        payloads: Arc<Mutex<Vec<u64>>>,
+        reads: Arc<Mutex<Vec<(u64, bool)>>>,
+    }
+
+    #[async_trait]
+    impl RemoteClient for LaggingRpc {
+        async fn get_block_number(&self, _: BlockNumberOrTag) -> Result<u64, RemoteL2ClientError> {
+            Ok(0)
+        }
+
+        async fn get_block_info(
+            &self,
+            _: BlockNumberOrTag,
+        ) -> Result<BlockInfo, RemoteL2ClientError> {
+            panic!("confirmations use confirm_block_hash, which never fans out on not found");
+        }
+
+        async fn get_payload_by_number(
+            &self,
+            number: u64,
+        ) -> Result<BaseExecutionPayloadEnvelope, RemoteL2ClientError> {
+            self.payloads.lock().unwrap().push(number);
+            Ok(payload(number, 7, 7))
+        }
+
+        async fn confirm_block_hash(&self, number: u64) -> Result<B256, RemoteL2ClientError> {
+            let available = self.start + self.block_time * number as u32 + self.lag;
+            let found = tokio::time::Instant::now() >= available;
+            self.reads.lock().unwrap().push((number, found));
+            if found {
+                Ok(hash(number, 7))
+            } else {
+                Err(RemoteL2ClientError::BlockNotFound(number.to_string()))
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_source_lagging_400_ms_at_200_ms_blocks_never_hits_the_cap() {
+        let block_time = Duration::from_millis(200);
+        let rpc = LaggingRpc {
+            start: tokio::time::Instant::now(),
+            block_time,
+            lag: Duration::from_millis(400),
+            payloads: Arc::default(),
+            reads: Arc::default(),
+        };
+        let cache = Arc::new(GossipPayloadCache::default());
+        let source = Arc::new(GossipFirstClient::new(
+            rpc.clone(),
+            Arc::clone(&cache),
+            FollowP2pMode::Primary,
+        ));
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(Arc::clone(&source).run_confirmations(cancellation.clone()));
+        source.get_payload_by_number(1).await.unwrap();
+        let blocks = 150u64; // 30 s
+        let mut max_run = 0;
+        for n in 2..=blocks {
+            tokio::time::sleep_until(rpc.start + block_time * n as u32).await;
+            max_run = max_run.max(source.lock_state().unconfirmed_run());
+            cache.insert(payload(n, 7, 7), Instant::now());
+            assert_eq!(served_hash(&source.get_payload_by_number(n).await.unwrap()), hash(n, 7));
+        }
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+        assert_eq!(*rpc.payloads.lock().unwrap(), vec![1], "all gossip, cap never hit");
+        assert!(max_run < MAX_UNCONFIRMED_RUN / 2, "max unconfirmed run {max_run}");
+        let reads = rpc.reads.lock().unwrap().clone();
+        let seconds = (block_time * blocks as u32).as_secs_f64();
+        let rate = reads.len() as f64 / seconds;
+        assert!(rate <= 4.0, "{} reads in {seconds} s", reads.len());
+        let misses = reads.iter().filter(|(_, found)| !found).count();
+        assert!(misses * 4 <= reads.len(), "the age adapts to the lag: {misses} misses");
+        eprintln!("lag test: {} reads, {misses} misses, max run {max_run}", reads.len());
     }
 
     #[tokio::test]
