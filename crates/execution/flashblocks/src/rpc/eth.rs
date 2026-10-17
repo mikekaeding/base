@@ -594,7 +594,9 @@ where
         &self,
         block_id: BlockId,
     ) -> RpcResult<(BlockId, EvmOverrides)> {
-        if !block_id.is_pending() {
+        // Without a Flashblocks snapshot (always after Denim) keep `pending` for the node's own
+        // forecast, without a blocking-pool round trip.
+        if !block_id.is_pending() || self.flashblocks_state.get_pending_blocks().is_none() {
             return Ok((block_id, EvmOverrides::default()));
         }
         let permit = self.eth_api.acquire_owned_blocking_io().await.map_err(|error| {

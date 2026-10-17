@@ -23,11 +23,12 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use alloy_eips::BlockNumberOrTag;
+use alloy_eips::{BlockNumberOrTag, eip2718::Decodable2718};
 use alloy_primitives::B256;
 use async_trait::async_trait;
-use base_common_rpc_types_engine::BaseExecutionPayloadEnvelope;
-use base_protocol::BlockInfo;
+use base_common_consensus::BaseTxEnvelope;
+use base_common_rpc_types_engine::{BaseExecutionPayload, BaseExecutionPayloadEnvelope};
+use base_protocol::{BaseTimeUpdateTx, BlockInfo};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
@@ -158,6 +159,23 @@ pub struct GossipCacheEngineClient {
     heads: Option<watch::Sender<u64>>,
 }
 
+/// Block time in milliseconds. From Denim the `BaseTime` deposit at `tx[1]` carries the
+/// sub-second part (about five 200 ms blocks share one header `timestamp`); before Denim there is
+/// none and the header seconds are exact.
+fn payload_timestamp_ms(payload: &BaseExecutionPayload) -> f64 {
+    let number = payload.block_number();
+    let millis = payload
+        .transactions()
+        .get(1)
+        .and_then(|raw| BaseTxEnvelope::decode_2718(&mut raw.as_ref()).ok())
+        .and_then(|transaction| {
+            let deposit = transaction.as_deposit()?;
+            BaseTimeUpdateTx::validate_deposit(deposit.inner(), number).ok()
+        })
+        .map_or(0, |base_time| base_time.timestamp_millis_part());
+    payload.timestamp() as f64 * 1000.0 + f64::from(millis)
+}
+
 impl GossipCacheEngineClient {
     /// Creates the client.
     pub const fn new(
@@ -177,8 +195,7 @@ impl NetworkEngineClient for GossipCacheEngineClient {
     ) -> EngineClientResult<()> {
         let received = Instant::now();
         let number = block.execution_payload.block_number();
-        let timestamp = block.execution_payload.timestamp();
-        let lag_ms = (unix_now_secs_f64() - timestamp as f64) * 1000.0;
+        let lag_ms = unix_now_secs_f64() * 1000.0 - payload_timestamp_ms(&block.execution_payload);
         let hash = block.execution_payload.block_hash();
         if self.cache.insert(block, received) {
             Metrics::follow_p2p_gossip_blocks_total().increment(1);
@@ -393,6 +410,30 @@ mod tests {
                 transactions: vec![],
             }),
         }
+    }
+
+    #[test]
+    fn gossip_lag_uses_denim_milliseconds() {
+        use alloy_eips::eip2718::Encodable2718;
+        use alloy_primitives::Sealable;
+        use base_common_consensus::TxDeposit;
+
+        let mut envelope = payload(9, 0, 0);
+        let BaseExecutionPayload::V1(inner) = &mut envelope.execution_payload else {
+            unreachable!()
+        };
+        inner.timestamp = 42;
+        assert_eq!(payload_timestamp_ms(&envelope.execution_payload), 42_000.0);
+        let BaseExecutionPayload::V1(inner) = &mut envelope.execution_payload else {
+            unreachable!()
+        };
+        inner.transactions = vec![
+            BaseTxEnvelope::from(TxDeposit::default().seal_slow()).encoded_2718().into(),
+            BaseTxEnvelope::from(BaseTimeUpdateTx::new(600).unwrap().into_deposit_tx(9))
+                .encoded_2718()
+                .into(),
+        ];
+        assert_eq!(payload_timestamp_ms(&envelope.execution_payload), 42_600.0);
     }
 
     fn rpc_source(variant: u8) -> MockRemoteClient {
