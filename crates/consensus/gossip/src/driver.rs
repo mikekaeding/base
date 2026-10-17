@@ -727,10 +727,10 @@ mod tests {
     async fn drive_until(
         dialer: &mut GossipDriver<ConnectionGater>,
         listener: &mut GossipDriver<ConnectionGater>,
-        done: impl Fn(&GossipDriver<ConnectionGater>) -> bool,
+        done: impl Fn(&GossipDriver<ConnectionGater>, &GossipDriver<ConnectionGater>) -> bool,
     ) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !done(dialer) && tokio::time::Instant::now() < deadline {
+        while !done(dialer, listener) && tokio::time::Instant::now() < deadline {
             tokio::select! {
                 Some(event) = dialer.next() => { dialer.handle_event(event); }
                 Some(event) = listener.next() => { listener.handle_event(event); }
@@ -753,8 +753,9 @@ mod tests {
 
         dialer.dial_due_static_peers();
         assert!(dialer.connection_gate.current_dials.contains_key(&listener_peer_id));
-        drive_until(&mut dialer, &mut listener, |d| {
+        drive_until(&mut dialer, &mut listener, |d, l| {
             d.static_peers.as_ref().unwrap().connected() == 1
+                && l.swarm.is_connected(&dialer_peer_id)
         })
         .await;
         assert_eq!(dialer.static_peers.as_ref().unwrap().connected(), 1);
@@ -762,8 +763,8 @@ mod tests {
 
         // The remote drops us: a redial is scheduled after the grown backoff (10 s after the
         // first dial), not immediately.
-        let _ = listener.swarm.disconnect_peer_id(dialer_peer_id);
-        drive_until(&mut dialer, &mut listener, |d| {
+        assert!(listener.swarm.disconnect_peer_id(dialer_peer_id).is_ok());
+        drive_until(&mut dialer, &mut listener, |d, _| {
             d.static_peers.as_ref().unwrap().connected() == 0
         })
         .await;
